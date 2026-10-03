@@ -1,6 +1,12 @@
 # Build output
 /out/
 /build/
+/Testing/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
 CMakeUserPresets.json
 
 # Build directories created outside /out/ (per-stage trees use names like b457_perf)
@@ -17,6 +23,14 @@ cmake-build-*/
 *.ipdb
 *.res
 *.tlog
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.pch
+*.idb
+*.ipch
 
 # Copyrighted game data.  Never publish: the PSP executable, its decrypted ELF
 # and save data are the user's own dumped media, not part of this source tree.
@@ -26,6 +40,14 @@ SAVEDATA/
 *.elf
 *.iso
 *.cso
+EBOOT*.BIN
+BOOT.BIN
+*.pbp
+*.PBP
+*.prx
+*.PRX
+*.at3
+*.pmf
 
 # User-owned game data and reverse-engineering workspace
 /profiles/*/game/
@@ -39,6 +61,9 @@ SAVEDATA/
 *.log
 *.pdb
 *.ilk
+*.dmp
+*.mdmp
+*_crash.txt
 
 # IDE files
 .vs/
@@ -46,6 +71,13 @@ SAVEDATA/
 .idea/
 *.user
 *.suo
+*.VC.db
+*.VC.VC.opendb
+/.cache/
+
+# Local command-output scratch files
+/dir
+/gh
 
 # Python
 __pycache__/
