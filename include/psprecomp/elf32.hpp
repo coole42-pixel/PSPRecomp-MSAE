@@ -74,6 +74,7 @@ struct RelocationStats {
     std::uint32_t r_mips_lo16{};
     std::uint32_t unsupported{};
     std::uint32_t invalid{};
+    std::uint32_t r_mips_16{};
 };
 
 class Elf32Image {

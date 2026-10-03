@@ -25,6 +25,7 @@ RuntimePostImportHook g_post_import_hook = nullptr;
 std::int32_t g_runtime_thread_uid = -1;
 std::array<char, 64> g_runtime_thread_name{};
 std::uint32_t g_runtime_dispatch_pc = 0u;
+AllegrexContext *g_runtime_watch_context = nullptr;
 RuntimeHeartbeatHook g_heartbeat_hook = nullptr;
 std::uint64_t g_heartbeat_interval = 0u;
 RuntimeStarvationHook g_starvation_hook = nullptr;
@@ -33,6 +34,12 @@ RuntimePreDispatchHook g_pre_dispatch_hook = nullptr;
 RuntimePostDispatchHook g_post_dispatch_hook = nullptr;
 RuntimePreChainedCallHook g_pre_chained_call_hook = nullptr;
 RuntimePostChainedCallHook g_post_chained_call_hook = nullptr;
+}
+
+// Memory-watch diagnostics need the live PSP callsite even when several
+// same-unit guest calls run inside one outer native dispatch.
+std::uint32_t runtime_watch_register(std::uint32_t index) noexcept {
+    return g_runtime_watch_context!=nullptr && index<32 ? g_runtime_watch_context->gpr[index] : 0u;
 }
 
 // Execution counter for a handful of guest addresses, armed by
@@ -74,6 +81,64 @@ void load_counted_pcs() {
 inline void count_pc(std::uint32_t pc) noexcept {
     for (std::size_t index = 0u; index < g_counted_pc_size; ++index)
         if (g_counted_pcs[index] == pc) { ++g_counted_pc_hits[index]; return; }
+}
+
+// Indirect-call (jalr) trace: PSPRECOMP_TRACE_JALR holds a comma-separated list
+// of target addresses whose indirect invocations are logged with the caller's
+// return address and arguments.  Scene systems and callback tables dispatch
+// through function pointers, so the chained-call tracer never sees them.
+namespace {
+constexpr std::size_t kMaxJalrTargets = 16u;
+std::array<std::uint32_t, kMaxJalrTargets> g_jalr_targets{};
+std::size_t g_jalr_target_size = 0u;
+bool g_jalr_targets_loaded = false;
+std::uint64_t g_jalr_logged = 0u;
+
+void load_jalr_targets() {
+    if (g_jalr_targets_loaded) return;
+    g_jalr_targets_loaded = true;
+    const char *text = std::getenv("PSPRECOMP_TRACE_JALR");
+    if (text == nullptr || *text == '\0') return;
+    const std::string list(text);
+    std::size_t begin = 0u;
+    while (begin < list.size() && g_jalr_target_size < kMaxJalrTargets) {
+        const std::size_t comma = list.find(',', begin);
+        const std::string item = list.substr(begin, comma == std::string::npos ? std::string::npos : comma - begin);
+        char *end = nullptr;
+        const unsigned long value = std::strtoul(item.c_str(), &end, 0);
+        if (end != item.c_str() && *end == '\0')
+            g_jalr_targets[g_jalr_target_size++] = static_cast<std::uint32_t>(value);
+        if (comma == std::string::npos) break;
+        begin = comma + 1u;
+    }
+    if (g_jalr_target_size != 0u) g_runtime_chain_observers_active = true;
+}
+
+void trace_jalr(const AllegrexContext &ctx, std::uint32_t address) {
+    if (g_jalr_target_size == 0u || g_jalr_logged >= 4000u) return;
+    for (std::size_t index = 0u; index < g_jalr_target_size; ++index) {
+        if (g_jalr_targets[index] != address) continue;
+        ++g_jalr_logged;
+        std::cerr << "[JALR] target=" << hex32(address) << " ra=" << hex32(ctx.gpr[31])
+                  << " sp=" << hex32(ctx.gpr[29]) << " a0=" << hex32(ctx.gpr[4])
+                  << " a1=" << hex32(ctx.gpr[5]) << " a2=" << hex32(ctx.gpr[6])
+                  << " a3=" << hex32(ctx.gpr[7]) << "\n";
+        return;
+    }
+}
+}
+
+// The dispatcher stopping on an unknown PC is a first-class profile blocker.
+// Print the exact target/PC/RA/thread so a missing AOT unit, an indirect call
+// into data, or a jr $ra into the wrong place is identifiable from the log
+// alone.
+void report_dispatch_miss(const AllegrexContext &ctx) {
+    std::cerr << "[DISPATCH MISS]\n"
+              << "target: " << hex32(ctx.pc) << "\n"
+              << "RA: " << hex32(ctx.gpr[31]) << "\n"
+              << "SP: " << hex32(ctx.gpr[29]) << "\n"
+              << "thread: " << g_runtime_thread_uid << " name="
+              << g_runtime_thread_name.data() << "\n";
 }
 }
 
@@ -360,6 +425,8 @@ void Runtime::register_generated_unit(std::uint32_t unit_index,
 bool Runtime::invoke_isolated_aot(std::uint32_t address, AllegrexContext &ctx) {
     const RecompiledFunction function = lookup_function(address);
     if (function == nullptr) return false;
+    load_jalr_targets();
+    trace_jalr(ctx, address);
     ctx.pc = address;
     function(*this, ctx);
     ctx.gpr[0] = 0u;
@@ -510,6 +577,13 @@ std::filesystem::path Runtime::translate_path(const std::string &psp_path) const
 }
 
 void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
+    struct WatchContextScope {
+        AllegrexContext *previous;
+        explicit WatchContextScope(AllegrexContext &ctx) : previous(g_runtime_watch_context) {
+            g_runtime_watch_context=&ctx;
+        }
+        ~WatchContextScope() {g_runtime_watch_context=previous;}
+    } watch_context(cpu_);
     stopped_ = false;
     stop_reason_.clear();
     cpu_.pc = entry;
@@ -580,6 +654,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
             const std::int32_t dispatch_thread_uid = g_runtime_thread_uid;
             RecompiledFunction function = lookup_function(before);
             if (function == nullptr) {
+                report_dispatch_miss(cpu_);
                 stop("No recompiled function registered at " + hex32(before));
                 return;
             }
@@ -657,6 +732,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
             RecompiledFunction function = lookup_generated_unit(before);
             if (function == nullptr) function = lookup_function(before);
             if (function == nullptr) {
+                report_dispatch_miss(cpu_);
                 stop("No recompiled function registered at " + hex32(before));
                 break;
             }
@@ -716,6 +792,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
         RecompiledFunction function = lookup_function(before);
         const FunctionEntry *function_entry = lookup_entry(before);
         if (function == nullptr) {
+            report_dispatch_miss(cpu_);
             stop("No recompiled function registered at " + hex32(before));
             break;
         }
@@ -1095,6 +1172,9 @@ bool Runtime::stopped() const noexcept { return stopped_; }
 const std::string &Runtime::stop_reason() const noexcept { return stop_reason_; }
 
 void Runtime::unsupported(std::uint32_t pc, std::uint32_t instruction, const std::string &reason) {
+    std::cerr << "[ERROR] unsupported Allegrex instruction " << hex32(instruction)
+              << " at PC=" << hex32(pc) << " thread=" << g_runtime_thread_uid
+              << " name=" << g_runtime_thread_name.data() << " reason=" << reason << "\n";
     stop("Unsupported Allegrex instruction " + hex32(instruction) + " at " + hex32(pc) + ": " + reason);
 }
 
@@ -1158,6 +1238,16 @@ void Runtime::invoke_import_cached(std::uint32_t slot, std::string_view library,
         if (library_it == hle_.end() || function_it == library_it->second.end()) {
             const std::string library_name(library);
             const auto name = nids_.resolve(library_name, nid).value_or(hex32(nid));
+            // Loud, greppable diagnostic: the profile spec requires the exact
+            // module/NID/PC/RA of the first missing service, never a silent stop.
+            std::cerr << "[HLE MISSING]\n"
+                      << "module: " << library_name << "\n"
+                      << "NID: " << hex32(nid) << "\n"
+                      << "symbol: " << name << "\n"
+                      << "PC: " << hex32(ctx.pc) << "\n"
+                      << "RA: " << hex32(ctx.gpr[31]) << "\n"
+                      << "thread: " << g_runtime_thread_uid << " name="
+                      << g_runtime_thread_name.data() << "\n";
             stop("Missing HLE import " + library_name + "::" + name);
             return;
         }
@@ -1182,6 +1272,14 @@ void Runtime::invoke_import(std::string_view library, std::uint32_t nid, Allegre
     if (library_it == hle_.end() || function_it == library_it->second.end()) {
         const std::string library_name(library);
         const auto name = nids_.resolve(library_name, nid).value_or(hex32(nid));
+        std::cerr << "[HLE MISSING]\n"
+                  << "module: " << library_name << "\n"
+                  << "NID: " << hex32(nid) << "\n"
+                  << "symbol: " << name << "\n"
+                  << "PC: " << hex32(ctx.pc) << "\n"
+                  << "RA: " << hex32(ctx.gpr[31]) << "\n"
+                  << "thread: " << g_runtime_thread_uid << " name="
+                  << g_runtime_thread_name.data() << "\n";
         stop("Missing HLE import " + library_name + "::" + name);
         return;
     }

@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
 
 option(PSPRECOMP_BUILD_TESTS "Build reusable PSPRecomp tests" ON)
 option(PSPRECOMP_BUILD_PROFILE_TESTS "Build tests supplied by the selected profile" ON)
@@ -78,12 +80,16 @@ add_library(psprecomp_core STATIC
     src/deflate.cpp
     src/elf32.cpp
     src/guest_memory.cpp
+    src/hle_audio_output2.cpp
+    src/hle_savedata.cpp
+    src/hle_sas.cpp
     src/nid_registry.cpp
     src/program_analysis.cpp
     src/runtime.cpp
     src/sha256.cpp
 )
 target_include_directories(psprecomp_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(psprecomp_core PUBLIC Threads::Threads)
 target_compile_definitions(psprecomp_core PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:_CRT_SECURE_NO_WARNINGS>)
 if(MSVC)
@@ -120,6 +126,10 @@ if(PSPRECOMP_BUILD_TESTS)
     target_compile_definitions(psprecomp_tests PRIVATE
         PSPRECOMP_CODEGEN_PATH="$<TARGET_FILE:psp_recomp>")
     add_test(NAME psprecomp_tests COMMAND psprecomp_tests)
+    add_executable(psprecomp_codegen_tests tests/codegen_lowering_tests.cpp)
+    target_link_libraries(psprecomp_codegen_tests PRIVATE psprecomp_core)
+    add_test(NAME psprecomp_codegen_tests COMMAND psprecomp_codegen_tests)
+    set_tests_properties(psprecomp_tests psprecomp_codegen_tests PROPERTIES TIMEOUT 60)
 endif()
 
 if(NOT PSPRECOMP_PROFILE STREQUAL "")

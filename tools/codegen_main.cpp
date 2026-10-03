@@ -3,12 +3,16 @@
 #include "psprecomp/codegen_policy.hpp"
 #include "psprecomp/elf32.hpp"
 #include "psprecomp/program_analysis.hpp"
+#include "psprecomp/parallel_work.hpp"
+#include "aot_output.hpp"
+#include "codegen_text.hpp"
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cctype>
 #include <charconv>
+#include <chrono>
 #include <filesystem>
 #include <cmath>
 #include <limits>
@@ -23,6 +27,14 @@
 #include <vector>
 
 namespace {
+using Clock = std::chrono::steady_clock;
+double seconds_since(Clock::time_point start) {
+    return std::chrono::duration<double>(Clock::now() - start).count();
+}
+void stage_timing(std::string_view stage, Clock::time_point start) {
+    std::cout << "[AUTO] " << stage << ": " << std::fixed << std::setprecision(2)
+              << seconds_since(start) << "s\n" << std::flush;
+}
 struct Function {
     std::string name;
     std::uint32_t address{};
@@ -86,7 +98,7 @@ std::string reg(std::uint32_t index) {
 std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t pc) {
     const auto imm = static_cast<std::int32_t>(d.immediate);
     const auto uimm = static_cast<std::uint16_t>(d.immediate);
-    std::ostringstream out;
+    psprecomp::CodegenText out;
     switch (d.kind) {
     case psprecomp::OpcodeKind::Nop: out << "    // nop\n"; break;
     case psprecomp::OpcodeKind::Sync:
@@ -177,6 +189,24 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
         out << "    ctx.set_gpr(" << d.rd << ", ((" << reg(d.rt) << " & 0x000000FFu) << 24u) | ((" << reg(d.rt) << " & 0x0000FF00u) << 8u) | ((" << reg(d.rt) << " & 0x00FF0000u) >> 8u) | ((" << reg(d.rt) << " & 0xFF000000u) >> 24u));\n";
         break;
     case psprecomp::OpcodeKind::Lw: out << "    ctx.set_gpr(" << d.rt << ", rt.memory().aot_load32(" << reg(d.rs) << " + static_cast<std::uint32_t>(" << imm << ")));\n"; break;
+    case psprecomp::OpcodeKind::Ll: {
+        // Load-linked / store-conditional: the scheduler is cooperative and
+        // never switches guest threads between the two, so the reservation is
+        // modelled with an address check and always still valid at `sc`.
+        out << "    { const std::uint32_t ll_address = " << reg(d.rs) << " + static_cast<std::uint32_t>(" << imm << ");\n"
+            << "      ctx.ll_address = ll_address;\n"
+            << "      ctx.ll_reserved = true;\n"
+            << "      ctx.set_gpr(" << d.rt << ", rt.memory().aot_load32(ll_address)); }\n";
+        break;
+    }
+    case psprecomp::OpcodeKind::Sc: {
+        out << "    { const std::uint32_t sc_address = " << reg(d.rs) << " + static_cast<std::uint32_t>(" << imm << ");\n"
+            << "      const bool sc_reserved = ctx.ll_reserved && ctx.ll_address == sc_address;\n"
+            << "      if (sc_reserved) rt.memory().aot_store32(sc_address, ctx.gpr[" << d.rt << "]);\n"
+            << "      ctx.ll_reserved = false;\n"
+            << "      ctx.set_gpr(" << d.rt << ", sc_reserved ? 1u : 0u); }\n";
+        break;
+    }
     case psprecomp::OpcodeKind::Lwl: out << "    ctx.set_gpr(" << d.rt << ", rt.memory().aot_load_word_left(" << reg(d.rs) << " + static_cast<std::uint32_t>(" << imm << "), " << reg(d.rt) << "));\n"; break;
     case psprecomp::OpcodeKind::Lwr: out << "    ctx.set_gpr(" << d.rt << ", rt.memory().aot_load_word_right(" << reg(d.rs) << " + static_cast<std::uint32_t>(" << imm << "), " << reg(d.rt) << "));\n"; break;
     case psprecomp::OpcodeKind::Sw: out << "    rt.memory().aot_store32(" << reg(d.rs) << " + static_cast<std::uint32_t>(" << imm << "), " << reg(d.rt) << ");\n"; break;
@@ -564,6 +594,25 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
             << length << "u);\n";
         break;
     }
+    case psprecomp::OpcodeKind::Vsgn: {
+        const std::uint32_t size_code = ((d.word >> 7u) & 1u) | (((d.word >> 15u) & 1u) << 1u);
+        const std::uint32_t length = size_code + 1u;
+        const std::uint32_t destination = d.word & 0x7Fu;
+        const std::uint32_t source = (d.word >> 8u) & 0x7Fu;
+        out << "    ctx.execute_vfpu_vsgn(" << destination << "u, " << source << "u, "
+            << length << "u);\n";
+        break;
+    }
+    case psprecomp::OpcodeKind::Vi2x: {
+        const std::uint32_t size_code = ((d.word >> 7u) & 1u) | (((d.word >> 15u) & 1u) << 1u);
+        const std::uint32_t length = size_code + 1u;
+        const std::uint32_t destination = d.word & 0x7Fu;
+        const std::uint32_t source = (d.word >> 8u) & 0x7Fu;
+        const std::uint32_t operation = (d.word >> 16u) & 3u;
+        out << "    ctx.execute_vfpu_vi2x(" << destination << "u, " << source << "u, "
+            << length << "u, " << operation << "u);\n";
+        break;
+    }
     case psprecomp::OpcodeKind::VfpuHorizontal: {
         const std::uint32_t size_code = ((d.word >> 7u) & 1u) | (((d.word >> 15u) & 1u) << 1u);
         const std::uint32_t length = size_code + 1u;
@@ -770,7 +819,7 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
             << "u, \"" << cpp_escape(d.mnemonic) << " not lowered yet\"); return;\n";
         break;
     }
-    return out.str();
+    return out.take();
 }
 
 bool is_branch(psprecomp::OpcodeKind kind) {
@@ -845,28 +894,39 @@ std::string direct_unit_chain_expression(
                 std::to_string(unit) + "u, " + std::to_string(found->second) + "u, " +
                 psprecomp::hex32(target) + "u>(ctx, &aot_mem)";
         }
+        // The target is not an emitted entry of that bucket.  Entering the unit
+        // cannot succeed (and its sparse dispatcher would switch on the
+        // caller's stale PC), so signal the caller to use the exact path.
+        return {};
     }
     return "rt.invoke_chained_direct<&" + generated_unit_cpp_name(unit) + ", " +
         std::to_string(unit) + "u>(ctx, &aot_mem)";
 }
 
-void emit_target(std::ostringstream &body, std::uint32_t target,
+void emit_target(psprecomp::CodegenText &body, std::uint32_t target,
                  const std::set<std::uint32_t> &labels, const char *indent,
                  std::uint32_t executable_base = 0u,
                  std::uint32_t unit_span_bytes = 0u,
                  const std::map<std::uint32_t, std::uint16_t> *direct_entry_ids = nullptr,
-                 const std::set<std::uint32_t> *import_stubs = nullptr) {
-    if (labels.contains(target)) {
-        body << indent << "goto L_" << psprecomp::hex32(target).substr(2) << ";\n";
-        return;
-    }
-
+                 const std::set<std::uint32_t> *import_stubs = nullptr,
+                 const std::set<std::uint32_t> *unit_buckets = nullptr) {
     // A fixed J/JAL to a PSP import must return to the outer dispatcher.
     // Trying the generated-unit chain first is guaranteed to fail because import
     // registration deliberately poisons/replaces that exact PC, and these stubs
     // are frequently hot in real titles. Emit the minimal correct handoff directly.
+    //
+    // This test must precede the local-label one: import stubs are legitimate
+    // entry labels of their containing unit (their placeholder bodies are
+    // translated like any other code), and a same-unit call used to resolve to
+    // `goto L_<stub>`. That executed the placeholder body instead of the HLE
+    // wrapper, silently dropping every import called from the stub's own unit.
     if (import_stubs != nullptr && import_stubs->contains(target)) {
         body << indent << "ctx.pc = " << psprecomp::hex32(target) << "u; return;\n";
+        return;
+    }
+
+    if (labels.contains(target)) {
+        body << indent << "goto L_" << psprecomp::hex32(target).substr(2) << ";\n";
         return;
     }
 
@@ -876,14 +936,25 @@ void emit_target(std::ostringstream &body, std::uint32_t target,
     // chain table and indexes the tiny unit table instead. A bucket containing
     // an import/HLE/host replacement is marked overridden at registration time
     // and invoke_chained_unit() falls back to the exact per-PC lookup there.
-    if (unit_span_bytes != 0u && target >= executable_base) {
+    //
+    // Only buckets that actually produced a translation unit may be named
+    // directly: a J/JAL target can point past the emitted corpus (data that was
+    // never partitioned, or stale link-time constants), and referring to
+    // recomp_unit_0546 for a 21-unit corpus does not compile.  Such targets
+    // fall back to the exact per-PC chain, which reports a real dispatcher miss
+    // if the guest ever executes them.
+    const bool direct_unit = unit_span_bytes != 0u && target >= executable_base &&
+        (unit_buckets == nullptr || unit_buckets->contains((target - executable_base) / unit_span_bytes));
+    if (direct_unit) {
         const std::uint32_t unit = (target - executable_base) / unit_span_bytes;
-        body << indent << "(void)" << direct_unit_chain_expression(unit, target, direct_entry_ids)
-             << "; return;\n";
-    } else {
-        body << indent << "ctx.pc = " << psprecomp::hex32(target)
-             << "u; (void)rt.invoke_chained_call(ctx, &aot_mem); return;\n";
+        const std::string chain = direct_unit_chain_expression(unit, target, direct_entry_ids);
+        if (!chain.empty()) {
+            body << indent << "(void)" << chain << "; return;\n";
+            return;
+        }
     }
+    body << indent << "ctx.pc = " << psprecomp::hex32(target)
+         << "u; (void)rt.invoke_chained_call(ctx, &aot_mem); return;\n";
 }
 
 
@@ -896,12 +967,36 @@ struct GeneratedFunctionInput {
     std::uint32_t unit_span_bytes{};
     const std::map<std::uint32_t, std::uint16_t> *direct_entry_ids{};
     const std::set<std::uint32_t> *import_stubs{};
+    const std::set<std::uint32_t> *unit_buckets{};
 };
 
-std::string emit_function_source(const GeneratedFunctionInput &function,
+struct GeneratedFunctionView {
+    std::string name;
+    std::uint32_t address{};
+    const std::set<std::uint32_t> &instructions;
+    const std::set<std::uint32_t> &entry_labels;
+    std::uint32_t executable_base{};
+    std::uint32_t unit_span_bytes{};
+    const std::map<std::uint32_t, std::uint16_t> *direct_entry_ids{};
+    const std::set<std::uint32_t> *import_stubs{};
+    const std::set<std::uint32_t> *unit_buckets{};
+};
+
+template <class FunctionInput>
+std::string emit_function_source(const FunctionInput &function,
                                  const psprecomp::GuestMemory &memory,
-                                 const std::string &cpp_name) {
-    std::ostringstream body;
+                                 const std::string &cpp_name,
+                                 const std::function<void(std::string)> &sink = {},
+                                 const std::function<void(std::size_t)> &progress = {}) {
+    psprecomp::CodegenText body;
+    if (sink) body.reserve(65536u);
+    std::size_t blocks = 0u, instructions = 0u;
+    auto flush = [&] {
+        if (sink && body.size() >= 65536u) {
+            sink(body.take());
+            body.reserve(65536u);
+        }
+    };
 
     // Unit entry dispatch.  A `switch (ctx.pc)` over several hundred sparse
     // guest addresses compiles to a branch tree, and every outer dispatch pays
@@ -964,12 +1059,39 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
              << "    }\n"
              << "    }\n";
     } else {
+        // Sparse dispatch keeps the same local-transfer contract as the dense
+        // form: a JR that stays inside the unit writes local_pc and re-enters
+        // via LOCAL_DISPATCH without touching AllegrexContext.  local_pc must
+        // therefore exist and be the switch operand, or the emitted transfer
+        // code cannot compile (or would resume at the wrong PC).
+        //
+        // A fixed cross-unit edge hands this unit a compact direct_entry_id and
+        // deliberately leaves ctx.pc at the *caller's* address.  The dense form
+        // consumes that id directly; the sparse form cannot, and switching on
+        // the stale caller PC would hit the default arm and report an invalid
+        // entry.  Publish id -> entry-PC table here so both call conventions
+        // land on the same blocks.
+        const std::string entry_pc_table = "kDirectEntryPc_" + cpp_name;
+        body << "static const std::uint32_t " << entry_pc_table << "[" << function.entry_labels.size()
+             << "] = {";
+        {
+            std::size_t emitted = 0u;
+            for (const auto label : function.entry_labels) {
+                if (emitted++ % 8u == 0u) body << "\n   ";
+                body << ' ' << psprecomp::hex32(label) << "u,";
+            }
+        }
+        body << "\n};\n";
         body << "void " << cpp_name << "_entry(Runtime &rt, AllegrexContext &ctx, std::uint16_t direct_entry_id, GuestMemory::AotFastView &aot_mem) {\n"
-             << "    (void)direct_entry_id;\n"
              << "    std::uint32_t jump_target = 0u;\n"
              << "    std::uint32_t local_transfers = 0u;\n"
+             << "    std::uint32_t local_pc = ctx.pc;\n"
+             << "    std::uint32_t entry_id = 0u;\n"
+             << "    if (direct_entry_id != 0u && direct_entry_id <= "
+             << function.entry_labels.size() << "u) local_pc = "
+             << entry_pc_table << "[direct_entry_id - 1u];\n"
              << "LOCAL_DISPATCH:\n"
-             << "    switch (ctx.pc) {\n";
+             << "    switch (local_pc) {\n";
         for (const auto label : function.entry_labels) {
             body << "    case " << psprecomp::hex32(label) << "u: goto L_"
                  << psprecomp::hex32(label).substr(2) << ";\n";
@@ -989,9 +1111,15 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
     }
 
     for (const auto block_start : function.entry_labels) {
+        flush(); // Split only between complete emitted statements.
+        if (progress && (++blocks & 255u) == 0u) progress(blocks);
         body << "L_" << psprecomp::hex32(block_start).substr(2) << ":\n";
         std::uint32_t pc = block_start;
         while (function.instructions.contains(pc)) {
+            if ((++instructions & 255u) == 0u) {
+                flush();
+                if (progress) progress(blocks);
+            }
             if (pc != block_start && function.entry_labels.contains(pc)) {
                 body << "    goto L_" << psprecomp::hex32(pc).substr(2) << ";\n";
                 break;
@@ -1019,16 +1147,16 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                     if (likely_branch) {
                         body << "    if (" << condition << ") {\n"
                              << emit_regular(slot, pc + 4u);
-                        emit_target(body, target, function.entry_labels, "        ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
+                        emit_target(body, target, function.entry_labels, "        ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, function.unit_buckets);
                         body << "    }\n";
-                        emit_target(body, fallthrough, function.entry_labels, "    ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
+                        emit_target(body, fallthrough, function.entry_labels, "    ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, function.unit_buckets);
                     } else {
                         body << "    { const bool branch_taken = " << condition << ";\n"
                              << emit_regular(slot, pc + 4u)
                              << "      if (branch_taken) {\n";
-                        emit_target(body, target, function.entry_labels, "          ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
+                        emit_target(body, target, function.entry_labels, "          ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, function.unit_buckets);
                         body << "      }\n";
-                        emit_target(body, fallthrough, function.entry_labels, "      ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
+                        emit_target(body, fallthrough, function.entry_labels, "      ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, function.unit_buckets);
                         body << "    }\n";
                     }
                 } else if (decoded.kind == psprecomp::OpcodeKind::J ||
@@ -1039,7 +1167,18 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                     }
                     body << emit_regular(slot, pc + 4u);
                     if (decoded.kind == psprecomp::OpcodeKind::J) {
-                        emit_target(body, target, function.entry_labels, "    ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
+                        emit_target(body, target, function.entry_labels, "    ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, function.unit_buckets);
+                    } else if (function.import_stubs != nullptr &&
+                               function.import_stubs->contains(target)) {
+                        // Fixed JAL to a same-unit import stub. The stub is also
+                        // an entry label (its placeholder body is translated), so
+                        // the local-label fast path below would transfer into the
+                        // placeholder and never run the HLE wrapper. Leave the
+                        // unit through the outer dispatcher exactly like a
+                        // cross-unit import JAL.
+                        body << "    ctx.pc = " << psprecomp::hex32(target) << "u;\n"
+                             << "    return;\n";
+                        break;
                     } else if (function.entry_labels.contains(target)) {
                         // Fixed same-unit JAL: the destination is already a C++
                         // label. Going through ctx.pc + LOCAL_DISPATCH needlessly
@@ -1056,27 +1195,33 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                         if (target_is_import) {
                             body << "    ctx.pc = " << psprecomp::hex32(target) << "u;\n"
                                  << "    return;\n";
-                            continue;
+                            break;
                         }
                         // Otherwise run the callee inline and resume locally only
                         // if it came back to our return address.
                         const bool direct_unit = function.unit_span_bytes != 0u &&
-                            target >= function.executable_base;
+                            target >= function.executable_base &&
+                            (function.unit_buckets == nullptr ||
+                             function.unit_buckets->contains(
+                                 (target - function.executable_base) / function.unit_span_bytes));
                         const std::uint32_t target_unit = direct_unit
                             ? (target - function.executable_base) / function.unit_span_bytes : 0u;
-                        if (!direct_unit)
+                        const std::string chain = direct_unit
+                            ? direct_unit_chain_expression(target_unit, target, function.direct_entry_ids)
+                            : std::string{};
+                        if (chain.empty())
                             body << "    ctx.pc = " << psprecomp::hex32(target) << "u;\n";
                         if (function.entry_labels.contains(return_pc)) {
                             body << "    if (";
-                            if (direct_unit)
-                                body << direct_unit_chain_expression(target_unit, target, function.direct_entry_ids);
+                            if (!chain.empty())
+                                body << chain;
                             else
                                 body << "rt.invoke_chained_call(ctx, &aot_mem)";
                             body << " && ctx.pc == " << psprecomp::hex32(return_pc)
                                  << "u) goto L_" << psprecomp::hex32(return_pc).substr(2) << ";\n";
                         } else {
-                            if (direct_unit)
-                                body << "    (void)" << direct_unit_chain_expression(target_unit, target, function.direct_entry_ids) << ";\n";
+                            if (!chain.empty())
+                                body << "    (void)" << chain << ";\n";
                             else
                                 body << "    (void)rt.invoke_chained_call(ctx, &aot_mem);\n";
                         }
@@ -1142,7 +1287,9 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
     body << "void " << cpp_name << "(Runtime &rt, AllegrexContext &ctx) {\n"
          << "    auto aot_mem = rt.memory().aot_fast_view();\n"
          << "    " << cpp_name << "_entry(rt, ctx, 0u, aot_mem);\n}\n\n";
-    return body.str();
+    if (progress) progress(function.entry_labels.size());
+    if (sink) { sink(body.take()); return {}; }
+    return body.take();
 }
 
 void write_import_wrappers(std::ostream &out, const std::vector<psprecomp::PspImport> &imports) {
@@ -1226,6 +1373,9 @@ int generate_manual(const std::filesystem::path &elf_path,
 // readable helper form used by their source-level tests.
 std::string lower_constant_gpr_writes(std::string text) {
     constexpr std::string_view needle = "ctx.set_gpr(";
+    std::string lowered;
+    lowered.reserve(text.size());
+    std::size_t copied = 0u;
     std::size_t search = 0u;
     while ((search = text.find(needle, search)) != std::string::npos) {
         const std::size_t open = search + needle.size() - 1u;
@@ -1273,10 +1423,86 @@ std::string lower_constant_gpr_writes(std::string text) {
             search = close + 1u;
             continue;
         }
-        text.replace(search, close - search + 1u, replacement);
-        search += replacement.size();
+        lowered.append(text, copied, search - copied);
+        lowered += replacement;
+        copied = close + 1u;
+        search = copied;
     }
-    return text;
+    lowered.append(text, copied, text.size() - copied);
+    return lowered;
+}
+
+// Every pattern below starts with a fixed helper name. Find that name directly
+// and run the original regex only at candidates instead of rescanning/copying
+// every byte of source for every helper. Preserve regex captures and formatting.
+std::string replace_prefixed_regex(std::string text, std::string_view prefix,
+                                   const std::regex &pattern, const char *replacement) {
+    auto search = text.find(prefix);
+    if (search == std::string::npos) return text;
+    std::string lowered;
+    lowered.reserve(text.size());
+    std::size_t copied = 0u;
+    std::smatch match;
+    while (search != std::string::npos) {
+        const auto begin = text.cbegin() + static_cast<std::ptrdiff_t>(search);
+        if (std::regex_search(begin, text.cend(), match, pattern, std::regex_constants::match_continuous)) {
+            lowered.append(text, copied, search - copied);
+            lowered += match.format(replacement);
+            copied = search + static_cast<std::size_t>(match.length());
+            search = text.find(prefix, copied);
+        } else {
+            search = text.find(prefix, search + prefix.size());
+        }
+    }
+    lowered.append(text, copied, text.size() - copied);
+    return lowered;
+}
+
+std::string replace_all_literal(std::string text, std::string_view from, std::string_view to) {
+    std::size_t found = text.find(from);
+    if (found == std::string::npos) return text;
+    std::string replaced;
+    replaced.reserve(text.size() + text.size() / 8u);
+    std::size_t copied = 0u;
+    for (; found != std::string::npos; found = text.find(from, copied)) {
+        replaced.append(text, copied, found - copied);
+        replaced.append(to);
+        copied = found + from.size();
+    }
+    replaced.append(text, copied, text.size() - copied);
+    return replaced;
+}
+
+std::string lower_builtin_hot_accessors(std::string text) {
+    // Opt-in (--builtin-accessors), final pass.  A corpus compiled without
+    // inlining (MSVC /Ob0 also disables __forceinline) otherwise turns every
+    // ctx.gpr[N] into a std::array::operator[] call, every guest load/store
+    // into three nested calls and every bit_cast into a call, and each call
+    // spills its operands into a fresh stack slot of the unit's frame.  Index
+    // the register files through raw pointers, use the PSPRECOMP_AOT_* macros
+    // (same fast-path test, member call only on the slow path) and the
+    // compiler's builtin bit_cast.  Every replaced form is still a single
+    // expression with the same value and evaluation of its operands.
+    static constexpr std::string_view kEntryOpen = "GuestMemory::AotFastView &aot_mem) {\n";
+    static constexpr std::pair<std::string_view, std::string_view> kReplacements[] = {
+        {"ctx.gpr[", "aot_gpr["},
+        {"ctx.fpr[", "aot_fpr["},
+        {"aot_mem.aot_load8(", "PSPRECOMP_AOT_LOAD8("},
+        {"aot_mem.aot_load16(", "PSPRECOMP_AOT_LOAD16("},
+        {"aot_mem.aot_load32(", "PSPRECOMP_AOT_LOAD32("},
+        {"aot_mem.aot_store8(", "PSPRECOMP_AOT_STORE8("},
+        {"aot_mem.aot_store16(", "PSPRECOMP_AOT_STORE16("},
+        {"aot_mem.aot_store32(", "PSPRECOMP_AOT_STORE32("},
+        {"std::bit_cast<float>(", "__builtin_bit_cast(float, "},
+        {"std::bit_cast<std::uint32_t>(", "__builtin_bit_cast(std::uint32_t, "},
+    };
+    for (const auto &[from, to] : kReplacements) text = replace_all_literal(std::move(text), from, to);
+    return replace_all_literal(std::move(text), kEntryOpen,
+        "GuestMemory::AotFastView &aot_mem) {\n"
+        "    static_assert(std::endian::native == std::endian::little);\n"
+        "    std::uint32_t *const aot_gpr = ctx.gpr.data();\n"
+        "    float *const aot_fpr = ctx.fpr.data();\n"
+        "    const GuestMemory::AotFastView::Raw aot_raw = aot_mem.raw();\n");
 }
 
 std::string lower_aot_memory_accesses(std::string text) {
@@ -1285,14 +1511,14 @@ std::string lower_aot_memory_accesses(std::string text) {
     // Lower ordinary aligned byte/half/word accesses to that shared view.
     static const std::regex access_pattern(
         R"(rt\.memory\(\)\.aot_(load|store)(8|16|32)\()" );
-    return std::regex_replace(text, access_pattern, "aot_mem.aot_$1$2(");
+    return replace_prefixed_regex(std::move(text), "rt.memory().aot_", access_pattern, "aot_mem.aot_$1$2(");
 }
 
 std::string lower_constant_fpr_accesses(std::string text) {
     // All Allegrex FPR operands emitted by the decoder are architectural
     // constants in [0,31]. Avoid helper calls/bounds branches in enormous AOT
     // functions so MSVC can keep float lanes in registers across basic blocks.
-    const std::regex read_pattern(R"(ctx\.fpr_bits\(([0-9]+)\))");
+    static const std::regex read_pattern(R"(ctx\.fpr_bits\(([0-9]+)\))");
     std::smatch match;
     std::string lowered;
     lowered.reserve(text.size());
@@ -1310,6 +1536,9 @@ std::string lower_constant_fpr_accesses(std::string text) {
     text = std::move(lowered);
 
     constexpr std::string_view needle = "ctx.set_fpr_bits(";
+    lowered.clear();
+    lowered.reserve(text.size());
+    std::size_t copied = 0u;
     std::size_t search = 0u;
     while ((search = text.find(needle, search)) != std::string::npos) {
         std::size_t cursor = search + needle.size();
@@ -1344,10 +1573,13 @@ std::string lower_constant_fpr_accesses(std::string text) {
         const std::string expression = text.substr(first, last - first);
         const std::string replacement = "ctx.fpr[" + std::to_string(index) +
             "] = std::bit_cast<float>(" + expression + ")";
-        text.replace(search, close - search + 1u, replacement);
-        search += replacement.size();
+        lowered.append(text, copied, search - copied);
+        lowered += replacement;
+        copied = close + 1u;
+        search = copied;
     }
-    return text;
+    lowered.append(text, copied, text.size() - copied);
+    return lowered;
 }
 
 // VFPU operands in automatic AOT are encoded literals. Convert the
@@ -1355,95 +1587,135 @@ std::string lower_constant_fpr_accesses(std::string text) {
 // scalar-vs-control selection and 1..4-lane loops disappear before MSVC sees the
 // giant translation units. Dynamic-size matrix helpers remain untouched.
 std::string lower_constant_vfpu_accesses(std::string text) {
-    const std::regex read_prefix(
+    static const std::regex read_prefix(
         R"(ctx\.read_vfpu_vector_with_source_prefix\(([A-Za-z0-9_]+), ([0-9]+)u, ([1-4])u, ([01])u\);)" );
-    text = std::regex_replace(text, read_prefix,
+    text = replace_prefixed_regex(std::move(text), "ctx.read_vfpu_vector_with_source_prefix(", read_prefix,
         "ctx.read_vfpu_vector_with_source_prefix_ct<$2u, $3u, $4u>($1);");
 
-    const std::regex read_plain(
+    static const std::regex read_plain(
         R"(ctx\.read_vfpu_vector\(([A-Za-z0-9_]+), ([0-9]+)u, ([1-4])u\);)" );
-    text = std::regex_replace(text, read_plain,
+    text = replace_prefixed_regex(std::move(text), "ctx.read_vfpu_vector(", read_plain,
         "ctx.read_vfpu_vector_ct<$2u, $3u>($1);");
 
-    const std::regex write_prefix(
+    static const std::regex write_prefix(
         R"(ctx\.write_vfpu_vector_with_destination_prefix\(([A-Za-z0-9_]+), ([0-9]+)u, ([1-4])u\);)" );
-    text = std::regex_replace(text, write_prefix,
+    text = replace_prefixed_regex(std::move(text), "ctx.write_vfpu_vector_with_destination_prefix(", write_prefix,
         "ctx.write_vfpu_vector_with_destination_prefix_ct<$2u, $3u>($1);");
 
-    const std::regex write_plain(
+    static const std::regex write_plain(
         R"(ctx\.write_vfpu_vector\(([A-Za-z0-9_]+), ([0-9]+)u, ([1-4])u\);)" );
-    text = std::regex_replace(text, write_plain,
+    text = replace_prefixed_regex(std::move(text), "ctx.write_vfpu_vector(", write_plain,
         "ctx.write_vfpu_vector_ct<$2u, $3u>($1);");
 
-    const std::regex source_prefix_plain(
+    static const std::regex source_prefix_plain(
         R"(ctx\.apply_vfpu_source_prefix\(([A-Za-z0-9_]+), ([1-4])u, ([01])u\);)" );
-    text = std::regex_replace(text, source_prefix_plain,
+    text = replace_prefixed_regex(std::move(text), "ctx.apply_vfpu_source_prefix(", source_prefix_plain,
         "ctx.apply_vfpu_source_prefix_ct<$2u, $3u>($1);");
 
-    const std::regex fpu_to_word(
+    static const std::regex fpu_to_word(
         R"(ctx\.fpu_float_to_word\(([^,\n]+), ([0-3])u\))" );
-    text = std::regex_replace(text, fpu_to_word,
+    text = replace_prefixed_regex(std::move(text), "ctx.fpu_float_to_word(", fpu_to_word,
         "ctx.fpu_float_to_word_ct<$2u>($1)");
 
-    const std::regex vcmp(
+    static const std::regex vcmp(
         R"(ctx\.execute_vfpu_vcmp\(([0-9]+)u, ([0-9]+)u, ([1-4])u, ([0-9]+)u\);)" );
-    text = std::regex_replace(text, vcmp,
+    text = replace_prefixed_regex(std::move(text), "ctx.execute_vfpu_vcmp(", vcmp,
         "ctx.execute_vfpu_vcmp_ct<$1u, $2u, $3u, $4u>();");
 
-    const std::regex vcmov(
+    static const std::regex vcmov(
         R"(ctx\.execute_vfpu_vcmov\(([0-9]+)u, ([0-9]+)u, ([1-4])u, ([0-7])u, (true|false)\);)" );
-    text = std::regex_replace(text, vcmov,
+    text = replace_prefixed_regex(std::move(text), "ctx.execute_vfpu_vcmov(", vcmov,
         "ctx.execute_vfpu_vcmov_ct<$1u, $2u, $3u, $4u, $5>();");
 
-    const std::regex vdot(
+    static const std::regex vdot(
         R"(ctx\.execute_vfpu_vdot\(([0-9]+)u, ([0-9]+)u, ([0-9]+)u, ([1-4])u\);)" );
-    text = std::regex_replace(text, vdot,
+    text = replace_prefixed_regex(std::move(text), "ctx.execute_vfpu_vdot(", vdot,
         "ctx.execute_vfpu_vdot_ct<$1u, $2u, $3u, $4u>();");
 
-    const std::regex vscl(
+    static const std::regex vscl(
         R"(ctx\.execute_vfpu_vscl\(([0-9]+)u, ([0-9]+)u, ([0-9]+)u, ([1-4])u\);)" );
-    text = std::regex_replace(text, vscl,
+    text = replace_prefixed_regex(std::move(text), "ctx.execute_vfpu_vscl(", vscl,
         "ctx.execute_vfpu_vscl_ct<$1u, $2u, $3u, $4u>();");
 
-    const std::regex scalar_read(R"(ctx\.vfpu_scalar_bits\(([0-9]+)u\))");
-    text = std::regex_replace(text, scalar_read,
+    static const std::regex scalar_read(R"(ctx\.vfpu_scalar_bits\(([0-9]+)u\))");
+    text = replace_prefixed_regex(std::move(text), "ctx.vfpu_scalar_bits(", scalar_read,
         "ctx.vfpu_scalar_bits_ct<$1u>()");
 
     // set_vfpu_scalar_bits second arguments in generated code stay on one line.
-    const std::regex scalar_write(
+    static const std::regex scalar_write(
         R"(ctx\.set_vfpu_scalar_bits\(([0-9]+)u, ([^;\n]+)\);)" );
-    text = std::regex_replace(text, scalar_write,
+    text = replace_prefixed_regex(std::move(text), "ctx.set_vfpu_scalar_bits(", scalar_write,
         "ctx.set_vfpu_scalar_bits_ct<$1u>($2);");
     return text;
 }
 
 bool write_text_if_changed(const std::filesystem::path &path, const std::string &text) {
-    if (std::ifstream existing(path, std::ios::binary); existing) {
-        const std::string old((std::istreambuf_iterator<char>(existing)), std::istreambuf_iterator<char>());
-        if (old == text) return false;
-    }
-    const auto temporary = path.string() + ".tmp";
-    {
-        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-        if (!out) throw psprecomp::Error("Cannot create generated file: " + path.string());
-        out.write(text.data(), static_cast<std::streamsize>(text.size()));
-    }
-    std::filesystem::rename(temporary, path);
-    return true;
+    psprecomp::AtomicTextFile file(path);
+    file.stream().write(text.data(), static_cast<std::streamsize>(text.size()));
+    return file.commit();
 }
 
 int generate_auto(const std::filesystem::path &elf_path,
                   const std::filesystem::path &output_dir,
                   std::uint32_t load_base,
-                  std::uint32_t unit_span_bytes) {
+                  std::uint32_t unit_span_bytes,
+                  unsigned requested_jobs = 0u,
+                  bool builtin_accessors = false) {
+    const auto total_start = Clock::now();
+    auto stage_start = total_start;
+    const unsigned jobs = psprecomp::effective_jobs(requested_jobs, std::thread::hardware_concurrency());
+    std::cout << "PSPRecomp automatic AOT generation\nInput: " << elf_path.string()
+              << "\nOutput: " << output_dir.string() << "\nWorkers requested: " << jobs << "\n" << std::flush;
     const auto elf = psprecomp::Elf32Image::from_file(elf_path);
+    stage_timing("ELF loaded", stage_start);
+    stage_start = Clock::now();
     psprecomp::GuestMemory memory;
-    (void)elf.load_and_relocate(memory, load_base);
+    elf.load_into(memory, load_base);
+    stage_timing("Guest memory loaded", stage_start);
+    stage_start = Clock::now();
+    const auto relocations = elf.apply_relocations(memory, load_base);
+    stage_timing("Relocations " + std::to_string(relocations.total) + " (unsupported " + std::to_string(relocations.unsupported) + ")", stage_start);
+    stage_start = Clock::now();
     std::vector<psprecomp::PspImport> imports;
     if (const auto module = elf.find_module_info(memory, load_base)) imports = elf.scan_imports(memory, *module);
     std::set<std::uint32_t> import_stubs;
     for (const auto &import : imports) import_stubs.insert(import.stub_address);
-    const auto program = psprecomp::analyze_program(elf, memory, load_base);
+    stage_timing("Imports " + std::to_string(imports.size()), stage_start);
+    stage_start = Clock::now();
+    auto last_progress = stage_start;
+    std::string previous_stage;
+    double cfg_seconds = 0.0;
+    const auto analysis_start = total_start;
+    auto finish_analysis_stage = [&] {
+        if (!previous_stage.empty()) {
+            if (previous_stage == "CFG / overlap / label aggregation") cfg_seconds = seconds_since(stage_start);
+            stage_timing(previous_stage + " complete", stage_start);
+        }
+    };
+    const auto program = psprecomp::analyze_program(elf, memory, load_base, 131072u,
+        [&](std::string_view stage, std::size_t done, std::size_t total) {
+            if (previous_stage != stage) {
+                finish_analysis_stage();
+                previous_stage = stage;
+                stage_start = Clock::now();
+                std::cout << "[AUTO] Building " << stage << "...\n" << std::flush;
+            }
+            if (total != 0u && (done == total || Clock::now() - last_progress >= std::chrono::seconds(1))) {
+                last_progress = Clock::now();
+                const auto elapsed = seconds_since(stage_start);
+                std::cout << "[AUTO] " << stage << ": " << done << "/" << total << " | "
+                          << (total ? 100.0 * done / total : 100.0) << "% | " << elapsed << "s";
+                if (elapsed >= 1.0 && done != 0u) {
+                    std::cout << " | " << done / elapsed << "/s";
+                    if (elapsed >= 3.0 && total != 0u && done >= total / 20u && done < total)
+                        std::cout << " | ETA " << elapsed * (total - done) / done << "s";
+                }
+                std::cout << "\n" << std::flush;
+            }
+        });
+    finish_analysis_stage();
+    const double analysis_seconds = seconds_since(analysis_start) - cfg_seconds;
+    stage_start = Clock::now();
     if (program.executable_ranges.empty()) throw psprecomp::Error("ELF has no executable ranges");
 
     std::filesystem::create_directories(output_dir);
@@ -1486,6 +1758,12 @@ int generate_auto(const std::filesystem::path &elf_path,
         if (!unit.entries.empty()) units.push_back(std::move(unit));
     }
 
+    // Buckets that produced a translation unit.  Fixed cross-unit edges may name
+    // a bucket directly only when it exists; targets outside this set (data,
+    // stale constants, code past the emitted span) use the exact dispatch path.
+    std::set<std::uint32_t> unit_buckets;
+    for (const auto &unit : units) unit_buckets.insert(unit.bucket);
+
     // assign the same compact entry ids used by each unit's dense
     // dispatcher globally before emission. Fixed cross-unit edges can pass the
     // destination id directly and skip the target unit's PC->entry table lookup.
@@ -1509,19 +1787,80 @@ int generate_auto(const std::filesystem::path &elf_path,
     }
     units_header << "} // namespace psprecomp\n";
     (void)write_text_if_changed(units_header_path, units_header.str());
+    const double partition_seconds = seconds_since(stage_start);
+    stage_timing("Partitioning / direct targets / header", stage_start);
+    std::size_t blocks_with_overlap = 0u, indirect_sites = 0u;
+    for (const auto &function : program.functions) {
+        blocks_with_overlap += function.basic_block_count;
+        indirect_sites += function.indirect_call_sites.size();
+    }
+    std::cout << "Runtime entry: " << psprecomp::hex32(elf.runtime_entry(load_base))
+              << "\nFunctions: " << program.functions.size() << "\nBlocks: " << program.covered_entry_labels.size()
+              << "\nLabels: " << program.covered_labels.size() << "\nBlocks with overlap: " << blocks_with_overlap
+              << "\nRepeated block entries: " << program.overlapping_label_count << "\nIndirect call sites: " << indirect_sites
+              << "\nUnits: " << units.size() << "\nWorkers: " << std::min<std::size_t>(jobs, units.size())
+              << "\nUnit span: " << unit_span_bytes << " bytes\n" << std::flush;
 
     std::set<std::filesystem::path> expected_cpp;
     std::size_t rewritten_units = 0u;
     std::size_t registered_entries = 0u;
+    std::vector<std::filesystem::path> paths;
     for (const auto &unit : units) {
         std::ostringstream suffix;
         suffix << std::setfill('0') << std::setw(4) << unit.bucket;
-        const std::string suffix_text = suffix.str();
-        const auto path = output_dir / ("generated_unit_" + suffix_text + ".cpp");
-        expected_cpp.insert(path.filename());
-
-        const GeneratedFunctionInput generated_unit{
-            "recomp_unit_" + suffix_text,
+        paths.push_back(output_dir / ("generated_unit_" + suffix.str() + ".cpp"));
+        expected_cpp.insert(paths.back().filename());
+        registered_entries += unit.entries.size();
+    }
+    enum class UnitStage { Queued, Emission, Gpr, Fpr, Memory, Vfpu, Writing, Complete };
+    constexpr std::array<const char *, 8> stage_names{
+        "queued", "C++ emission", "GPR lowering", "FPR lowering", "memory lowering", "VFPU lowering", "file output", "complete"};
+    struct UnitProgress {
+        std::atomic<UnitStage> stage{UnitStage::Queued};
+        std::atomic<std::size_t> blocks{0u};
+        Clock::time_point start{}; // Published once before the first release store.
+    };
+    struct UnitResult {
+        bool rewritten{};
+        std::uintmax_t bytes{};
+        std::array<double, 6> times{}; // emission, four lowering passes, output
+    };
+    std::vector<UnitProgress> progress(units.size());
+    std::vector<UnitResult> results(units.size());
+    std::mutex log_mutex;
+    auto last_unit_log = Clock::now();
+    auto report_units = [&] {
+        std::lock_guard lock(log_mutex);
+        if (Clock::now() - last_unit_log < std::chrono::seconds(1)) return;
+        last_unit_log = Clock::now();
+        for (std::size_t i = 0; i < units.size(); ++i) {
+            const auto state = progress[i].stage.load(std::memory_order_acquire);
+            if (state == UnitStage::Queued || state == UnitStage::Complete) continue;
+            const auto done = progress[i].blocks.load(std::memory_order_relaxed);
+            const auto total = units[i].entries.size();
+            const auto elapsed = seconds_since(progress[i].start);
+            std::cout << "[AUTO] Unit " << i + 1u << "/" << units.size() << ": "
+                      << stage_names[static_cast<std::size_t>(state)] << " | blocks " << done << "/" << total
+                      << " (" << (total ? 100.0 * done / total : 100.0) << "%) | " << elapsed << "s";
+            if (elapsed >= 1.0 && done != 0u) {
+                std::cout << " | " << done / elapsed << " blocks/s";
+                if (elapsed >= 3.0 && done >= total / 20u && done < total)
+                    std::cout << " | ETA " << elapsed * (total - done) / done << "s";
+            }
+            std::cout << "\n";
+        }
+        std::cout << std::flush;
+    };
+    const auto generation_start = Clock::now();
+    psprecomp::parallel_work(units.size(), jobs, [&](std::size_t index) {
+        const auto &unit = units[index];
+        auto &status = progress[index];
+        auto &result = results[index];
+        status.start = Clock::now();
+        status.stage.store(UnitStage::Emission, std::memory_order_release);
+        const auto &path = paths[index];
+        const GeneratedFunctionView generated_unit{
+            generated_unit_cpp_name(unit.bucket),
             executable_base + unit.bucket * unit_span_bytes,
             unit.instructions,
             unit.entries,
@@ -1529,9 +1868,11 @@ int generate_auto(const std::filesystem::path &elf_path,
             unit_span_bytes,
             &direct_entry_ids,
             &import_stubs,
+            &unit_buckets,
         };
 
-        std::ostringstream out;
+        psprecomp::AtomicTextFile file(path);
+        auto &out = file.stream();
         out << "#include \"psprecomp/runtime.hpp\"\n#include \"generated_units.hpp\"\n#include <bit>\n#include <cmath>\n#include <cstdint>\n#include <limits>\n\nnamespace psprecomp {\n";
         // The register-cache lowering passes (per-basic-block GPR/FPR caches and
         // the cross-unit hot-register cache) are deliberately absent.  They kept
@@ -1542,10 +1883,34 @@ int generate_auto(const std::filesystem::path &elf_path,
         // each grew past 2 GB, exhausting system memory during a normal build.
         // This pipeline matches the last configuration observed booting on
         // hardware.
-        out << lower_constant_vfpu_accesses(
-                lower_aot_memory_accesses(
-                    lower_constant_fpr_accesses(
-                        lower_constant_gpr_writes(emit_function_source(generated_unit, memory, generated_unit.name)))));
+        auto emission_part_start = Clock::now();
+        (void)emit_function_source(generated_unit, memory, generated_unit.name,
+            [&](std::string source) {
+                result.times[0] += seconds_since(emission_part_start);
+                auto pass = [&](UnitStage stage, std::size_t slot, auto lower) {
+                    status.stage.store(stage, std::memory_order_release);
+                    const auto start = Clock::now();
+                    source = lower(std::move(source));
+                    result.times[slot] += seconds_since(start);
+                };
+                pass(UnitStage::Gpr, 1u, lower_constant_gpr_writes);
+                pass(UnitStage::Fpr, 2u, lower_constant_fpr_accesses);
+                pass(UnitStage::Memory, 3u, lower_aot_memory_accesses);
+                pass(UnitStage::Vfpu, 4u, lower_constant_vfpu_accesses);
+                if (builtin_accessors) pass(UnitStage::Vfpu, 4u, lower_builtin_hot_accessors);
+                status.stage.store(UnitStage::Writing, std::memory_order_release);
+                const auto write_start = Clock::now();
+                out.write(source.data(), static_cast<std::streamsize>(source.size()));
+                if (!out) throw psprecomp::Error("Cannot write generated unit: " + path.string());
+                result.times[5] += seconds_since(write_start);
+                emission_part_start = Clock::now();
+                status.stage.store(UnitStage::Emission, std::memory_order_release);
+            }, [&](std::size_t blocks) {
+                status.blocks.store(blocks, std::memory_order_relaxed);
+                if (jobs == 1u) report_units();
+            });
+        status.stage.store(UnitStage::Writing, std::memory_order_release);
+        const auto output_start = Clock::now();
         out << "void register_generated_unit_" << unit.bucket << "(Runtime &runtime) {\n";
         out << "    runtime.register_generated_unit(" << unit.bucket << "u, "
             << psprecomp::hex32(generated_unit.address) << "u, " << unit_span_bytes
@@ -1554,12 +1919,29 @@ int generate_auto(const std::filesystem::path &elf_path,
         for (const auto label : unit.entries) {
             out << "    runtime.register_function(" << psprecomp::hex32(label) << "u, &"
                 << generated_unit.name << ", \"" << generated_unit.name << "\");\n";
-            ++registered_entries;
         }
         out << "}\n} // namespace psprecomp\n";
-        rewritten_units += write_text_if_changed(path, out.str()) ? 1u : 0u;
+        result.rewritten = file.commit();
+        result.bytes = std::filesystem::file_size(path);
+        result.times[5] += seconds_since(output_start);
+        status.stage.store(UnitStage::Complete, std::memory_order_release);
+        std::lock_guard lock(log_mutex);
+        std::cout << "[AOT] Unit " << index + 1u << "/" << units.size() << " completed -> "
+                  << path.filename().string() << " (" << result.bytes / 1000000.0 << " MB) | "
+                  << seconds_since(status.start) << "s | emit " << result.times[0] << "s | GPR " << result.times[1]
+                  << "s | FPR " << result.times[2] << "s | memory " << result.times[3] << "s | VFPU " << result.times[4]
+                  << "s | output " << result.times[5] << "s\n" << std::flush;
+    }, report_units);
+    const double generation_seconds = seconds_since(generation_start);
+    std::uintmax_t generated_bytes = 0u;
+    std::array<double, 6> worker_seconds{};
+    for (const auto &result : results) {
+        rewritten_units += result.rewritten ? 1u : 0u;
+        generated_bytes += result.bytes;
+        for (std::size_t i = 0u; i < worker_seconds.size(); ++i) worker_seconds[i] += result.times[i];
     }
 
+    stage_start = Clock::now();
     const auto registry_path = output_dir / "generated_registry.cpp";
     expected_cpp.insert(registry_path.filename());
     std::ostringstream registry;
@@ -1598,6 +1980,32 @@ int generate_auto(const std::filesystem::path &elf_path,
            << "  \"unit_span_bytes\": " << unit_span_bytes << "\n"
            << "}\n";
     write_text_if_changed(output_dir / "auto_codegen_report.json", report.str());
+    generated_bytes += std::filesystem::file_size(registry_path) + std::filesystem::file_size(units_header_path)
+                     + std::filesystem::file_size(output_dir / "auto_codegen_report.json");
+    const double manifest_seconds = seconds_since(stage_start);
+    stage_timing("Registry / manifest / stale output cleanup", stage_start);
+    stage_timing("Total generation", total_start);
+
+    std::cout << "======== PSPRecomp AOT Summary ========\n"
+              << "Functions:       " << program.functions.size() << "\n"
+              << "Blocks:          " << program.covered_entry_labels.size() << "\n"
+              << "Registered PCs:  " << registered_entries << "\n"
+              << "Units generated: " << units.size() << "\n"
+              << "Generated code:  " << generated_bytes << " bytes\n"
+              << "Analysis:        " << analysis_seconds << "s\n"
+              << "CFG / overlap:   " << cfg_seconds << "s\n"
+              << "Partition/header:" << partition_seconds << "s\n"
+              << "Generation wall: " << generation_seconds << "s (includes file output)\n"
+              << "C++ emission:    " << worker_seconds[0] << "s (sum of worker durations)\n"
+              << "GPR lowering:    " << worker_seconds[1] << "s (sum)\n"
+              << "FPR lowering:    " << worker_seconds[2] << "s (sum)\n"
+              << "Memory lowering: " << worker_seconds[3] << "s (sum)\n"
+              << "VFPU lowering:   " << worker_seconds[4] << "s (sum)\n"
+              << "File output:     " << worker_seconds[5] << "s (sum)\n"
+              << "Registry/report: " << manifest_seconds << "s\n"
+              << "Total:           " << seconds_since(total_start) << "s\n"
+              << "Workers:         " << std::min<std::size_t>(jobs, units.size()) << "\n"
+              << "=======================================\n";
 
     std::cout << "Automatic global codegen completed\n"
               << "  function seeds:    " << program.seeds.size() << "\n"
@@ -1614,24 +2022,63 @@ int generate_auto(const std::filesystem::path &elf_path,
 
 int main(int argc, char **argv) {
     try {
+        constexpr std::string_view usage =
+            "Usage:\n"
+            "  psp_recomp <ELF> <functions.csv> <generated_manifest.cpp>\n"
+            "  psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes] [--jobs N]\n"
+            "             [--builtin-accessors]\n"
+            "\nAutomatic generation options:\n"
+            "  --jobs N    Bounded generation workers (default/0: hardware concurrency; 1: serial).\n"
+            "              Worker count is capped at the number of units; unknown hardware uses 1.\n"
+            "  --builtin-accessors  Emit raw register-file indexing, PSPRECOMP_AOT_* memory macros\n"
+            "              and __builtin_bit_cast, for corpora compiled without inlining (MSVC /Ob0).\n"
+            "  load_base_hex    Default: 0x08804000\n"
+            "  unit_span_bytes  Default: 131072; must be nonzero and 4-byte aligned.\n"
+            "\nUnits are streamed to temporary files and published after completion.\n"
+            "Stage timings, block progress, rates and a final summary are printed to stdout.\n";
+        if (argc == 2 && (std::string_view(argv[1]) == "--help" || std::string_view(argv[1]) == "-h")) {
+            std::cout << usage;
+            return 0;
+        }
         if (argc >= 4 && std::string_view(argv[2]) == "--auto") {
-            if (argc > 6) {
-                std::cerr << "Usage: psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]\n";
-                return 2;
+            auto number = [](std::string_view value, const char *name, int base = 0) {
+                if (value.empty() || value.front() == '-' || value.front() == '+') throw psprecomp::Error(std::string("Invalid ") + name);
+                std::size_t consumed = 0u;
+                const auto parsed = std::stoull(std::string(value), &consumed, base);
+                if (consumed != value.size() || parsed > std::numeric_limits<std::uint32_t>::max())
+                    throw psprecomp::Error(std::string("Invalid ") + name);
+                return static_cast<std::uint32_t>(parsed);
+            };
+            std::uint32_t load_base = psprecomp::kDefaultPspUserLoadBase, unit_span = 0x20000u;
+            unsigned jobs = 0u;
+            bool have_jobs = false;
+            bool builtin_accessors = false;
+            unsigned positional = 0u;
+            for (int i = 4; i < argc; ++i) {
+                const std::string_view arg(argv[i]);
+                if (arg == "--jobs") {
+                    if (have_jobs || i + 1 >= argc) throw psprecomp::Error("--jobs requires one non-negative integer");
+                    jobs = number(argv[++i], "--jobs", 10);
+                    have_jobs = true;
+                } else if (arg == "--builtin-accessors") {
+                    builtin_accessors = true;
+                } else if (arg.starts_with("--")) {
+                    throw psprecomp::Error("Unknown option: " + std::string(arg));
+                } else if (positional == 0u) {
+                    load_base = number(arg, "load_base_hex");
+                    ++positional;
+                } else if (positional == 1u) {
+                    unit_span = number(arg, "unit_span_bytes");
+                    ++positional;
+                } else {
+                    throw psprecomp::Error("Too many automatic generation arguments");
+                }
             }
-            const std::uint32_t load_base = argc >= 5
-                ? static_cast<std::uint32_t>(std::stoul(argv[4], nullptr, 0))
-                : psprecomp::kDefaultPspUserLoadBase;
-            const std::uint32_t unit_span = argc >= 6
-                ? static_cast<std::uint32_t>(std::stoul(argv[5], nullptr, 0))
-                : 0x20000u;
             if (unit_span == 0u || (unit_span & 3u) != 0u) throw psprecomp::Error("unit_span_bytes must be non-zero and 4-byte aligned");
-            return generate_auto(argv[1], argv[3], load_base, unit_span);
+            return generate_auto(argv[1], argv[3], load_base, unit_span, jobs, builtin_accessors);
         }
         if (argc == 4) return generate_manual(argv[1], argv[2], argv[3]);
-        std::cerr << "Usage:\n"
-                  << "  psp_recomp <ELF> <functions.csv> <generated_manifest.cpp>\n"
-                  << "  psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]\n";
+        std::cerr << usage;
         return 2;
     } catch (const std::exception &e) {
         std::cerr << "psp_recomp error: " << e.what() << "\n";

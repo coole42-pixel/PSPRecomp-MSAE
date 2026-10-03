@@ -3,12 +3,16 @@
 #include "psprecomp/elf32.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace psprecomp {
+
+using AnalysisProgress = std::function<void(std::string_view, std::size_t, std::size_t)>;
 
 struct ExecutableRange {
     std::uint32_t start{};
@@ -41,6 +45,7 @@ struct ProgramAnalysis {
 [[nodiscard]] ProgramAnalysis analyze_program(const Elf32Image &elf,
                                               const GuestMemory &memory,
                                               std::uint32_t load_base,
-                                              std::size_t max_instructions_per_function = 131072u);
+                                              std::size_t max_instructions_per_function = 131072u,
+                                              const AnalysisProgress &progress = {});
 
 } // namespace psprecomp

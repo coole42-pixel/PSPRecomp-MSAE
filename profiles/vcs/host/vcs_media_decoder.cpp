@@ -208,7 +208,7 @@ std::size_t AudioStreamDecoder::read(std::span<std::uint8_t> output) {
 namespace {
 
 // Every 0xBD PES payload, minus its four-byte PSP substream header.
-std::vector<std::uint8_t> extract_pmf_private_stream(const std::filesystem::path &path) {
+std::vector<std::uint8_t> extract_pmf_private_stream(const std::filesystem::path &path,std::uint32_t channel) {
     std::vector<std::uint8_t> file;
     {
         std::FILE *handle = std::fopen(path.string().c_str(), "rb");
@@ -241,8 +241,11 @@ std::vector<std::uint8_t> extract_pmf_private_stream(const std::filesystem::path
             ++i;
             continue;
         }
-        elementary.insert(elementary.end(), file.begin() + static_cast<std::ptrdiff_t>(payload + kSubstreamHeader),
-                          file.begin() + static_cast<std::ptrdiff_t>(payload + payload_size));
+        // Private stream 1 can carry several languages. Combining their PES
+        // payloads corrupts the ATRAC frames at every packet boundary.
+        if(file[payload]==channel)
+            elementary.insert(elementary.end(), file.begin() + static_cast<std::ptrdiff_t>(payload + kSubstreamHeader),
+                              file.begin() + static_cast<std::ptrdiff_t>(payload + payload_size));
         i = payload + payload_size;
     }
     return elementary;
@@ -264,7 +267,13 @@ std::size_t measure_atrac3p_frame_size(std::span<const std::uint8_t> stream) {
     }
     if (first == stream.size()) return 0u;
     for (std::size_t i = first + 2u; i + 1u < stream.size(); ++i) {
-        if (sync_at(i)) return i - first;
+        if (sync_at(i)) {
+            if(first+8>stream.size()) return 0;
+            // The 10-bit size code describes the ATRAC payload in eight-byte
+            // units. Do not mistake a sync-like pattern inside coded audio for
+            // the next frame boundary.
+            return 8u+((((stream[first+2]&3u)<<8u)|stream[first+3])+1u)*8u;
+        }
     }
     return 0u;
 }
@@ -308,10 +317,10 @@ PmfAudioDecoder &PmfAudioDecoder::operator=(PmfAudioDecoder &&) noexcept = defau
 bool PmfAudioDecoder::is_open() const noexcept { return state_->codec != nullptr; }
 void PmfAudioDecoder::close() noexcept { state_->release(); }
 
-bool PmfAudioDecoder::open(const std::filesystem::path &path) {
+bool PmfAudioDecoder::open(const std::filesystem::path &path,std::uint32_t channel) {
     close();
     State &state = *state_;
-    state.stream = extract_pmf_private_stream(path);
+    state.stream = extract_pmf_private_stream(path,channel);
     const bool diag = std::getenv("PSPRECOMP_MPEG_DIAG") != nullptr;
     state.diag = diag;
     if (diag) std::fprintf(stderr, "[pmf-audio] elementary=%zu bytes\n", state.stream.size());

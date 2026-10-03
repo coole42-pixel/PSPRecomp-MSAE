@@ -12,6 +12,24 @@
 namespace psprecomp {
 namespace {
 
+std::size_t executable_words(const std::vector<ExecutableRange> &ranges) {
+    std::size_t total = 0u;
+    for (const auto &range : ranges) total += (range.end - range.start) / 4u;
+    return total;
+}
+
+class ScanProgress {
+public:
+    ScanProgress(const AnalysisProgress &callback, std::string_view stage, std::size_t total)
+        : callback_(callback), stage_(stage), total_(total) { if (callback_) callback_(stage_, 0u, total_); }
+    void step() { if ((++done_ & 16383u) == 0u && callback_) callback_(stage_, done_, total_); }
+    void finish() { if (callback_) callback_(stage_, total_, total_); }
+private:
+    const AnalysisProgress &callback_;
+    std::string_view stage_;
+    std::size_t total_{}, done_{};
+};
+
 std::vector<ExecutableRange> executable_ranges_for(const Elf32Image &elf, std::uint32_t load_base) {
     std::vector<ExecutableRange> ranges;
     for (std::size_t i = 0; i < elf.segments().size(); ++i) {
@@ -57,11 +75,14 @@ void add_seed(std::map<std::uint32_t, std::string> &seeds,
 }
 
 std::set<std::uint32_t> collect_global_block_starts(const GuestMemory &memory,
-                                                    const std::vector<ExecutableRange> &ranges) {
+                                                    const std::vector<ExecutableRange> &ranges,
+                                                    const AnalysisProgress &progress) {
+    ScanProgress scan(progress, "Global block starts", executable_words(ranges));
     std::set<std::uint32_t> starts;
     for (const auto &range : ranges) {
         starts.insert(range.start);
         for (std::uint32_t pc = range.start; pc + 4u <= range.end; pc += 4u) {
+            scan.step();
             const auto decoded = decode_allegrex(memory.load32(pc));
             if (is_conditional_branch(decoded.kind)) {
                 const auto target = branch_target(pc, decoded);
@@ -75,6 +96,7 @@ std::set<std::uint32_t> collect_global_block_starts(const GuestMemory &memory,
             }
         }
     }
+    scan.finish();
     return starts;
 }
 
@@ -218,9 +240,12 @@ void propagate_constant(const DecodedInstruction &decoded,
 
 void collect_materialized_code_pointers(const GuestMemory &memory,
                                         const std::vector<ExecutableRange> &ranges,
-                                        std::map<std::uint32_t, std::string> &seeds) {
-    const auto block_starts = collect_global_block_starts(memory, ranges);
+                                        std::map<std::uint32_t, std::string> &seeds,
+                                        const AnalysisProgress &progress) {
+    const auto block_starts = collect_global_block_starts(memory, ranges, progress);
+    ScanProgress blocks(progress, "Materialized / indirect targets", block_starts.size());
     for (const auto block_start : block_starts) {
+        blocks.step();
         if (!is_executable_address(ranges, block_start)) continue;
         ConstantState constants{};
         clear_all_constants(constants);
@@ -239,6 +264,8 @@ void collect_materialized_code_pointers(const GuestMemory &memory,
         }
     }
 
+    blocks.finish();
+    ScanProgress windows(progress, "LUI pointer windows", executable_words(ranges));
     // Function pointers are frequently assembled immediately before an API call,
     // including in the call's delay slot. A global block boundary can split the
     // LUI from that final ADDIU/ORI when the surrounding code has overlapping
@@ -247,6 +274,7 @@ void collect_materialized_code_pointers(const GuestMemory &memory,
     // ranges become seeds, so data addresses and ordinary constants are ignored.
     for (const auto &range : ranges) {
         for (std::uint32_t start = range.start; start + 4u <= range.end; start += 4u) {
+            windows.step();
             const auto first = decode_allegrex(memory.load32(start));
             if (first.kind != OpcodeKind::Lui || first.rt == 0u) continue;
 
@@ -268,48 +296,65 @@ void collect_materialized_code_pointers(const GuestMemory &memory,
             }
         }
     }
+    windows.finish();
 }
 
 void collect_relocated_data_code_pointers(const Elf32Image &elf,
                                           const GuestMemory &memory,
                                           std::uint32_t load_base,
                                           const std::vector<ExecutableRange> &ranges,
-                                          std::map<std::uint32_t, std::string> &seeds) {
+                                          std::map<std::uint32_t, std::string> &seeds,
+                                          const AnalysisProgress &progress) {
+    std::size_t total = 0u;
+    for (const auto &segment : elf.segments()) {
+        if (segment.type == 1u && (segment.flags & 1u) == 0u) total += segment.file_size / 4u;
+    }
+    ScanProgress scan(progress, "Relocated data pointers", total);
     for (std::size_t i = 0; i < elf.segments().size(); ++i) {
         const auto &segment = elf.segments()[i];
         if (segment.type != 1u || (segment.flags & 1u) != 0u || segment.file_size < 4u) continue;
         const std::uint32_t start = elf.segment_runtime_address(i, load_base);
         const std::uint32_t size = segment.file_size & ~3u;
         for (std::uint32_t offset = 0u; offset < size; offset += 4u) {
+            scan.step();
             add_seed(seeds, ranges, memory.load32(start + offset), "relocated_data_code_pointer");
         }
     }
+    scan.finish();
 }
 
 std::map<std::uint32_t, std::string> collect_initial_seeds(const Elf32Image &elf,
                                                            const GuestMemory &memory,
                                                            std::uint32_t load_base,
-                                                           const std::vector<ExecutableRange> &ranges) {
+                                                           const std::vector<ExecutableRange> &ranges,
+                                                           const AnalysisProgress &progress) {
     std::map<std::uint32_t, std::string> seeds;
     const std::uint32_t entry = elf.runtime_entry(load_base);
     add_seed(seeds, ranges, entry, "elf_entry");
 
+    ScanProgress calls(progress, "Direct call seeds", executable_words(ranges));
     for (const auto &range : ranges) {
         for (std::uint32_t pc = range.start; pc + 4u <= range.end; pc += 4u) {
+            calls.step();
             const auto decoded = decode_allegrex(memory.load32(pc));
             if (decoded.kind != OpcodeKind::Jal) continue;
             add_seed(seeds, ranges, direct_jump_target(pc, decoded), "direct_jal_target");
         }
     }
-    collect_materialized_code_pointers(memory, ranges, seeds);
-    collect_relocated_data_code_pointers(elf, memory, load_base, ranges, seeds);
+    calls.finish();
+    collect_materialized_code_pointers(memory, ranges, seeds, progress);
+    collect_relocated_data_code_pointers(elf, memory, load_base, ranges, seeds, progress);
     // R_MIPS_32 relocations are the authoritative source for function pointers
     // stored in read-only tables embedded in the executable segment (init arrays,
     // vtables, callbacks). Scanning raw RX words would confuse J opcodes with pointers.
-    for (const auto &site : elf.relocation_sites(load_base)) {
+    const auto sites = elf.relocation_sites(load_base);
+    ScanProgress relocated(progress, "Relocation pointer sites", sites.size());
+    for (const auto &site : sites) {
+        relocated.step();
         if (site.type != 2u || !memory.contains(site.patch_address, 4u)) continue;
         add_seed(seeds, ranges, memory.load32(site.patch_address), "relocated_r_mips32_code_pointer");
     }
+    relocated.finish();
     return seeds;
 }
 
@@ -317,7 +362,9 @@ FunctionAnalysis analyze_function(std::uint32_t entry,
                                   const GuestMemory &memory,
                                   const std::vector<ExecutableRange> &ranges,
                                   const std::map<std::uint32_t, std::string> &known_seeds,
-                                  std::size_t max_instructions) {
+                                  std::size_t max_instructions,
+                                  const AnalysisProgress &progress,
+                                  std::size_t completed_functions) {
     FunctionAnalysis result{};
     result.entry = entry;
     std::deque<std::uint32_t> pending_blocks;
@@ -345,6 +392,8 @@ FunctionAnalysis analyze_function(std::uint32_t entry,
             if (pc != entry && known_seeds.contains(pc) && pc != block_start) break;
 
             result.labels.insert(pc);
+            if ((result.labels.size() & 4095u) == 0u && progress)
+                progress("CFG / overlap / label aggregation", completed_functions, known_seeds.size());
             const auto decoded = decode_allegrex(memory.load32(pc));
             if (decoded.kind == OpcodeKind::Unsupported || decoded.kind == OpcodeKind::Vfpu) {
                 ++result.unsupported_instruction_count;
@@ -410,17 +459,22 @@ bool is_executable_address(const std::vector<ExecutableRange> &ranges, std::uint
 ProgramAnalysis analyze_program(const Elf32Image &elf,
                                 const GuestMemory &memory,
                                 std::uint32_t load_base,
-                                std::size_t max_instructions_per_function) {
+                                std::size_t max_instructions_per_function,
+                                const AnalysisProgress &progress) {
     ProgramAnalysis program{};
+    if (progress) progress("Executable ranges", 0u, 0u);
     program.executable_ranges = executable_ranges_for(elf, load_base);
-    program.seeds = collect_initial_seeds(elf, memory, load_base, program.executable_ranges);
+    if (progress) progress("Executable ranges", program.executable_ranges.size(), program.executable_ranges.size());
+    program.seeds = collect_initial_seeds(elf, memory, load_base, program.executable_ranges, progress);
+    if (progress) progress("Functions discovered", program.seeds.size(), program.seeds.size());
     program.functions.reserve(program.seeds.size());
 
     std::unordered_map<std::uint32_t, std::size_t> label_owners;
+    if (progress) progress("CFG / overlap / label aggregation", 0u, program.seeds.size());
     for (const auto &[entry, source] : program.seeds) {
         (void)source;
         auto function = analyze_function(entry, memory, program.executable_ranges, program.seeds,
-                                         max_instructions_per_function);
+                                         max_instructions_per_function, progress, program.functions.size());
         for (const auto label : function.labels) program.covered_labels.insert(label);
         for (const auto label : function.entry_labels) {
             const auto [it, inserted] = label_owners.emplace(label, program.functions.size());
@@ -428,6 +482,7 @@ ProgramAnalysis analyze_program(const Elf32Image &elf,
             program.covered_entry_labels.insert(label);
         }
         program.functions.push_back(std::move(function));
+        if (progress) progress("CFG / overlap / label aggregation", program.functions.size(), program.seeds.size());
     }
     return program;
 }

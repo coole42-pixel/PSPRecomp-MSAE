@@ -52,6 +52,7 @@ static_assert(sizeof(Rel32) == 8);
 
 constexpr std::uint32_t kPtLoad = 1u;
 constexpr std::uint32_t kShtNobits = 8u;
+constexpr std::uint32_t kRMips16 = 1u;
 constexpr std::uint32_t kRMips32 = 2u;
 constexpr std::uint32_t kRMips26 = 4u;
 constexpr std::uint32_t kRMipsHi16 = 5u;
@@ -265,7 +266,12 @@ RelocationStats Elf32Image::apply_relocations(GuestMemory &memory, std::uint32_t
                 for (std::size_t j = i + 1u; j < count; ++j) {
                     const std::uint32_t candidate_type = rels[j].info & 0x0Fu;
                     if (candidate_type == kRMipsHi16) continue;
-                    if (candidate_type != kRMipsLo16 || (rels[j].info >> 8u) != identity || !valid[j]) continue;
+                    // PSP VFPU memory operands can use R_MIPS_16 as the low
+                    // member of a HI16 pair (MotorStorm does this for shadow
+                    // projection coefficients). Its signed carry is the same
+                    // as LO16; skipping it pairs the LUI with an unrelated low.
+                    if ((candidate_type != kRMipsLo16 && candidate_type != kRMips16) ||
+                        (rels[j].info >> 8u) != identity || !valid[j]) continue;
                     const auto low = static_cast<std::int16_t>(original_ops[j] & 0xFFFFu);
                     std::uint32_t value = (op & 0xFFFFu) << 16u;
                     value += static_cast<std::uint32_t>(static_cast<std::int32_t>(low));
@@ -282,8 +288,10 @@ RelocationStats Elf32Image::apply_relocations(GuestMemory &memory, std::uint32_t
                 break;
             }
             case kRMipsLo16:
+            case kRMips16:
                 op = (op & 0xFFFF0000u) | ((op + relocate_to) & 0xFFFFu);
-                ++stats.r_mips_lo16;
+                if (type == kRMips16) ++stats.r_mips_16;
+                else ++stats.r_mips_lo16;
                 break;
             default:
                 ++stats.unsupported;

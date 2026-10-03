@@ -66,7 +66,7 @@ public:
     PmfAudioDecoder(PmfAudioDecoder &&) noexcept;
     PmfAudioDecoder &operator=(PmfAudioDecoder &&) noexcept;
 
-    [[nodiscard]] bool open(const std::filesystem::path &path);
+    [[nodiscard]] bool open(const std::filesystem::path &path, std::uint32_t channel = 0);
     [[nodiscard]] std::size_t read(std::span<std::uint8_t> output);
     [[nodiscard]] bool is_open() const noexcept;
     void close() noexcept;

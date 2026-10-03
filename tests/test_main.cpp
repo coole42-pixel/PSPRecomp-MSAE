@@ -3,8 +3,11 @@
 #include "psprecomp/elf32.hpp"
 #include "psprecomp/guest_memory.hpp"
 #include "psprecomp/deflate.hpp"
+#include "psprecomp/hle_sas.hpp"
 #include "psprecomp/nid_registry.hpp"
 #include "psprecomp/program_analysis.hpp"
+#include "psprecomp/parallel_work.hpp"
+#include "../tools/aot_output.hpp"
 #include "psprecomp/runtime.hpp"
 #include "psprecomp/sha256.hpp"
 
@@ -743,6 +746,109 @@ static void test_automatic_cross_unit_tail_chaining() {
 #endif
 }
 
+static void test_parallel_work_and_atomic_output() {
+    require(psprecomp::effective_jobs(0u, 0u) == 1u, "Unknown hardware concurrency must use one worker");
+    require(psprecomp::effective_jobs(0u, 20u) == 20u && psprecomp::effective_jobs(4u, 20u) == 4u,
+            "Worker selection ignored explicit or automatic concurrency");
+    const auto caller = std::this_thread::get_id();
+    psprecomp::parallel_work(10u, 1u, [&](std::size_t) {
+        require(std::this_thread::get_id() == caller, "--jobs 1 must execute on the calling thread");
+    }, [] {});
+    std::vector<std::size_t> values(1000u);
+    psprecomp::parallel_work(values.size(), 4u, [&](std::size_t i) { values[i] = i * i; }, [] {});
+    for (std::size_t i = 0u; i < values.size(); ++i) require(values[i] == i * i, "Parallel aggregation lost a result");
+    std::atomic<unsigned> active{0u};
+    std::atomic<bool> start{false};
+    std::atomic<unsigned> completed{0u};
+    bool caught = false;
+    try {
+        psprecomp::parallel_work(4u, 4u, [&](std::size_t i) {
+            ++active;
+            struct Exit { std::atomic<unsigned> &active; ~Exit() { --active; } } exit{active};
+            if (i == 0u) {
+                while (active != 4u) std::this_thread::yield();
+                start = true;
+            } else {
+                while (!start) std::this_thread::yield();
+            }
+            if (i == 0u) throw std::runtime_error("worker failure");
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            ++completed;
+        }, [] {});
+    } catch (const std::runtime_error &error) { caught = std::string(error.what()) == "worker failure"; }
+    require(caught && active == 0u && completed == 3u, "Worker exception was lost or workers were not joined");
+    psprecomp::parallel_work(0u, 0u, [](std::size_t) { throw std::runtime_error("empty work ran"); }, [] {});
+
+    const auto root = std::filesystem::temp_directory_path() / "psprecomp_atomic_output_test";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    const auto final = root / "unit.cpp";
+    { psprecomp::AtomicTextFile file(final); file.stream() << "old"; require(file.commit(), "Initial file was not published"); }
+    const auto stamp = std::filesystem::last_write_time(final);
+    { psprecomp::AtomicTextFile file(final); file.stream() << "old"; require(!file.commit(), "Unchanged output was rewritten"); }
+    require(std::filesystem::last_write_time(final) == stamp, "Unchanged output timestamp changed");
+    { psprecomp::AtomicTextFile file(final); file.stream() << "new"; require(file.commit(), "Existing output replacement failed"); }
+    bool write_failed = false;
+    try {
+        psprecomp::AtomicTextFile file(final);
+        file.stream() << "partial";
+        file.stream().setstate(std::ios::badbit);
+        (void)file.commit();
+    } catch (const psprecomp::Error &) { write_failed = true; }
+    require(write_failed && !std::filesystem::exists(final.string() + ".tmp"), "Failed output left a temporary file");
+    std::string preserved;
+    { std::ifstream file(final); file >> preserved; }
+    require(preserved == "new", "Failed output overwrote the completed file");
+    const auto fresh = root / "fresh.cpp";
+    { psprecomp::AtomicTextFile file(fresh); file.stream() << "partial"; }
+    require(!std::filesystem::exists(fresh) && !std::filesystem::exists(fresh.string() + ".tmp"),
+            "Uncommitted output left a partial final or temporary file");
+    std::filesystem::remove_all(root);
+}
+
+static void test_parallel_codegen_determinism_and_failure() {
+#ifdef PSPRECOMP_CODEGEN_PATH
+    const auto root = std::filesystem::temp_directory_path() / "psprecomp_parallel_codegen_test";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    const auto elf_path = root / "parallel.elf";
+    const auto bytes = make_cross_unit_branch_test_elf();
+    { std::ofstream out(elf_path, std::ios::binary); out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size())); }
+    const std::string base = shell_quote(std::filesystem::path(PSPRECOMP_CODEGEN_PATH)) + " " + shell_quote(elf_path) + " --auto ";
+    std::map<std::string, std::string> reference;
+    for (const unsigned jobs : {1u, 4u, 20u, 0u}) {
+        const auto output = root / ("jobs_" + std::to_string(jobs));
+        const auto command = base + shell_quote(output) + " --jobs " + std::to_string(jobs) + " 0x08804000 64";
+        require(std::system(shell_command(command).c_str()) == 0, "Parallel CLI generation failed");
+        std::map<std::string, std::string> files;
+        for (const auto &entry : std::filesystem::directory_iterator(output)) {
+            require(entry.path().extension() != ".tmp", "Successful generation left a temporary file");
+            std::ifstream in(entry.path(), std::ios::binary);
+            files[entry.path().filename().string()] = std::string(std::istreambuf_iterator<char>(in), {});
+        }
+        if (jobs == 1u) reference = files;
+        else require(files == reference, "Generated units, header, registry or report depend on worker count");
+        require(files.at("generated_units.hpp").find("recomp_unit_0000(") < files.at("generated_units.hpp").find("recomp_unit_0001("),
+                "Unit declarations lost address ordering");
+    }
+    const auto failed = root / "failed";
+    std::filesystem::create_directories(failed / "generated_unit_0000.cpp"); // Force a worker publication error.
+    const auto command = base + shell_quote(failed) + " 0x08804000 64 --jobs 4";
+    require(std::system(shell_command(command).c_str()) != 0, "Worker output error was silently ignored");
+    require(std::filesystem::is_directory(failed / "generated_unit_0000.cpp"), "Failure replaced the conflicting destination");
+    require(!std::filesystem::exists(failed / "generated_registry.cpp") && !std::filesystem::exists(failed / "auto_codegen_report.json"),
+            "Failed run published a success manifest");
+    for (const auto &entry : std::filesystem::directory_iterator(failed))
+        require(entry.path().extension() != ".tmp", "Worker error left a temporary file");
+    for (const auto *args : {"--jobs", "--jobs -1", "--jobs 1x", "--jobs 4294967296", "--jobs 2 --jobs 3", "--unknown"}) {
+        require(std::system(shell_command(base + shell_quote(root / "invalid") + " " + args).c_str()) != 0,
+                "Invalid CLI arguments were accepted");
+    }
+    require(!std::filesystem::exists(root / "invalid"), "Invalid CLI arguments started generation");
+    std::filesystem::remove_all(root);
+#endif
+}
+
 static std::vector<std::uint8_t> make_relocation_test_prx() {
     std::vector<std::uint8_t> bytes(0x1B8u, 0u);
     bytes[0] = 0x7Fu; bytes[1] = 'E'; bytes[2] = 'L'; bytes[3] = 'F';
@@ -799,11 +905,216 @@ static std::vector<std::uint8_t> make_relocation_test_prx() {
     return bytes;
 }
 
+static std::vector<std::uint8_t> make_vfpu_relocation_test_prx(std::uint32_t low_instruction) {
+    auto bytes=make_relocation_test_prx();
+    const std::vector<std::uint8_t> sections(bytes.begin()+0x140,bytes.end());
+    bytes.resize(0x1F8,0);
+    std::copy(sections.begin(),sections.end(),bytes.begin()+0x180);
+    put32(bytes,32,0x180); // relocated section table, beyond five REL entries
+    put32(bytes,68,20);put32(bytes,72,20);
+    put32(bytes,0x108,0x3C040002); // lui a0, 2
+    put32(bytes,0x10C,low_instruction);
+    put32(bytes,0x110,0x24421234); // later, unrelated LO16 must not pair with a0
+    const std::uint32_t types[]{2,4,5,1,6};
+    for(std::uint32_t i=0;i<5;++i){put32(bytes,0x120+i*8,i*4);put32(bytes,0x124+i*8,types[i]);}
+    put32(bytes,0x180+40+20,20);
+    put32(bytes,0x180+80+16,0x120);put32(bytes,0x180+80+20,40);
+    return bytes;
+}
+
+static void test_sce_sas_hle() {
+    constexpr std::uint32_t kNidInit = 0x42778A9Fu;
+    constexpr std::uint32_t kNidSetVoice = 0x99944089u;
+    constexpr std::uint32_t kNidSetVoicePcm = 0xE1CD9561u;
+    constexpr std::uint32_t kNidSetPitch = 0xAD84D37Fu;
+    constexpr std::uint32_t kNidSetVolume = 0x440CA7D8u;
+    constexpr std::uint32_t kNidKeyOn = 0x76F01ACAu;
+    constexpr std::uint32_t kNidKeyOff = 0xA0CF2FA4u;
+    constexpr std::uint32_t kNidGetEndFlag = 0x68A46B95u;
+    constexpr std::uint32_t kNidCore = 0xA3589D81u;
+    constexpr std::uint32_t kNidGetOutputMode = 0xE175EF66u;
+    constexpr std::uint32_t kNidSetOutputMode = 0xE855BF76u;
+    constexpr std::uint32_t kNidGetGrain = 0xBD11B7C2u;
+    constexpr std::uint32_t kNidSetGrain = 0xD1E0A01Eu;
+    constexpr std::uint32_t kNidGetAllEnvelopeHeights = 0x07F58C24u;
+
+    constexpr std::uint32_t kCore = 0x08810000u;
+    constexpr std::uint32_t kVagData = 0x08811000u;
+    constexpr std::uint32_t kPcmData = 0x08811100u;
+    constexpr std::uint32_t kOutput = 0x08812000u;
+
+    psprecomp::Runtime runtime;
+    psprecomp::install_sce_sas_core_hle(runtime);
+    auto &memory = runtime.memory();
+
+    const auto sas = [&](std::uint32_t nid, std::uint32_t a0 = 0u, std::uint32_t a1 = 0u,
+                         std::uint32_t a2 = 0u, std::uint32_t a3 = 0u, std::uint32_t a4 = 0u,
+                         std::uint32_t a5 = 0u) {
+        psprecomp::AllegrexContext call{};
+        call.set_gpr(4u, a0);
+        call.set_gpr(5u, a1);
+        call.set_gpr(6u, a2);
+        call.set_gpr(7u, a3);
+        call.set_gpr(8u, a4);
+        call.set_gpr(9u, a5);
+        runtime.invoke_import("sceSasCore", nid, call);
+        return call.gpr[2];
+    };
+
+    // Invalid initialization values must be rejected with PSP error codes.
+    require(sas(kNidInit, 0x08810001u, 256u, 32u, 0u, 44100u) == 0x80420005u,
+            "sceSasInit accepted a misaligned core address");
+    require(sas(kNidInit, kCore, 256u, 0u, 0u, 44100u) == 0x80420002u,
+            "sceSasInit accepted maxvoices=0");
+    require(sas(kNidInit, kCore, 0x30u, 32u, 0u, 44100u) == 0x80420001u,
+            "sceSasInit accepted an invalid grain size");
+    require(sas(kNidInit, kCore, 256u, 32u, 2u, 44100u) == 0x80420003u,
+            "sceSasInit accepted an invalid output mode");
+    require(sas(kNidInit, kCore, 256u, 32u, 0u, 22050u) == 0x80420004u,
+            "sceSasInit accepted an invalid sample rate");
+
+    // Valid initialization.
+    require(sas(kNidInit, kCore, 256u, 32u, 0u, 44100u) == 0u, "sceSasInit rejected a valid configuration");
+    {
+        auto &state = psprecomp::sas_hle_state();
+        require(state.initialized && state.core_address == kCore && state.grain_size == 256u &&
+                    state.max_voices == 32u && state.output_mode == 0u && state.sample_rate == 44100u,
+                "sceSasInit did not record the SAS context fields");
+    }
+
+    // Output mode and grain accessors.
+    require(sas(kNidGetOutputMode, kCore) == 0u, "sceSasGetOutputmode returned the wrong mode");
+    require(sas(kNidSetOutputMode, kCore, 1u) == 0u, "sceSasSetOutputmode rejected mode 1");
+    require(sas(kNidGetOutputMode, kCore) == 1u, "sceSasSetOutputmode did not take effect");
+    require(sas(kNidSetOutputMode, kCore, 2u) == 0x80420003u, "sceSasSetOutputmode accepted mode 2");
+    require(sas(kNidSetOutputMode, kCore, 0u) == 0u, "sceSasSetOutputmode could not restore mode 0");
+    require(sas(kNidGetGrain, kCore) == 256u, "sceSasGetGrain returned the wrong grain");
+    require(sas(kNidSetGrain, kCore, 0x30u) == 0x80420001u, "sceSasSetGrain accepted an invalid grain");
+    require(sas(kNidSetGrain, kCore, 128u) == 0u && sas(kNidGetGrain, kCore) == 128u,
+            "sceSasSetGrain did not take effect");
+    require(sas(kNidSetGrain, kCore, 256u) == 0u, "sceSasSetGrain could not restore the grain");
+
+    // Invalid context and voice handling.
+    require(sas(kNidSetVolume, 0x08820000u, 0u, 0x1000u, 0x1000u, 0u, 0u) == 0x80420100u,
+            "SAS call with an unknown core did not report NOT_INITIALIZED");
+    require(sas(kNidSetVolume, kCore, 32u, 0u, 0u, 0u, 0u) == 0x80420010u,
+            "sceSasSetVolume accepted voice 32");
+    require(sas(kNidSetPitch, kCore, 0u, 0x4001u) == 0x80420012u,
+            "sceSasSetPitch accepted an out-of-range pitch");
+    require(sas(kNidSetVolume, kCore, 0u, 0x1001u, 0u, 0u, 0u) == 0x80420018u,
+            "sceSasSetVolume accepted an out-of-range volume");
+    require(sas(kNidSetPitch, kCore, 0u, 0x1000u) == 0u, "sceSasSetPitch rejected 1x pitch");
+    require(sas(kNidSetVolume, kCore, 0u, 0x1000u, 0x1000u, 0u, 0u) == 0u,
+            "sceSasSetVolume rejected unity volume");
+
+    // VAG voice: deterministic two-block fixture (the second block is terminal).
+    for (std::uint32_t index = 0u; index < 15u; ++index)
+        memory.store8(kVagData + 2u + index, 0x11u);
+    memory.store8(kVagData + 16u, 0x00u);
+    memory.store8(kVagData + 17u, 0x07u);
+    require(sas(kNidGetEndFlag, kCore) == 0xFFFFFFFFu, "fresh SAS voices were not reported as ended");
+    require(sas(kNidSetVoice, kCore, 0u, kVagData, 0x20u, 0u) == 0u, "sceSasSetVoice rejected a valid VAG");
+    require(sas(kNidKeyOn, kCore, 0u) == 0u, "sceSasSetKeyOn failed");
+    require(sas(kNidKeyOn, kCore, 0u) == 0x80420016u, "sceSasSetKeyOn succeeded twice");
+    require((sas(kNidGetEndFlag, kCore) & 1u) == 0u, "keyed-on SAS voice was reported as ended");
+    memory.zero(kOutput, 256u);
+    require(sas(kNidCore, kCore, kOutput) == 0u, "sceSasCore failed");
+    {
+        bool any_nonzero = false;
+        for (std::uint32_t frame = 0u; frame < 64u; ++frame)
+            any_nonzero = any_nonzero ||
+                memory.load16(kOutput + frame * 4u) != 0u || memory.load16(kOutput + frame * 4u + 2u) != 0u;
+        require(any_nonzero, "sceSasCore rendered only silence for an active VAG voice");
+    }
+    require((sas(kNidGetEndFlag, kCore) & 1u) != 0u, "finite SAS voice never reached its end flag");
+    require(sas(kNidKeyOff, kCore, 0u) == 0x80420016u, "sceSasSetKeyOff succeeded on an ended voice");
+
+    // Key-off while sounding must release the envelope and retire the voice.
+    require(sas(kNidSetVoice, kCore, 0u, kVagData, 0x20u, 1u) == 0u, "sceSasSetVoice loop setup failed");
+    require(sas(kNidKeyOn, kCore, 0u) == 0u, "sceSasSetKeyOn (loop) failed");
+    require(sas(kNidKeyOff, kCore, 0u) == 0u, "sceSasSetKeyOff failed");
+    for (std::uint32_t call = 0u; call < 8u && (sas(kNidGetEndFlag, kCore) & 1u) == 0u; ++call)
+        require(sas(kNidCore, kCore, kOutput) == 0u, "sceSasCore failed during release");
+    require((sas(kNidGetEndFlag, kCore) & 1u) != 0u, "keyed-off SAS voice never retired");
+
+    // PCM voices: 16 deterministic samples, no loop.
+    for (std::uint32_t index = 0u; index < 16u; ++index)
+        memory.store16(kPcmData + index * 2u, static_cast<std::uint16_t>((index + 1u) * 100u));
+    require(sas(kNidSetVoicePcm, kCore, 1u, kPcmData, 0u, 0u) == 0x8042001Au,
+            "sceSasSetVoicePCM accepted a zero sample count");
+    require(sas(kNidSetVoicePcm, kCore, 1u, kPcmData, 17u, 17u) == 0x80420015u,
+            "sceSasSetVoicePCM accepted a loop position past the end");
+    require(sas(kNidSetVoicePcm, kCore, 1u, kPcmData, 16u, 0xFFFFFFFFu) == 0u,
+            "sceSasSetVoicePCM rejected valid PCM");
+    require(sas(kNidSetVolume, kCore, 1u, 0x1000u, 0x1000u, 0u, 0u) == 0u, "PCM voice volume setup failed");
+    require(sas(kNidKeyOn, kCore, 1u) == 0u, "PCM voice KeyOn failed");
+    memory.zero(kOutput, 256u);
+    require(sas(kNidCore, kCore, kOutput) == 0u, "sceSasCore failed for PCM voice");
+    require((sas(kNidGetEndFlag, kCore) & 2u) != 0u, "finite PCM voice never reached its end flag");
+    {
+        bool any_nonzero = false;
+        for (std::uint32_t frame = 0u; frame < 64u; ++frame)
+            any_nonzero = any_nonzero ||
+                memory.load16(kOutput + frame * 4u) != 0u || memory.load16(kOutput + frame * 4u + 2u) != 0u;
+        require(any_nonzero, "sceSasCore rendered only silence for an active PCM voice");
+    }
+
+    // Output buffer contract: exactly grain*4 bytes are written; a silent core
+    // (fresh init, no voices) writes deterministic zeros and nothing past the
+    // buffer.
+    require(sas(kNidInit, kCore, 64u, 32u, 0u, 44100u) == 0u, "sceSasInit (grain 64) failed");
+    for (std::uint32_t index = 0u; index < 320u; ++index) memory.store8(kOutput + index, 0xAAu);
+    require(sas(kNidCore, kCore, kOutput) == 0u, "sceSasCore (silent) failed");
+    for (std::uint32_t index = 0u; index < 256u; ++index)
+        require(memory.load8(kOutput + index) == 0u, "silent sceSasCore did not write deterministic zeros");
+    for (std::uint32_t index = 256u; index < 320u; ++index)
+        require(memory.load8(kOutput + index) == 0xAAu, "sceSasCore wrote past its output buffer");
+
+    // All-envelope-heights reporting.
+    {
+        constexpr std::uint32_t kHeights = 0x08812100u;
+        for (std::uint32_t index = 0u; index < 32u; ++index) memory.store32(kHeights + index * 4u, 0xDEADBEEFu);
+        require(sas(kNidGetAllEnvelopeHeights, kCore, kHeights) == 0u, "sceSasGetAllEnvelopeHeights failed");
+        for (std::uint32_t index = 0u; index < 32u; ++index)
+            require(memory.load32(kHeights + index * 4u) == 0u,
+                    "sceSasGetAllEnvelopeHeights did not report silent heights");
+        require(sas(kNidGetAllEnvelopeHeights, kCore, 0xFFFFFFFFu) == 0x80420014u,
+                "sceSasGetAllEnvelopeHeights accepted a bad destination");
+    }
+
+    // The envelope fallback defaults must fall (not rise) during release.
+    {
+        psprecomp::SasVoiceState voice{};
+        require(voice.adsr_modes[0] == 0 && voice.adsr_modes[1] == 1 && voice.adsr_modes[2] == 1 &&
+                    voice.adsr_modes[3] == 1,
+                "default SAS ADSR curve modes are wrong");
+        voice.adsr_configured = true;
+        voice.playing = true;
+        voice.on = false;
+        voice.envelope_height = psprecomp::kSasEnvelopeMaximum;
+        voice.envelope_phase = psprecomp::SasEnvelopePhase::Release;
+        voice.adsr_rates[3] = 0x10000000;
+        std::uint32_t steps = 0u;
+        while (voice.playing && steps < 64u) {
+            psprecomp::sas_step_envelope(voice);
+            ++steps;
+        }
+        require(!voice.playing, "keyed-off SAS envelope never released");
+    }
+
+    psprecomp::reset_sas_hle_state();
+}
+
 int main() {
     try {
         test_import_return_context_guard();
         test_chained_call_context_guard();
         test_nested_direct_chain_context_guard();
+
+        // Shared sceSasCore HLE: valid/invalid init, voice state, key on/off,
+        // volume/pitch, end flags, output buffer sizing and deterministic
+        // (silent or rendered) output.
+        test_sce_sas_hle();
 
         psprecomp::GuestMemory mem;
         mem.store32(0x08800000u, 0x12345678u);
@@ -966,6 +1277,12 @@ int main() {
         const auto vocp = psprecomp::decode_allegrex(0xD0440020u);
         require(vocp.kind == psprecomp::OpcodeKind::Vocp && vocp.mnemonic == "vocp",
                 "VOCP.S classification failed");
+        const auto vsgn = psprecomp::decode_allegrex(0xD04A0C0Cu);
+        require(vsgn.kind == psprecomp::OpcodeKind::Vsgn && vsgn.mnemonic == "vsgn",
+                "VSGN.Q classification failed");
+        const auto vi2uc = psprecomp::decode_allegrex(0xD03C85CBu);
+        require(vi2uc.kind == psprecomp::OpcodeKind::Vi2x && vi2uc.mnemonic == "vi2uc",
+                "VI2UC.Q classification failed");
         const auto vtfm = psprecomp::decode_allegrex(0xF104A003u);
         require(vtfm.kind == psprecomp::OpcodeKind::Vtfm && vtfm.mnemonic == "vtfm",
                 "VTFM3.T classification failed");
@@ -1323,6 +1640,20 @@ int main() {
         require((vocp_nan & 0x80000000u) == 0u && std::isnan(std::bit_cast<float>(vocp_nan)),
                 "VOCP.S positive NaN behavior failed");
 
+        psprecomp::AllegrexContext vsgn_context{};
+        vsgn_context.eat_vfpu_prefixes();
+        vsgn_context.set_vfpu_scalar_bits(0u, std::bit_cast<std::uint32_t>(-2.5f));
+        vsgn_context.execute_vfpu_vsgn(32u, 0u, 1u);
+        require(vsgn_context.vfpu_scalar_bits(32u) == std::bit_cast<std::uint32_t>(-1.0f),
+                "VSGN negative source failed");
+        vsgn_context.set_vfpu_scalar_bits(0u, std::bit_cast<std::uint32_t>(3.0f));
+        vsgn_context.execute_vfpu_vsgn(32u, 0u, 1u);
+        require(vsgn_context.vfpu_scalar_bits(32u) == std::bit_cast<std::uint32_t>(1.0f),
+                "VSGN positive source failed");
+        vsgn_context.set_vfpu_scalar_bits(0u, 0u);
+        vsgn_context.execute_vfpu_vsgn(32u, 0u, 1u);
+        require(vsgn_context.vfpu_scalar_bits(32u) == 0u, "VSGN zero source failed");
+
         psprecomp::AllegrexContext vector_init_context{};
         vector_init_context.eat_vfpu_prefixes();
         float vector_zero[4]{};
@@ -1641,6 +1972,8 @@ int main() {
         test_vfpu_branch_cfg_discovery();
         test_automatic_cfg_and_codegen();
         test_automatic_cross_unit_tail_chaining();
+        test_parallel_work_and_atomic_output();
+        test_parallel_codegen_determinism_and_failure();
         test_materialized_function_pointer_discovery();
 
         auto relocation_elf = psprecomp::Elf32Image::from_bytes(make_relocation_test_prx(), "synthetic_relocation.prx");
@@ -1653,7 +1986,61 @@ int main() {
         require(relocation_memory.load32(0x08804008u) == 0x3C020880u, "R_MIPS_HI16 relocation failed");
         require(relocation_memory.load32(0x0880400Cu) == 0x24425234u, "R_MIPS_LO16 relocation failed");
 
+        // PSP assemblers use R_MIPS_16 on VFPU memory operands. The HI16 must
+        // pair with it, including a signed-low carry, rather than a later LO16.
+        for(const auto instruction : {0xF8955A88u,0xE8955A88u,0xE8955A89u,0xE8955A8Au,0xE8955A8Bu}) {
+            auto elf=psprecomp::Elf32Image::from_bytes(make_vfpu_relocation_test_prx(instruction),"vfpu_relocation.prx");
+            psprecomp::GuestMemory m;constexpr std::uint32_t base=0x08804F28;
+            const auto stats=elf.load_and_relocate(m,base);
+            require(stats.total==5 && stats.invalid==0 && stats.unsupported==0,
+                    "PSP VFPU R_MIPS_16 relocation is supported");
+            require(m.load32(base+8)==0x3C040883,
+                    "HI16 pairs with R_MIPS_16 and carries the signed low half");
+            require(m.load32(base+12)==((instruction&0xFFFF0000u)|0xA9B0u|(instruction&3)),
+                    "R_MIPS_16 relocates VFPU address and preserves register selector bits");
+            require(m.load32(base+16)==0x2442615C,
+                    "Later LO16 relocates independently of the VFPU pair");
+        }
+
         psprecomp::GuestMemory segmented_memory;
+        // MotorStorm uses the PSP scratchpad for its compressed render indices.
+        // It must be a distinct, bounded region on both ordinary and AOT paths.
+        require(segmented_memory.contains(0x00010000u, 0x4000u) &&
+                    !segmented_memory.contains(0x0000FFFFu) &&
+                    !segmented_memory.contains(0x00014000u) &&
+                    !segmented_memory.contains(0x00013FFFu, 2u),
+                "PSP scratchpad mapping/bounds failed");
+        segmented_memory.store32(0x00010000u, 0x12345678u);
+        require(segmented_memory.load32(0x40010000u) == 0x12345678u &&
+                    segmented_memory.load32(0x80010000u) == 0x12345678u,
+                "PSP scratchpad aliases failed");
+        auto scratch_view = segmented_memory.aot_fast_view();
+        scratch_view.aot_store16(0x00013FFEu, 0xABCDu);
+        scratch_view.aot_store8(0x40010004u, 0xEFu);
+        segmented_memory.aot_store32(0x00010008u, 0x89ABCDEFu);
+        require(scratch_view.aot_load16(0x40013FFEu) == 0xABCDu &&
+                    scratch_view.aot_load8(0x00010004u) == 0xEFu &&
+                    scratch_view.aot_load32(0x40010008u) == 0x89ABCDEFu &&
+                    segmented_memory.aot_load32(0x00010000u) == 0x12345678u,
+                "AOT scratchpad loads/stores failed");
+        bool scratch_overrun_rejected = false;
+        try { scratch_view.aot_store32(0x00013FFEu, 0u); }
+        catch (const psprecomp::Error &) { scratch_overrun_rejected = true; }
+        require(scratch_overrun_rejected && scratch_view.aot_load16(0x00013FFEu) == 0xABCDu,
+                "Scratchpad overrun was accepted or partially written");
+        const std::array<std::uint8_t, 4> scratch_payload{4u, 3u, 2u, 1u};
+        segmented_memory.copy_in(0x00010010u, scratch_payload);
+        std::array<std::uint8_t, 4> scratch_copy{};
+        segmented_memory.copy_out(0x40010010u, scratch_copy);
+        require(scratch_copy == scratch_payload &&
+                    segmented_memory.raw_pointer(0x00010000u, 0x4000u) != nullptr &&
+                    segmented_memory.raw_pointer(0x00013FFEu, 4u) == nullptr,
+                "Scratchpad bulk access failed");
+        segmented_memory.zero(0x00010000u, 0x4000u);
+        require(scratch_view.aot_load32(0x00010000u) == 0u &&
+                    scratch_view.aot_load16(0x00013FFEu) == 0u &&
+                    segmented_memory.size() == 32u * 1024u * 1024u,
+                "Scratchpad clearing or main RAM independence failed");
         require(segmented_memory.contains(0x04000000u, psprecomp::GuestMemory::kVramSize),
                 "PSP EDRAM range was not mapped");
         segmented_memory.store32(0x04000000u, 0x12345678u);

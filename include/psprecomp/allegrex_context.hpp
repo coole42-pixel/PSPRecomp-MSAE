@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <cmath>
 #include <limits>
 
@@ -24,6 +25,13 @@ struct alignas(16) AllegrexContext {
     std::uint32_t pc{};
     std::array<float, 32> fpr{};
     std::uint32_t fcr31{};
+
+    // Address most recently reserved by ll (load-linked) plus the id of the
+    // reservation, consumed by sc (store-conditional).  The recompiler's
+    // cooperative scheduler never switches guest threads between the two
+    // instructions, so a matching address is always still reserved.
+    std::uint32_t ll_address{};
+    bool ll_reserved{};
 
     // VFPU is represented as 128 scalar lanes for now. The physical PSP
     // register views overlap; the final lowering layer will provide S/V/M views.
@@ -1217,6 +1225,87 @@ struct alignas(16) AllegrexContext {
                 (target_swizzle >= length && !target_constant)) {
                 result[lane] = 0.0f;
             }
+        }
+
+        write_vfpu_vector_with_destination_prefix(result, destination_register, length);
+    }
+
+    // VI2x family (vi2uc/vi2c/vi2us/vi2s): repacks integer-valued float lanes
+    // into packed byte (single word) or halfword (pair) outputs.  Lanes are
+    // read as raw 32-bit patterns under the source swizzle, matching the
+    // hardware's integer interpretation; the destination size shrinks to a
+    // single word for the byte forms and to a pair for the halfword forms.
+    void execute_vfpu_vi2x(std::uint32_t destination_register, std::uint32_t source_register,
+                           std::uint32_t length, std::uint32_t operation) noexcept {
+        if (length == 0u || length > 4u) return;
+
+        std::uint32_t source[4]{};
+        read_vfpu_vector(reinterpret_cast<float *>(source), source_register, length);
+        apply_vfpu_source_prefix(reinterpret_cast<float *>(source), length, 0u);
+
+        std::uint32_t packed[4]{};
+        std::uint32_t output_length = 1u;
+        if (operation <= 1u) {
+            std::uint32_t word = 0u;
+            for (std::uint32_t lane = 0u; lane < 4u; ++lane) {
+                std::uint32_t value = source[lane];
+                if (operation == 0u) {
+                    if (static_cast<std::int32_t>(value) < 0) value = 0u;
+                    value >>= 23u;
+                } else {
+                    value >>= 24u;
+                }
+                word |= (value & 0xFFu) << (lane * 8u);
+            }
+            packed[0] = word;
+        } else {
+            output_length = length > 2u ? 2u : 1u;
+            for (std::uint32_t index = 0u; index < output_length; ++index) {
+                std::uint32_t low = source[index * 2u];
+                std::uint32_t high = source[index * 2u + 1u];
+                if (operation == 2u) {
+                    if (static_cast<std::int32_t>(low) < 0) low = 0u;
+                    if (static_cast<std::int32_t>(high) < 0) high = 0u;
+                    low >>= 15u;
+                    high >>= 15u;
+                } else {
+                    low >>= 16u;
+                    high >>= 16u;
+                }
+                packed[index] = (low & 0xFFFFu) | ((high & 0xFFFFu) << 16u);
+            }
+        }
+
+        write_vfpu_vector_with_destination_prefix(reinterpret_cast<float *>(packed),
+                                                  destination_register, output_length);
+    }
+
+    // VSGN: per lane, writes the sign of the (swizzled) source as 1.0, -1.0
+    // or 0.0.  The T operand is forced to the zero constant by the hardware,
+    // so a no-prefix VSGN is just the sign of S.  A zero or denormal source
+    // yields +0.0 and the sign comes from the raw result bits, matching the
+    // hardware's handling of NaN inputs.
+    void execute_vfpu_vsgn(std::uint32_t destination_register, std::uint32_t source_register,
+                           std::uint32_t length) noexcept {
+        if (length == 0u || length > 4u) return;
+
+        const std::uint32_t source_prefix = vfpu_ctrl[0];
+        float source[4]{};
+        read_vfpu_vector(source, source_register, length);
+        apply_vfpu_source_prefix(source, length, 0u);
+
+        float result[4]{};
+        for (std::uint32_t lane = 0u; lane < length; ++lane) {
+            std::uint32_t bits = 0u;
+            std::memcpy(&bits, &source[lane], sizeof(bits));
+            if ((bits & 0x7F800000u) == 0u)
+                result[lane] = 0.0f;
+            else
+                result[lane] = (bits >> 31u) == 0u ? 1.0f : -1.0f;
+
+            const std::uint32_t source_swizzle = (source_prefix >> (lane * 2u)) & 3u;
+            const bool source_constant = ((source_prefix >> (12u + lane)) & 1u) != 0u;
+            if (source_swizzle >= length && !source_constant) result[lane] = 0.0f;
         }
 
         write_vfpu_vector_with_destination_prefix(result, destination_register, length);

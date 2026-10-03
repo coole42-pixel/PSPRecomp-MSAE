@@ -22,6 +22,8 @@ namespace psprecomp {
 
 class GuestMemory {
 public:
+    static constexpr std::uint32_t kScratchpadPhysicalBase = 0x00010000u;
+    static constexpr std::uint32_t kScratchpadSize = 16u * 1024u;
     static constexpr std::uint32_t kVramPhysicalBase = 0x04000000u;
     static constexpr std::uint32_t kVramSize = 2u * 1024u * 1024u;
     static constexpr std::uint32_t kVramMirrorCount = 4u;
@@ -68,17 +70,17 @@ public:
     public:
         [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint8_t aot_load8(std::uint32_t address) const {
             const std::uint32_t offset = ram_offset_of_fast(address);
-            if (offset <= ram_limit8_) return ram_data_[offset];
+            if (offset <= ram_limit8_ && !read_watched(address)) return ram_data_[offset];
             return owner_->aot_load8_slow(address);
         }
         [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint16_t aot_load16(std::uint32_t address) const {
             const std::uint32_t offset = ram_offset_of_fast(address);
-            if (offset <= ram_limit16_) return GuestMemory::read_le16(ram_data_ + offset);
+            if (offset <= ram_limit16_ && !read_watched(address)) return GuestMemory::read_le16(ram_data_ + offset);
             return owner_->aot_load16_slow(address);
         }
         [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint32_t aot_load32(std::uint32_t address) const {
             const std::uint32_t offset = ram_offset_of_fast(address);
-            if (offset <= ram_limit32_) return GuestMemory::read_le32(ram_data_ + offset);
+            if (offset <= ram_limit32_ && !read_watched(address)) return GuestMemory::read_le32(ram_data_ + offset);
             return owner_->aot_load32_slow(address);
         }
         PSPRECOMP_MEMORY_FAST_PATH void aot_store8(std::uint32_t address, std::uint8_t value) const {
@@ -118,17 +120,39 @@ public:
             owner_->aot_store32_slow(address, value);
         }
 
+        // Plain copy of the fast-path state for the PSPRECOMP_AOT_* macros
+        // below.  Corpora compiled at /Ob0 (no inlining, not even
+        // __forceinline) call the members above out of line; the macros keep
+        // the identical fast-path test as builtin operations and fall back to
+        // the members for every other case.
+        struct Raw {
+            std::uint8_t *ram;
+            std::uint32_t limit8, limit16, limit32;
+            bool write_watch;
+            std::uint32_t read_watch_low, read_watch_span;
+        };
+        [[nodiscard]] Raw raw() const noexcept {
+            return {ram_data_, ram_limit8_, ram_limit16_, ram_limit32_, write_watch_enabled_,
+                    read_watch_low_, read_watch_span_};
+        }
+
     private:
         friend class GuestMemory;
         AotFastView(GuestMemory *owner, std::uint8_t *ram_data,
                     std::uint32_t limit8, std::uint32_t limit16,
-                    std::uint32_t limit32, bool write_watch) noexcept
+                    std::uint32_t limit32, bool write_watch,
+                    std::uint32_t read_watch_low, std::uint32_t read_watch_span) noexcept
             : owner_(owner), ram_data_(ram_data), ram_limit8_(limit8),
               ram_limit16_(limit16), ram_limit32_(limit32),
-              write_watch_enabled_(write_watch) {}
+              write_watch_enabled_(write_watch), read_watch_low_(read_watch_low),
+              read_watch_span_(read_watch_span) {}
         [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH static constexpr std::uint32_t ram_offset_of_fast(
             std::uint32_t address) noexcept {
             return (address & 0x1FFFFFFFu) - GuestMemory::kPhysicalBase;
+        }
+        [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH bool read_watched(std::uint32_t address) const noexcept {
+            return read_watch_span_ != 0u &&
+                   (address & 0x1FFFFFFFu) - read_watch_low_ < read_watch_span_;
         }
         GuestMemory *owner_{};
         std::uint8_t *ram_data_{};
@@ -136,11 +160,13 @@ public:
         std::uint32_t ram_limit16_{};
         std::uint32_t ram_limit32_{};
         bool write_watch_enabled_{};
+        std::uint32_t read_watch_low_{};
+        std::uint32_t read_watch_span_{};
     };
 
     [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH AotFastView aot_fast_view() noexcept {
         return AotFastView(this, ram_data_, ram_limit8_, ram_limit16_, ram_limit32_,
-                           write_watch_enabled_);
+                           write_watch_enabled_, read_watch_low_, read_watch_span_);
     }
 
     // Fast paths used only by statically generated AOT code. They retain
@@ -156,17 +182,17 @@ public:
     // behavior these functions had when they lived entirely in the .cpp.
     [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint8_t aot_load8(std::uint32_t address) const {
         const std::uint32_t offset = ram_offset_of(address);
-        if (offset <= ram_limit8_) return ram_data_[offset];
+        if (offset <= ram_limit8_ && !read_watched(address)) return ram_data_[offset];
         return aot_load8_slow(address);
     }
     [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint16_t aot_load16(std::uint32_t address) const {
         const std::uint32_t offset = ram_offset_of(address);
-        if (offset <= ram_limit16_) return read_le16(ram_data_ + offset);
+        if (offset <= ram_limit16_ && !read_watched(address)) return read_le16(ram_data_ + offset);
         return aot_load16_slow(address);
     }
     [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint32_t aot_load32(std::uint32_t address) const {
         const std::uint32_t offset = ram_offset_of(address);
-        if (offset <= ram_limit32_) return read_le32(ram_data_ + offset);
+        if (offset <= ram_limit32_ && !read_watched(address)) return read_le32(ram_data_ + offset);
         return aot_load32_slow(address);
     }
     [[nodiscard]] std::uint32_t aot_load_word_left(std::uint32_t address, std::uint32_t existing) const;
@@ -246,7 +272,7 @@ public:
     [[nodiscard]] const std::vector<std::uint8_t> &vram_bytes() const noexcept;
 
 private:
-    enum class Region { Vram, Ram };
+    enum class Region { Scratchpad, Vram, Ram };
     struct ResolvedAddress {
         Region region;
         std::size_t offset;
@@ -301,6 +327,7 @@ private:
     void aot_store16_slow(std::uint32_t address, std::uint16_t value);
     void aot_store32_slow(std::uint32_t address, std::uint32_t value);
 
+    std::vector<std::uint8_t> scratchpad_;
     std::vector<std::uint8_t> vram_;
     std::vector<std::uint8_t> bytes_;
     // Cached view of bytes_ for the inline fast paths.  Neither region is ever
@@ -312,11 +339,76 @@ private:
     // nothing (0.599 us/dispatch against 0.595 without it), and it is not even
     // sound here -- this pointer aliases bytes_ below, which other members of
     // this class access directly.
+    [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH bool read_watched(std::uint32_t address) const noexcept {
+        return read_watch_span_ != 0u &&
+               (address & 0x1FFFFFFFu) - read_watch_low_ < read_watch_span_;
+    }
     std::uint8_t *ram_data_{};
     std::uint32_t ram_limit8_{};
     std::uint32_t ram_limit16_{};
     std::uint32_t ram_limit32_{};
     bool write_watch_enabled_{};
+    std::uint32_t read_watch_low_{};
+    std::uint32_t read_watch_span_{};
 };
 
 } // namespace psprecomp
+
+// Builtin-operation guest accesses emitted by `psp_recomp --builtin-accessors`.
+// They expect `aot_mem` (the unit's AotFastView) and `aot_raw` (aot_mem.raw())
+// in scope.  MSVC corpora built at /Ob0 cannot inline even __forceinline, so
+// every aot_load32 became three nested calls plus spilled temporaries; these
+// expand to the same fast-path test inline and call the view only on the slow
+// path.  The address expression is evaluated more than once: generated
+// addresses are register/constant arithmetic without side effects.  The entry
+// prologue asserts a little-endian host.  Other compilers honor always_inline,
+// so they keep the member calls.
+#if defined(_MSC_VER)
+#define PSPRECOMP_AOT_OFFSET(address) \
+    ((static_cast<::std::uint32_t>(address) & 0x1FFFFFFFu) - ::psprecomp::GuestMemory::kPhysicalBase)
+#define PSPRECOMP_AOT_READ_OK(address)                                                              \
+    (aot_raw.read_watch_span == 0u ||                                                               \
+     ((static_cast<::std::uint32_t>(address) & 0x1FFFFFFFu) - aot_raw.read_watch_low) >=           \
+         aot_raw.read_watch_span)
+#if defined(PSPRECOMP_AOT_ASSUME_NO_WRITE_WATCH)
+#define PSPRECOMP_AOT_WRITE_OK true
+#else
+#define PSPRECOMP_AOT_WRITE_OK (!aot_raw.write_watch)
+#endif
+#define PSPRECOMP_AOT_LOAD8(address)                                                                \
+    ((PSPRECOMP_AOT_OFFSET(address) <= aot_raw.limit8 && PSPRECOMP_AOT_READ_OK(address))           \
+         ? aot_raw.ram[PSPRECOMP_AOT_OFFSET(address)]                                               \
+         : aot_mem.aot_load8(address))
+#define PSPRECOMP_AOT_LOAD16(address)                                                               \
+    ((PSPRECOMP_AOT_OFFSET(address) <= aot_raw.limit16 && PSPRECOMP_AOT_READ_OK(address))          \
+         ? *reinterpret_cast<const ::std::uint16_t *>(aot_raw.ram + PSPRECOMP_AOT_OFFSET(address)) \
+         : aot_mem.aot_load16(address))
+#define PSPRECOMP_AOT_LOAD32(address)                                                               \
+    ((PSPRECOMP_AOT_OFFSET(address) <= aot_raw.limit32 && PSPRECOMP_AOT_READ_OK(address))          \
+         ? *reinterpret_cast<const ::std::uint32_t *>(aot_raw.ram + PSPRECOMP_AOT_OFFSET(address)) \
+         : aot_mem.aot_load32(address))
+#define PSPRECOMP_AOT_STORE8(address, value)                                                        \
+    ((PSPRECOMP_AOT_WRITE_OK && PSPRECOMP_AOT_OFFSET(address) <= aot_raw.limit8)                   \
+         ? static_cast<void>(aot_raw.ram[PSPRECOMP_AOT_OFFSET(address)] =                           \
+                                 static_cast<::std::uint8_t>(value))                                \
+         : aot_mem.aot_store8((address), static_cast<::std::uint8_t>(value)))
+#define PSPRECOMP_AOT_STORE16(address, value)                                                       \
+    ((PSPRECOMP_AOT_WRITE_OK && PSPRECOMP_AOT_OFFSET(address) <= aot_raw.limit16)                  \
+         ? static_cast<void>(*reinterpret_cast<::std::uint16_t *>(                                  \
+                                 aot_raw.ram + PSPRECOMP_AOT_OFFSET(address)) =                     \
+                                 static_cast<::std::uint16_t>(value))                               \
+         : aot_mem.aot_store16((address), static_cast<::std::uint16_t>(value)))
+#define PSPRECOMP_AOT_STORE32(address, value)                                                       \
+    ((PSPRECOMP_AOT_WRITE_OK && PSPRECOMP_AOT_OFFSET(address) <= aot_raw.limit32)                  \
+         ? static_cast<void>(*reinterpret_cast<::std::uint32_t *>(                                  \
+                                 aot_raw.ram + PSPRECOMP_AOT_OFFSET(address)) =                     \
+                                 static_cast<::std::uint32_t>(value))                               \
+         : aot_mem.aot_store32((address), static_cast<::std::uint32_t>(value)))
+#else
+#define PSPRECOMP_AOT_LOAD8(address) aot_mem.aot_load8(address)
+#define PSPRECOMP_AOT_LOAD16(address) aot_mem.aot_load16(address)
+#define PSPRECOMP_AOT_LOAD32(address) aot_mem.aot_load32(address)
+#define PSPRECOMP_AOT_STORE8(address, value) aot_mem.aot_store8((address), (value))
+#define PSPRECOMP_AOT_STORE16(address, value) aot_mem.aot_store16((address), (value))
+#define PSPRECOMP_AOT_STORE32(address, value) aot_mem.aot_store32((address), (value))
+#endif

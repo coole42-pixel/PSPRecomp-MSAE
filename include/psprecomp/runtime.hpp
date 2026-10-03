@@ -295,8 +295,10 @@ private:
     // Dense fixed table for compile-time direct unit chaining. Keeping this in
     // the Runtime object avoids vector indirections and repeated size loads on
     // hot generated call edges. Larger corpora fall back to exact PC dispatch
-    // for indices beyond this conservative capacity.
-    static constexpr std::size_t kGeneratedUnitFastCapacity = 512u;
+    // for indices beyond this conservative capacity.  MotorStorm's 4 KiB-span
+    // corpus has 641 units (small units keep MSVC frames and __chkstk probes
+    // small; see profiles/motorstorm/progress/PERFORMANCE_RACE_BENCH.md).
+    static constexpr std::size_t kGeneratedUnitFastCapacity = 1024u;
     std::array<RecompiledFunction, kGeneratedUnitFastCapacity> generated_units_{};
     // Entry-form companion used by dynamic JR/JALR chains so they can share the
     // caller's AotFastView instead of rebuilding RAM pointers/limits each unit.
