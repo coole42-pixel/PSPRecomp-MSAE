@@ -76,6 +76,7 @@ if(PSPRECOMP_LTO)
 endif()
 
 add_library(psprecomp_core STATIC
+    src/allegrex_context.cpp
     src/decoder.cpp
     src/deflate.cpp
     src/elf32.cpp

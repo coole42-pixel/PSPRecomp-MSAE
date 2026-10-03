@@ -42,6 +42,11 @@ void register_thread_return_target(psprecomp::Runtime &runtime);
 // thread/scheduler census.  Safe to call after Runtime::run returned.
 void report_summary();
 
+// Current execution-driven guest clock in microseconds.
+[[nodiscard]] std::uint64_t guest_time_us();
+// True when the INI frame rate replaces the game's own 30 fps pacing.
+[[nodiscard]] bool frame_rate_unlocked();
+
 
 
 } // namespace motorstorm

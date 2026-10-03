@@ -7,6 +7,8 @@ param(
     [ValidateSet('None','FXAA','SSAA4x')][string]$Antialiasing = 'None',
     [string]$InputScript = 'out/motorstorm/phase12/fixes/normal-race-straight-input.txt',
     [string]$SaveRoot = 'out/motorstorm/phase12/fixes/test-stick-v2',
+    # Reference captures were recorded at the game's original 30 fps pacing.
+    [string]$Fps = 'original',
     [switch]$Window
 )
 $repoDirectory = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../../..'))
@@ -16,6 +18,9 @@ $settings = @{
     PSPRECOMP_MOTORSTORM_RENDERER = $Renderer
     PSPRECOMP_MOTORSTORM_RESOLUTION = "$Resolution"
     PSPRECOMP_MOTORSTORM_AA = $Antialiasing.ToLowerInvariant()
+    PSPRECOMP_MOTORSTORM_FPS = $Fps
+    # Measure throughput, not the wall-clock limiter used when audio is off.
+    PSPRECOMP_MOTORSTORM_UNTHROTTLED = '1'
     PSPRECOMP_MOTORSTORM_SOFTGE = '1'
     PSPRECOMP_MOTORSTORM_SOFTGE_START_AFTER = "$RenderAfterGe"
     PSPRECOMP_MOTORSTORM_STOP_AFTER_GE = "$StopAfterGe"
@@ -30,7 +35,7 @@ $settings = @{
     PSPRECOMP_MOTORSTORM_FRAME_DUMP_EVERY = '80'
     PSPRECOMP_MOTORSTORM_FRAME_DUMP_COUNT = '34'
     PSPRECOMP_MOTORSTORM_FRAME_DUMP_DIR = $outputDirectory
-    PSPRECOMP_MOTORSTORM_WINDOW = $(if ($Window) { '1' } else { $null })
+    PSPRECOMP_MOTORSTORM_WINDOW = $(if ($Window) { '1' } else { '0' })
     PSPRECOMP_MOTORSTORM_SKIP_BOOT = $null
     PSPRECOMP_MOTORSTORM_SKIP_MOVIE = $null
     PSPRECOMP_MOTORSTORM_SKIP_MOVIE_SCENE = $null

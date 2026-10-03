@@ -1,5 +1,7 @@
+#include "motorstorm_env.hpp"
 #include "motorstorm_media.hpp"
 #include "motorstorm_bootstrap.hpp"
+#include "motorstorm_hle.hpp"
 #include "psprecomp/common.hpp"
 #include "vcs_media_decoder.hpp"
 #include <algorithm>
@@ -30,7 +32,7 @@ bool header_valid(std::span<const std::uint8_t> h) {
 }
 struct Movie {
     std::uint32_t ring{}, width{}, height{}, format{3}, default_stride{512}, frames{}, audio_frames{}, size{}, stream_offset{}, consumed_packets{};
-    std::uint64_t first{}, last{};
+    std::uint64_t first{}, last{}, start_us{};
     std::map<std::uint32_t, std::uint32_t> streams;
     std::array<bool,2> es{};
     std::filesystem::path source;
@@ -39,7 +41,7 @@ struct Movie {
     std::vector<std::uint8_t> image;
     std::map<std::uint32_t, std::vector<std::uint8_t>> ycbcr_images;
     bool video_eof{}, audio_eof{};
-    std::uint32_t audio_channel{};
+    std::uint32_t audio_channel{}, video_loops{}, audio_loops{};
 };
 struct Pending { AllegrexContext resume; std::uint32_t ring{}, count{}; };
 std::map<std::uint32_t, std::unique_ptr<Movie>> movies;
@@ -81,16 +83,51 @@ bool get_header(Runtime &r, std::uint32_t address, std::array<std::uint8_t,2048>
     if (!r.memory().contains(address,h.size())) return false;
     r.memory().copy_out(address,h); return header_valid(h);
 }
+// Looping movies (the main menu background) are not flushed or recreated:
+// the guest feeder simply rewinds its file and keeps putting the same stream
+// into the ring. The decoder then continues with the stream's first picture.
+// Our decoder reads the cached PMF, so detect the next pass from the packet
+// count fed since the last flush. The margin keeps a stream whose final read
+// was padded past its end from replaying.
+constexpr std::uint32_t loop_margin_packets = 16;
+bool feeding_next_pass(Runtime &r, const Movie &v, std::uint32_t loops) {
+    const std::uint64_t total = v.size / 2048;
+    return total && r.memory().load32(v.ring + 4) >= (loops + 1) * total + loop_margin_packets;
+}
+void restart_video(Runtime &r, Movie &v) {
+    // Release the packets retained for the previous pass's delayed frames.
+    const auto total_packets = v.size / 2048;
+    const auto leftover = total_packets > v.consumed_packets ? total_packets - v.consumed_packets : 0;
+    const auto used = r.memory().load32(v.ring + 12);
+    r.memory().store32(v.ring + 12, used > leftover ? used - leftover : 0);
+    v.video.close(); v.video_eof = false;
+    v.frames = v.consumed_packets = 0; ++v.video_loops;
+    log_line("MPEG", "video loop=" + std::to_string(v.video_loops));
+}
+void restart_audio(Movie &v) {
+    v.audio.close(); v.audio_eof = false; v.audio_frames = 0; ++v.audio_loops;
+}
 bool decode_frame(Runtime &r, Movie &v) {
+    if (v.video_eof && feeding_next_pass(r, v, v.video_loops)) restart_video(r, v);
     if (v.video_eof || v.source.empty() || !v.width || !v.height || v.width > 480 || v.height > 272) return false;
     if (!v.video.is_open() && !v.video.open(v.source)) { v.video_eof = true; return false; }
+    // The game decodes one picture per game frame, so an unlocked frame rate
+    // would play movies fast. Repeat the current picture until the stream's
+    // own clock (one picture per 3003 ticks of 90 kHz) is due.
+    if (frame_rate_unlocked() && v.frames != 0 && !v.image.empty() &&
+        static_cast<std::uint64_t>(v.frames) * 3003 > (guest_time_us() - v.start_us) * 9 / 100) return true;
     v.image.resize(v.width * v.height * 4);
-    if (v.video.read(v.image) != v.image.size()) {
+    bool decoded = v.video.read(v.image) == v.image.size();
+    if (!decoded && feeding_next_pass(r, v, v.video_loops)) {
+        restart_video(r, v);
+        decoded = v.video.open(v.source) && v.video.read(v.image) == v.image.size();
+    }
+    if (!decoded) {
         v.video_eof = true;
         log_line("MPEG", "video EOF frames=" + std::to_string(v.frames));
         return false;
     }
-    ++v.frames;
+    if (++v.frames == 1) v.start_us = guest_time_us();
     // Free a proportional share of the actual submitted ring packets as the
     // decoder consumes the movie. The feeder callback still reads real data.
     const auto total_frames = std::max<std::uint64_t>(1, (v.last - v.first) / 3003);
@@ -170,7 +207,7 @@ void report_mpeg_summary(const Runtime &r) {
     for (const auto &[handle,v] : movies) {
         log_line("MPEG", "summary handle=" + psprecomp::hex32(handle) + " video_frames=" +
             std::to_string(v->frames) + " audio_frames=" + std::to_string(v->audio_frames) +
-            " video_eof=" + std::to_string(v->video_eof) + " audio_eof=" + std::to_string(v->audio_eof) +
+            " video_loops=" + std::to_string(v->video_loops) + " video_eof=" + std::to_string(v->video_eof) + " audio_eof=" + std::to_string(v->audio_eof) +
             " packets_read=" + std::to_string(r.memory().load32(v->ring+4)) +
             " packets_queued=" + std::to_string(r.memory().load32(v->ring+12)) +
             " first_pts=" + std::to_string(v->first) + " last_pts=" + std::to_string(v->last));
@@ -287,6 +324,8 @@ void install_mpeg_hle(Runtime &rt) {
                       " used=" + std::to_string(r.memory().load32(v->ring+12)) +
                       " total=" + std::to_string(r.memory().load32(v->ring)) +
                       " eof=" + std::to_string(audio?v->audio_eof:v->video_eof));
+        if (audio && v->audio_eof && feeding_next_pass(r,*v,v->audio_loops)) restart_audio(*v);
+        if (!audio && v->video_eof && feeding_next_pass(r,*v,v->video_loops)) restart_video(r,*v);
         if (audio?v->audio_eof:v->video_eof) {
             write_time(r.memory(),at,pts);write_time(r.memory(),at+8,UINT64_MAX);
             c.set_gpr(2,no_data);return;
@@ -336,7 +375,7 @@ void install_mpeg_hle(Runtime &rt) {
     bind(0x31BD0272,"AvcCsc",[](Runtime &r,AllegrexContext &c){
         auto *v=movie(c.gpr[4]);if (!v || !r.memory().contains(c.gpr[6],16)) {c.set_gpr(2,invalid);return;}
         auto &m=r.memory(); const auto p=c.gpr[6];
-        if(std::getenv("PSPRECOMP_MOTORSTORM_TRACE_MEDIA")) {
+        if(MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_TRACE_MEDIA")) {
             static unsigned count=0;
             if(count++<8 || count%120==0) log_line("MPEG CSC","src="+psprecomp::hex32(c.gpr[5])+" dest="+psprecomp::hex32(c.gpr[8])+" stride="+std::to_string(c.gpr[7])+" range="+std::to_string(m.load32(p))+","+std::to_string(m.load32(p+4))+","+std::to_string(m.load32(p+8))+","+std::to_string(m.load32(p+12))+" frame="+std::to_string(v->frames));
         }
@@ -358,11 +397,17 @@ void install_mpeg_hle(Runtime &rt) {
         else c.set_gpr(2,!was_eof && v->video_eof ? 0 : avc_decode_fatal);
     });
     bind(0x800C44DF,"AtracDecode",[](Runtime &r,AllegrexContext &c){
-        if (std::getenv("PSPRECOMP_MOTORSTORM_NO_PMF_AUDIO")) { c.set_gpr(2,no_data); return; }
+        if (MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_NO_PMF_AUDIO")) { c.set_gpr(2,no_data); return; }
         auto *v=movie(c.gpr[4]); if (!v || !r.memory().contains(c.gpr[6],8192)) {c.set_gpr(2,invalid);return;}
         std::array<std::uint8_t,8192> output{};
+        if (v->audio_eof && feeding_next_pass(r,*v,v->audio_loops)) restart_audio(*v);
         if (v->audio_eof || v->source.empty() || (!v->audio.is_open()&&!v->audio.open(v->source,v->audio_channel))) {v->audio_eof=true;c.set_gpr(2,no_data);return;}
-        const auto size=v->audio.read(output);if (!size) {
+        auto size=v->audio.read(output);
+        if (!size && feeding_next_pass(r,*v,v->audio_loops)) {
+            restart_audio(*v);
+            if (v->audio.open(v->source,v->audio_channel)) size=v->audio.read(output);
+        }
+        if (!size) {
             v->audio_eof=true;log_line("MPEG","audio EOF frames=" + std::to_string(v->audio_frames));
             c.set_gpr(2,no_data);return;
         }
@@ -376,7 +421,7 @@ void install_mpeg_hle(Runtime &rt) {
         if (auto *v=movie(c.gpr[4])) {
             log_line("MPEG","flush video_frames="+std::to_string(v->frames));
             v->video.close();v->audio.close();v->video_eof=v->audio_eof=false;
-            v->frames=v->audio_frames=v->consumed_packets=0;v->image.clear();v->ycbcr_images.clear();
+            v->frames=v->audio_frames=v->consumed_packets=v->video_loops=v->audio_loops=0;v->image.clear();v->ycbcr_images.clear();
             r.memory().store32(v->ring+4,0);r.memory().store32(v->ring+8,0);r.memory().store32(v->ring+12,0);
         }
         c.set_gpr(2,0);

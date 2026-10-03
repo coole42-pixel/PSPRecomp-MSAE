@@ -1,3 +1,4 @@
+#include "motorstorm_env.hpp"
 #include "motorstorm_atrac.hpp"
 #include "motorstorm_bootstrap.hpp"
 #include "psprecomp/common.hpp"
@@ -116,7 +117,7 @@ void install_atrac_hle(psprecomp::Runtime &runtime) {
     streams.clear();sources.clear();next_id=0x600;
     const auto bind=[&](std::uint32_t nid,psprecomp::Runtime::HleFunction handler){runtime.register_hle("sceAtrac3plus",nid,std::move(handler));};
     bind(0x7A20E7AF,[](auto &r,auto &c){
-        if (std::getenv("PSPRECOMP_MOTORSTORM_NO_ATRAC")) { c.set_gpr(2,bad_data); return; }
+        if (MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_NO_ATRAC")) { c.set_gpr(2,bad_data); return; }
         const auto buffer=c.gpr[4],capacity=c.gpr[5];
         if(capacity<128 || !r.memory().contains(buffer,capacity)) {c.set_gpr(2,bad_data);return;}
         std::vector<std::uint8_t> bytes(std::min(65536u,capacity));r.memory().copy_out(buffer,bytes);
@@ -186,7 +187,7 @@ void install_atrac_hle(psprecomp::Runtime &runtime) {
         std::vector<std::uint8_t> pcm(static_cast<std::size_t>(samples)*4);
         // Diagnostic kill switch: emulate the old silence shim while keeping the
         // stream object and bookkeeping fully active.
-        std::size_t decoded = std::getenv("PSPRECOMP_MOTORSTORM_ATRAC_SILENT")
+        std::size_t decoded = MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_ATRAC_SILENT")
                                   ? pcm.size()
                                   : s.decoder.read(pcm);
         r.memory().copy_in(c.gpr[5],std::span<const std::uint8_t>(pcm.data(),decoded));

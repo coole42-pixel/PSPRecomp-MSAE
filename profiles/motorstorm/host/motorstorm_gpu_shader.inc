@@ -14,7 +14,11 @@ cbuffer DrawState : register(b0) {
 uint C(uint i) { return commands[i >> 2][i & 3]; }
 RasterizerOrderedStructuredBuffer<uint> colorTarget : register(u0);
 RasterizerOrderedStructuredBuffer<uint> depthTarget : register(u1);
-Texture2D<uint> textureImage : register(t0);
+Texture2D<float4> textureImage : register(t0);
+SamplerState samplerWrapWrap : register(s0);
+SamplerState samplerClampWrap : register(s1);
+SamplerState samplerWrapClamp : register(s2);
+SamplerState samplerClampClamp : register(s3);
 StructuredBuffer<uint> feedbackImage : register(t2);
 struct Input {
     float3 position : POSITION;
@@ -115,13 +119,32 @@ uint4 texel(int2 p, uint level) {
     else textureImage.GetDimensions(level,w,h,n);
     p = int2(wrap(p.x,w,(C(0xc7)&1)!=0),wrap(p.y,h,(C(0xc7)&256)!=0));
     if(feedback.x) return bytes(unpackColor(feedbackImage[feedback.y+p.y*feedback.z+p.x],feedback.w));
-    return bytes(textureImage.Load(int3(p,level)));
+    return uint4(textureImage.Load(int3(p,level))*255+0.5);
 }
 uint4 sampleLevel(float2 uv, uint level, bool filterLinear) {
     uv /= float(1u<<level);
     if(!filterLinear) return texel(int2(floor(uv)),level);
     int2 fixedUV = int2(floor((uv-0.5)*16));
     int2 p = fixedUV >> 4; uint2 f = uint2(fixedUV)&15;
+    if(!feedback.x) {
+        uint w,h,n; textureImage.GetDimensions(level,w,h,n);
+        if((w&(w-1))==0 && (h&(h-1))==0) {
+            bool clampU=(C(0xc7)&1)!=0, clampV=(C(0xc7)&256)!=0;
+            // Preserve PSP four-bit filter weights, including the edge where
+            // clamp must duplicate a texel rather than shift its neighbor.
+            int2 bounded=int2(clampU ? clamp(p.x,-1,int(w)-1) : wrap(p.x,w,false),
+                              clampV ? clamp(p.y,-1,int(h)-1) : wrap(p.y,h,false));
+            float2 normalized=(float2(bounded)+float2(f)/16+0.5)/float2(w,h);
+            float4 filtered;
+            if(clampU && clampV) filtered=textureImage.SampleLevel(samplerClampClamp,normalized,level);
+            else if(clampU) filtered=textureImage.SampleLevel(samplerClampWrap,normalized,level);
+            else if(clampV) filtered=textureImage.SampleLevel(samplerWrapClamp,normalized,level);
+            else filtered=textureImage.SampleLevel(samplerWrapWrap,normalized,level);
+            // The exact result is an integer / 256. Correct tiny UNORM float
+            // error at integer boundaries without crossing a 1/256 fraction.
+            return min(uint4(max(filtered,0)*255+0.001),255);
+        }
+    }
     uint4 a = texel(p,level)*(16-f.x)+texel(p+int2(1,0),level)*f.x;
     uint4 b = texel(p+int2(0,1),level)*(16-f.x)+texel(p+1,level)*f.x;
     return (a*(16-f.y)+b*f.y)>>8;

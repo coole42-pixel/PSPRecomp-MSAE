@@ -6,6 +6,7 @@
 #include "motorstorm_hle.hpp"
 #include "motorstorm_ge.hpp"
 #include "motorstorm_audio.hpp"
+#include "motorstorm_audio_recovery.hpp"
 #include "motorstorm_atrac.hpp"
 #include "vcs_media_decoder.hpp"
 #include <chrono>
@@ -60,6 +61,26 @@ std::uint32_t read_rgb(const psprecomp::GuestMemory &memory, std::uint32_t addre
 } // namespace
 
 int main(int argc,char **argv) {
+    {
+        motorstorm::AudioRecoveryRamp recovery;
+        std::array<std::int16_t, 1024> pcm;
+        for (std::size_t i = 0u; i < pcm.size(); i += 2u) { pcm[i] = 12000; pcm[i + 1u] = -12000; }
+        const auto original = pcm;
+        recovery.pcm(pcm, 44100u, false);
+        require(pcm == original, "Healthy audio PCM is unchanged by underrun smoothing");
+        recovery.silence(pcm, 44100u);
+        require(pcm[0] > 11900 && pcm[0] < 12000 && pcm[1] == -pcm[0] &&
+                pcm[438] == 0 && pcm.back() == 0,
+                "Underrun onset ramps the last stereo sample to zero over five milliseconds");
+        recovery.silence(pcm, 44100u);
+        require(std::all_of(pcm.begin(), pcm.end(), [](auto sample) { return sample == 0; }),
+                "Continued underrun remains silent instead of repeating old audio");
+        pcm = original;
+        recovery.pcm(pcm, 44100u, true);
+        require(pcm[0] > 0 && pcm[0] < 100 && pcm[1] == -pcm[0] && pcm[438] == 12000 &&
+                pcm[440] == 12000 && pcm.back() == -12000,
+                "Recovery ramps into new PCM without changing its later samples");
+    }
     if(argc==2 && std::string(argv[1])=="--d3d12") {
         _putenv_s("PSPRECOMP_MOTORSTORM_RENDERER","d3d12");
         // These assertions specify native PSP pixel centers and mip footprints.

@@ -8,13 +8,16 @@ param(
     [string]$InputScript = 'profiles/motorstorm/tools/race-throughput-input.txt',
     [string]$SaveRoot = 'out/motorstorm/phase12/fixes/test-stick-v2',
     [switch]$Audio,
+    [switch]$Window,
     [string]$Executable = 'out/motorstorm/bin/Release/MotorStormNative.exe',
     # Guest time normally also advances per 256 chained dispatches.  Builds
     # with a different generated-unit layout dispatch differently, so their
     # guest timelines (and frames) diverge.  -FixedClock disables that
     # execution clock: guest time is then event-driven only and identical
     # across corpora, which makes cross-corpus comparisons equal guest work.
-    [switch]$FixedClock
+    [switch]$FixedClock,
+    # Baselines (750 frames per window) use the game's original 30 fps pacing.
+    [string]$Fps = 'original'
 )
 # Race benchmark window.  Runs the normal boot/menu/race path (no scene skips)
 # and stops exactly when the guest reaches -EndUs; the host writes the report
@@ -33,8 +36,11 @@ $settings = @{
     PSPRECOMP_MOTORSTORM_RENDERER = $Renderer
     PSPRECOMP_MOTORSTORM_RESOLUTION = "$Resolution"
     PSPRECOMP_MOTORSTORM_AA = $Antialiasing.ToLowerInvariant()
+    PSPRECOMP_MOTORSTORM_FPS = $Fps
+    # Measure throughput, not the wall-clock limiter used when audio is off.
+    PSPRECOMP_MOTORSTORM_UNTHROTTLED = '1'
     PSPRECOMP_MOTORSTORM_SOFTGE = '1'
-    PSPRECOMP_MOTORSTORM_WINDOW = $null
+    PSPRECOMP_MOTORSTORM_WINDOW = $(if ($Window) {'1'} else {'0'})
     PSPRECOMP_MOTORSTORM_AUDIO = $(if ($Audio) { '1' } else { '0' })
     PSPRECOMP_MOTORSTORM_INPUT_SCRIPT = $InputScript
     PSPRECOMP_MOTORSTORM_SAVEDATA = $SaveRoot

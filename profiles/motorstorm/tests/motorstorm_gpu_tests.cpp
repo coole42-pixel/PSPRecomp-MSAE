@@ -1,5 +1,6 @@
 #include "motorstorm_ge.hpp"
 #include "motorstorm_gpu.hpp"
+#include <algorithm>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
@@ -26,6 +27,55 @@ void vertex(psprecomp::GuestMemory &memory, std::uint32_t index, float x, float 
     memory.store32(address + 12, std::bit_cast<std::uint32_t>(x));
     memory.store32(address + 16, std::bit_cast<std::uint32_t>(y));
     memory.store32(address + 20, std::bit_cast<std::uint32_t>(z));
+}
+void bilinear_fraction_grid(psprecomp::GuestMemory &memory) {
+    constexpr std::uint32_t texture = 0x08B06000u;
+    constexpr std::uint32_t texels[]{0x01FF0002u, 0xF17A3299u, 0x00DD66FEu, 0xFEBB9988u};
+    for (unsigned i = 0u; i < 4u; ++i) memory.store32(texture + i * 4u, texels[i]);
+    for (const std::uint32_t wrapping : {0u, 1u, 256u, 257u})
+        for (const int base_y : {-1, 0, 1})
+            for (const int base_x : {-1, 0, 1}) {
+                memory.zero(kColor, 32u * 32u * 4u);
+                for (unsigned fy = 0u; fy < 16u; ++fy)
+                    for (unsigned fx = 0u; fx < 16u; ++fx) {
+                        const auto index = fy * 16u + fx;
+                        vertex(memory, index, fx + 0.5f, fy + 0.5f, 0xFFFFFFFFu);
+                        memory.store32(kVertices + index * 24u,
+                            std::bit_cast<std::uint32_t>(base_x + 0.5f + fx / 16.0f));
+                        memory.store32(kVertices + index * 24u + 4u,
+                            std::bit_cast<std::uint32_t>(base_y + 0.5f + fy / 16.0f));
+                    }
+                std::vector<std::uint32_t> list;
+                command(list, 0x9C, kColor); command(list, 0x9D, 0x040020); command(list, 0xD2, 3);
+                command(list, 0xD4, 0); command(list, 0xD5, 15 | (15 << 10));
+                command(list, 0x12, 0x80019F); command(list, 0x10, 0x080000); command(list, 0x01, kVertices);
+                for (auto disabled : {0x1D, 0x1F, 0x21, 0x22, 0x23, 0x24, 0x27, 0xD3, 0xE8, 0xE9})
+                    command(list, disabled, 0);
+                command(list, 0xA0, texture); command(list, 0xA8, 0x080002); command(list, 0xB8, 0x101);
+                command(list, 0xC3, 3); command(list, 0xC2, 0); command(list, 0xC0, 0);
+                command(list, 0xC6, 0x101); command(list, 0xC7, wrapping); command(list, 0xC9, 0x103);
+                command(list, 0x1E, 1); command(list, 0x04, 256); command(list, 0x0C, 0);
+                for (unsigned i = 0u; i < list.size(); ++i) memory.store32(kList + i * 4u, list[i]);
+                motorstorm::software_ge_execute_list(memory, kList, 0u);
+                const auto sample = [&](int x, int y) {
+                    x = (wrapping & 1u) ? std::clamp(x, 0, 1) : x & 1;
+                    y = (wrapping & 256u) ? std::clamp(y, 0, 1) : y & 1;
+                    return texels[y * 2 + x];
+                };
+                for (unsigned fy = 0u; fy < 16u; ++fy)
+                    for (unsigned fx = 0u; fx < 16u; ++fx) {
+                        std::uint32_t expected{};
+                        for (unsigned shift = 0u; shift < 32u; shift += 8u) {
+                            const auto channel = [&](int x, int y) { return (sample(x, y) >> shift) & 255u; };
+                            const auto a = channel(base_x, base_y) * (16u - fx) + channel(base_x + 1, base_y) * fx;
+                            const auto b = channel(base_x, base_y + 1) * (16u - fx) + channel(base_x + 1, base_y + 1) * fx;
+                            expected |= ((a * (16u - fy) + b * fy) >> 8u) << shift;
+                        }
+                        if (memory.load32(kColor + (fy * 32u + fx) * 4u) != expected)
+                            throw std::runtime_error("Hardware bilinear sampling changed a PSP four-bit fraction or wrap/clamp edge");
+                    }
+            }
+    std::puts("9216 RGBA bilinear fraction / wrap / clamp comparisons passed");
 }
 std::vector<std::uint8_t> run(psprecomp::GuestMemory &memory, const Case &test) {
     for (std::uint32_t i = 0; i < 32 * 32; ++i) {
@@ -254,6 +304,7 @@ int main() {
                             "presentation passed\n",
                             resolution, aa);
             }
+        bilinear_fraction_grid(memory);
         _putenv_s("PSPRECOMP_MOTORSTORM_RESOLUTION", "");
         _putenv_s("PSPRECOMP_MOTORSTORM_AA", "");
         std::printf("D3D12 %s: %zu pixel-exact blend/stencil/depth/mask/clear "

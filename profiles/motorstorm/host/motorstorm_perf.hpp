@@ -39,10 +39,16 @@ inline std::array<std::uint64_t, kSlotCount> &ticks() noexcept {
 }
 
 // Read once at load; all profiled code runs after static initialization.
-inline const bool g_enabled = [] {
+inline bool g_enabled = [] {
     const char *text = std::getenv("PSPRECOMP_MOTORSTORM_PROFILE");
     return text != nullptr && *text != '\0' && *text != '0';
 }();
+
+// INI defaults are applied after static initialization, before guest execution.
+inline void configure() noexcept {
+    const char *text = std::getenv("PSPRECOMP_MOTORSTORM_PROFILE");
+    g_enabled = text != nullptr && *text != '\0' && *text != '0';
+}
 
 inline bool enabled() noexcept { return g_enabled; }
 

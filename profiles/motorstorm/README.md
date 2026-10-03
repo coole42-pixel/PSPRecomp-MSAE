@@ -13,16 +13,46 @@ profile shares the bundled FFmpeg libraries under `profiles/vcs/third_party/ffmp
 their LGPL notice is documented in [the dependency notices](../vcs/THIRD_PARTY.md).
 
 ```powershell
-cmake -S . -B out/motorstorm -DPSPRECOMP_PROFILE=motorstorm
-cmake --build out/motorstorm --config Release --target MotorStormNative
+./profiles/motorstorm/build.ps1
 ./profiles/motorstorm/run.ps1
+./profiles/motorstorm/run.ps1 -Fullscreen
 ./profiles/motorstorm/run.ps1 -Resolution 2 -Antialiasing FXAA
 ./profiles/motorstorm/run.ps1 -Resolution 4 -Antialiasing SSAA4x -Scale 4
 ```
 
+`build.bat` is the Command Prompt / double-click wrapper for the same build.
+The Release executable is `out/motorstorm/bin/Release/MotorStormNative.exe`.
+Run `build.ps1 -Tests -GpuTests` for framework, configuration, window and hardware
+renderer checks; hardware tests require a D3D12 ROV GPU. `-Jobs 1..16` controls
+compiler workers (default 4). `-BuildDirectory` selects another build tree.
+
+The executable reads `MotorStormNative.ini` beside it. Defaults are **4x internal
+resolution, SSAA4x, windowed presentation and audio enabled**. The INI explains
+every option and includes commented debug examples for tracing, timing, frame
+dumps and bounded runs. Both the executable and launcher honor edited settings;
+explicit launcher arguments or `PSPRECOMP_*` environment options override them.
+`--config <path>` selects another INI, with relative paths based on its directory.
+
+**F11 or Alt+Enter** toggles borderless fullscreen on the current monitor. The PSP
+aspect ratio is preserved with black bars when needed. Escape returns to the
+original window size; Escape in windowed mode or Alt+F4 closes the game.
+Set `[window] fullscreen = true` for fullscreen startup, or use `run.ps1 -Fullscreen`.
+
+Rebuilds preserve your edited INI and update `MotorStormNative.default.ini` with
+the latest sample. `build.ps1 -ResetConfig` restores the sample after backing up
+your existing settings. The template is [config/motorstorm.ini](config/motorstorm.ini).
+See [build/configuration/fullscreen verification](docs/BUILD_CONFIGURATION_FULLSCREEN.md)
+for the native tests and game-run evidence.
+See [SSAA performance and audio recovery](docs/PERFORMANCE_AUDIO_SSAA.md) for
+the current quality-preserving optimization, frame comparisons and audio checks.
+
 The launcher selects hardware D3D12 rendering. It requires a D3D12 GPU with rasterizer ordered views. Use `-Renderer software` for the software reference or `-Renderer auto` to allow a reported software fallback. `-Bringup` enables historical scene skips for diagnostics; normal play leaves it off.
 
 `-Resolution` selects actual internal rendering: 1 = 480×272, 2 = 960×544, 3 = 1440×816, 4 = 1920×1088. `-Antialiasing` accepts `None`, `FXAA` or `SSAA4x`. SSAA4x renders a 2×2 sample grid per output pixel and costs more GPU work. `-Scale` controls the window size independently. These are PSP aspect-ratio resolutions; 4× is 1920×1088, rather than a cropped 1080p frame. Software rendering remains native-resolution.
+
+`[graphics] fps` in the INI (or `run.ps1 -Fps`) sets the frame rate. The default is 60. `original` keeps the retail 30 fps pacing (20 fps in heavier scenes). Values from 30 to 240 replace the game's vblank interval and its timestep (the setter at `0x0891BF0C`), so the simulation runs at real speed. Movies stay at their own 29.97 fps. 30 and 60 keep the PSP's 60 Hz vblank; any other value runs the virtual display at that rate. If the PC cannot simulate that many frames per second, the game runs in slow motion. `tools/bench-race.ps1` and `tools/validate-renderer.ps1` default to `-Fps original` so their results stay comparable with the 30 fps baselines.
+
+`dynamic_fps = true` (the default) drops to the original 30 fps pacing while the PC cannot hold the target, instead of slow motion and audio gaps, and returns to the target when it can. With audio disabled, a wall-clock limiter keeps the game at real speed. See [docs/PERFORMANCE_60FPS.md](docs/PERFORMANCE_60FPS.md) for the presentation and readback changes and measurements.
 
 The vehicle-selection preview is repaired in both renderers. See [preview fix and resolution validation](docs/PREVIEW_RESOLUTION.md).
 

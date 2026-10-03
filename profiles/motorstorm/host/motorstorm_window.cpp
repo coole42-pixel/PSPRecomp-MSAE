@@ -1,6 +1,8 @@
+#include "motorstorm_env.hpp"
 #include "motorstorm_window.hpp"
 #include "motorstorm_bootstrap.hpp"
 #include "motorstorm_gpu.hpp"
+#include "motorstorm_presentation.hpp"
 
 #include <windows.h>
 #include <Xinput.h>
@@ -20,11 +22,15 @@ namespace motorstorm {
 namespace {
 
 constexpr wchar_t kWindowClass[] = L"PSPRecompMotorStorm";
-constexpr wchar_t kWindowTitle[] = L"MotorStorm - PSPRecomp (PSPRECOMP_MOTORSTORM_WINDOW)";
+constexpr wchar_t kWindowTitle[] = L"MotorStorm: Arctic Edge - PSPRecomp";
 
 std::atomic<bool> g_enabled{false};
 std::atomic<bool> g_started{false};
 std::atomic<bool> g_close_requested{false};
+std::atomic<bool> g_shutdown_requested{false};
+std::atomic<bool> g_fullscreen{false};
+WINDOWPLACEMENT g_windowed_placement{sizeof(WINDOWPLACEMENT)};
+LONG_PTR g_windowed_style{};
 std::atomic<std::uint32_t> g_pad{0u};
 std::atomic<std::uint32_t> g_keyboard_presses{0u};
 std::mutex g_input_mutex;
@@ -43,12 +49,40 @@ std::atomic<bool> g_gpu_presenting{false};
 std::thread g_thread;
 
 std::uint32_t scale_factor() {
-    static const std::uint32_t scale = [] {
-        const char *text = std::getenv("PSPRECOMP_MOTORSTORM_WINDOW_SCALE");
-        const unsigned long value = text != nullptr ? std::strtoul(text, nullptr, 0) : 0ul;
-        return static_cast<std::uint32_t>(value >= 1ul && value <= 8ul ? value : 2ul);
-    }();
-    return scale;
+    const char *text = std::getenv("PSPRECOMP_MOTORSTORM_WINDOW_SCALE");
+    const unsigned long value = text != nullptr ? std::strtoul(text, nullptr, 0) : 0ul;
+    return static_cast<std::uint32_t>(value >= 1ul && value <= 8ul ? value : 2ul);
+}
+
+bool enabled_option(const char *name) {
+    const char *value = std::getenv(name);
+    return value && std::string_view(value) != "0" && std::string_view(value) != "false" &&
+           std::string_view(value) != "off";
+}
+
+void fit_monitor(HWND window) {
+    MONITORINFO monitor{sizeof(MONITORINFO)};
+    if (!GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &monitor)) return;
+    const auto &rect = monitor.rcMonitor;
+    SetWindowPos(window, HWND_TOP, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+                 SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+}
+
+void set_fullscreen(HWND window, bool enabled) {
+    if (enabled == g_fullscreen.load()) return;
+    if (enabled) {
+        if (!GetWindowPlacement(window, &g_windowed_placement)) return;
+        g_windowed_style = GetWindowLongPtrW(window, GWL_STYLE);
+        SetWindowLongPtrW(window, GWL_STYLE, g_windowed_style & ~WS_OVERLAPPEDWINDOW);
+        fit_monitor(window);
+    } else {
+        SetWindowLongPtrW(window, GWL_STYLE, g_windowed_style);
+        SetWindowPlacement(window, &g_windowed_placement);
+        SetWindowPos(window, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+    }
+    g_fullscreen.store(enabled);
+    log_line("WINDOW", enabled ? "fullscreen enabled (F11 / Alt+Enter to restore)" : "windowed mode restored");
 }
 
 std::uint32_t key_to_pad(WPARAM key) {
@@ -81,11 +115,28 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     case WM_APP + 1:
         DestroyWindow(window);
         return 0;
+    case WM_APP + 2:
+        set_fullscreen(window, wparam != 0u);
+        return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
     case WM_ERASEBKGND:
         return 1;
+    case WM_DISPLAYCHANGE:
+        if (g_fullscreen.load()) fit_monitor(window);
+        return 0;
+    case WM_DPICHANGED:
+        if (g_fullscreen.load()) fit_monitor(window);
+        else {
+            const RECT &rect = *reinterpret_cast<const RECT *>(lparam);
+            SetWindowPos(window, nullptr, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        return 0;
+    case WM_SETCURSOR:
+        if (g_fullscreen.load() && LOWORD(lparam) == HTCLIENT) { SetCursor(nullptr); return TRUE; }
+        break;
     case WM_KILLFOCUS:
         g_pad.store(0u);
         g_keyboard_presses.store(0u);
@@ -103,14 +154,26 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     }
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN: {
+        if (wparam == VK_F4 && (lparam & (1ll << 29)) != 0) {
+            g_close_requested.store(true);
+            DestroyWindow(window);
+            return 0;
+        }
+        const bool fullscreen_key = wparam == VK_F11 ||
+            (wparam == VK_RETURN && (lparam & (1ll << 29)) != 0);
+        if (fullscreen_key) {
+            if ((lparam & (1ll << 30)) == 0) set_fullscreen(window, !g_fullscreen.load());
+            return 0;
+        }
         const std::uint32_t bit = key_to_pad(wparam);
         if (bit != 0u) {
             const auto old = g_pad.fetch_or(bit);
             g_keyboard_presses.fetch_or(bit & ~old);
-            if (old != (old | bit) && std::getenv("PSPRECOMP_MOTORSTORM_TRACE_CTRL") != nullptr)
+            if (old != (old | bit) && MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_TRACE_CTRL"))
                 log_line("HOST INPUT", "down vk=" + std::to_string(wparam) + " pad=" + std::to_string(old | bit));
         }
         if (wparam == VK_ESCAPE) {
+            if (g_fullscreen.load()) { set_fullscreen(window, false); return 0; }
             g_close_requested.store(true);
             DestroyWindow(window);
         }
@@ -121,7 +184,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         const std::uint32_t bit = key_to_pad(wparam);
         if (bit != 0u) {
             const auto old = g_pad.fetch_and(~bit);
-            if (old != (old & ~bit) && std::getenv("PSPRECOMP_MOTORSTORM_TRACE_CTRL") != nullptr)
+            if (old != (old & ~bit) && MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_TRACE_CTRL"))
                 log_line("HOST INPUT", "up vk=" + std::to_string(wparam) + " pad=" + std::to_string(old & ~bit));
         }
         return 0;
@@ -149,7 +212,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             info.bmiHeader.biBitCount = 32;
             info.bmiHeader.biCompression = BI_RGB;
             SetStretchBltMode(dc, COLORONCOLOR);
-            StretchDIBits(dc, 0, 0, client.right - client.left, client.bottom - client.top, 0, 0,
+            FillRect(dc, &client, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+            const auto fitted = fit_presentation(client.right, client.bottom, width, height);
+            StretchDIBits(dc, fitted.left, fitted.top, fitted.width, fitted.height, 0, 0,
                           static_cast<int>(width), static_cast<int>(height), copy.data(), &info,
                           DIB_RGB_COLORS, SRCCOPY);
         } else {
@@ -180,14 +245,31 @@ void window_thread_main() {
     const int height = static_cast<int>(272u * scale);
     RECT rect{0, 0, width, height};
     AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
-    g_window = CreateWindowExW(0, kWindowClass, kWindowTitle, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+    const HWND window = CreateWindowExW(0, kWindowClass, kWindowTitle, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
                                CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top,
                                nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
-    if (g_window != nullptr) {
-        SetTimer(g_window, 1u, 16u, nullptr);
-        ShowWindow(g_window, SW_SHOW);
-        UpdateWindow(g_window);
+    g_window.store(window);
+    if (window == nullptr) {
+        g_close_requested.store(true);
+        g_enabled.store(false);
+        log_line("WINDOW", "window creation failed");
+        return;
     }
+    SetTimer(window, 1u, 16u, nullptr);
+    if (enabled_option("PSPRECOMP_MOTORSTORM_FULLSCREEN")) {
+        // Go borderless while still hidden so the bordered window never shows,
+        // and show it without ShowWindow: the first ShowWindow call adopts the
+        // launcher's show state (e.g. a shortcut set to Maximized or Normal),
+        // which could reapply windowed geometry over the fullscreen rect.
+        set_fullscreen(window, true);
+        g_windowed_placement.showCmd = SW_SHOWNORMAL;
+        SetWindowPos(window, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        SetForegroundWindow(window);
+    } else {
+        ShowWindow(window, SW_SHOW);
+    }
+    UpdateWindow(window);
+    if (g_shutdown_requested.load()) DestroyWindow(window);
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0u, 0u) > 0) {
@@ -195,6 +277,7 @@ void window_thread_main() {
         DispatchMessageW(&message);
     }
     g_window = nullptr;
+    g_fullscreen.store(false);
 }
 
 } // namespace
@@ -202,13 +285,22 @@ void window_thread_main() {
 bool window_enabled() { return g_enabled.load(); }
 
 void window_start() {
-    if (std::getenv("PSPRECOMP_MOTORSTORM_WINDOW") == nullptr) return;
+    if (!enabled_option("PSPRECOMP_MOTORSTORM_WINDOW")) return;
     if (g_started.exchange(true)) return;
+    g_close_requested.store(false);
+    g_shutdown_requested.store(false);
+    // Match monitor pixel coordinates when switching between monitors / DPI.
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     g_enabled.store(true);
     g_thread = std::thread(window_thread_main);
 }
 
-void window_present(const psprecomp::GuestMemory &memory, std::uint32_t framebuffer,
+void window_set_fullscreen(bool enabled) {
+    if (const HWND window = g_window.load()) PostMessageW(window, WM_APP + 2, enabled ? 1u : 0u, 0u);
+}
+bool window_fullscreen() { return g_fullscreen.load(); }
+
+void window_present(psprecomp::GuestMemory &memory, std::uint32_t framebuffer,
                     std::uint32_t stride, std::uint32_t format, std::uint32_t width,
                     std::uint32_t height) {
     if (!g_enabled.load() || framebuffer == 0u || width == 0u || height == 0u) return;
@@ -355,6 +447,7 @@ void window_shutdown() {
     gpu_shutdown();
     g_gpu_presenting.store(false);
     if (!g_started.exchange(false)) return;
+    g_shutdown_requested.store(true);
     // Close through WM_CLOSE so the window thread leaves its message loop, but
     // do not report this as a user close.
     if (g_window != nullptr) {

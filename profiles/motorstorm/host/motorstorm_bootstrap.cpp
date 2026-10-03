@@ -1,4 +1,5 @@
 #include "motorstorm_bootstrap.hpp"
+#include "motorstorm_gpu.hpp"
 #include "motorstorm_hle.hpp"
 #include "motorstorm_media.hpp"
 #include "motorstorm_perf.hpp"
@@ -26,6 +27,7 @@
 #include <unordered_map>
 #include <vector>
 
+
 namespace {
 // Optional dispatch-PC sampler (PSPRECOMP_MOTORSTORM_PC_SAMPLE=1): counts every
 // 64th chained-call target so a spin loop shows up in the end-of-run census as
@@ -39,22 +41,6 @@ namespace {
 std::mutex g_log_mutex;
 std::FILE *g_log_file = nullptr;
 
-std::string trim(std::string_view text) {
-    std::size_t begin = 0;
-    while (begin < text.size() && (text[begin] == ' ' || text[begin] == '\t' || text[begin] == '\r'))
-        ++begin;
-    std::size_t end = text.size();
-    while (end > begin && (text[end - 1] == ' ' || text[end - 1] == '\t' || text[end - 1] == '\r'))
-        --end;
-    return std::string(text.substr(begin, end - begin));
-}
-
-std::string lower(std::string text) {
-    std::transform(text.begin(), text.end(), text.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return text;
-}
-
 std::uint64_t parse_u64(const std::string &text, std::uint64_t fallback) {
     if (text.empty()) return fallback;
     char *end = nullptr;
@@ -63,53 +49,11 @@ std::uint64_t parse_u64(const std::string &text, std::uint64_t fallback) {
     return static_cast<std::uint64_t>(value);
 }
 
-bool parse_bool(const std::string &text, bool fallback) {
-    const std::string value = lower(trim(text));
-    if (value == "1" || value == "true" || value == "yes" || value == "on") return true;
-    if (value == "0" || value == "false" || value == "no" || value == "off") return false;
-    return fallback;
-}
-
-struct IniSettings {
-    std::string eboot;
-    std::string disc_root;
-    std::string log_file;
-    std::uint64_t max_dispatches{};
-    bool trace_imports{true};
-    bool trace_filesystem{true};
-    bool verbose{};
-    bool loaded{};
-};
-
-IniSettings load_ini(const std::filesystem::path &path) {
-    IniSettings settings;
-    std::ifstream in(path);
-    if (!in) return settings;
-    settings.loaded = true;
-    std::string line;
-    while (std::getline(in, line)) {
-        const std::string stripped = trim(line);
-        if (stripped.empty() || stripped[0] == ';' || stripped[0] == '#' || stripped[0] == '[')
-            continue;
-        const std::size_t equals = stripped.find('=');
-        if (equals == std::string::npos) continue;
-        const std::string key = lower(trim(stripped.substr(0, equals)));
-        const std::string value = trim(stripped.substr(equals + 1));
-        if (key == "eboot") settings.eboot = value;
-        else if (key == "disc_root") settings.disc_root = value;
-        else if (key == "log_file") settings.log_file = value;
-        else if (key == "max_dispatches") settings.max_dispatches = parse_u64(value, 0u);
-        else if (key == "trace_imports") settings.trace_imports = parse_bool(value, true);
-        else if (key == "trace_filesystem") settings.trace_filesystem = parse_bool(value, true);
-        else if (key == "verbose") settings.verbose = parse_bool(value, false);
-    }
-    return settings;
-}
-
 const char *environment(const char *name) {
     const char *value = std::getenv(name);
     return value != nullptr && *value != '\0' ? value : nullptr;
 }
+
 
 [[nodiscard]] std::optional<std::filesystem::path> first_existing(
     const std::vector<std::filesystem::path> &candidates) {
@@ -168,21 +112,27 @@ void close_log_file() {
 BootstrapPaths resolve_bootstrap_paths(int argc, const char *const *argv,
                                        const std::filesystem::path &executable_directory) {
     BootstrapPaths paths;
-    const IniSettings ini = load_ini(executable_directory / "MotorStormNative.ini");
+    std::filesystem::path config_path = executable_directory / "MotorStormNative.ini";
 
     std::vector<std::string> positional;
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index] != nullptr ? argv[index] : "";
-        if (argument == "--verbose" || argument == "-v") paths.verbose = true;
+        if (argument == "--config") {
+            if (++index >= argc || argv[index] == nullptr)
+                throw psprecomp::Error("--config requires an INI file path");
+            config_path = argv[index];
+        } else if (argument == "--verbose" || argument == "-v") paths.verbose = true;
         else if (!argument.empty() && argument[0] != '-') positional.push_back(argument);
     }
+    paths.config = load_native_config(config_path);
+    const auto &ini = paths.config;
 
     // --- Executable --------------------------------------------------------
     std::vector<std::filesystem::path> executable_candidates;
     if (const char *override_path = environment("PSPRECOMP_MOTORSTORM_EBOOT"))
         executable_candidates.emplace_back(override_path);
     if (!positional.empty()) executable_candidates.emplace_back(positional[0]);
-    if (!ini.eboot.empty()) executable_candidates.emplace_back(executable_directory / ini.eboot);
+    if (!ini.eboot.empty()) executable_candidates.emplace_back(ini.source.parent_path() / ini.eboot);
     executable_candidates.push_back(executable_directory / "PSP_DATA" / "EBOOT_DECRYPTED.BIN");
     executable_candidates.push_back(executable_directory / "EBOOT_DECRYPTED.BIN");
     executable_candidates.push_back(executable_directory / "game" / "EBOOT_DECRYPTED.BIN");
@@ -206,7 +156,7 @@ BootstrapPaths resolve_bootstrap_paths(int argc, const char *const *argv,
     if (const char *override_path = environment("PSPRECOMP_MOTORSTORM_DISC"))
         disc_candidates.emplace_back(override_path);
     if (positional.size() >= 2u) disc_candidates.emplace_back(positional[1]);
-    if (!ini.disc_root.empty()) disc_candidates.emplace_back(executable_directory / ini.disc_root);
+    if (!ini.disc_root.empty()) disc_candidates.emplace_back(ini.source.parent_path() / ini.disc_root);
     if (!paths.psp_executable.empty())
         disc_candidates.push_back(paths.psp_executable.parent_path() / "disc0");
     disc_candidates.push_back(executable_directory / "PSP_DATA" / "disc0");
@@ -228,7 +178,7 @@ BootstrapPaths resolve_bootstrap_paths(int argc, const char *const *argv,
     if (const char *override_path = environment("PSPRECOMP_MOTORSTORM_LOG"))
         paths.log_file = override_path;
     else if (!ini.log_file.empty())
-        paths.log_file = executable_directory / ini.log_file;
+        paths.log_file = ini.source.parent_path() / ini.log_file;
     else
         paths.log_file = executable_directory / "MotorStormNative.log";
 
@@ -243,6 +193,25 @@ BootstrapPaths resolve_bootstrap_paths(int argc, const char *const *argv,
 }
 
 int run(const BootstrapPaths &paths) {
+    const bool fullscreen_overridden = [] {
+        const char *value = std::getenv("PSPRECOMP_MOTORSTORM_FULLSCREEN");
+        return value != nullptr && *value != char{};
+    }();
+    apply_native_config(paths.config);
+    perf::configure();
+    // The live game publishes GE readbacks lazily so GPU work overlaps the next
+    // frame's guest CPU work. PSPRECOMP_MOTORSTORM_GPU_SYNC_READBACK=1 restores
+    // the strict per-list wait for diagnosing a guest that reads VRAM directly.
+    gpu_set_deferred_readback(std::getenv("PSPRECOMP_MOTORSTORM_GPU_SYNC_READBACK") == nullptr);
+    log_line("CONFIG", "ini=\"" + paths.config.source.string() + "\" " +
+             (paths.config.loaded ? "loaded" : "using built-in defaults"));
+    log_line("CONFIG", std::string("renderer=") + std::getenv("PSPRECOMP_MOTORSTORM_RENDERER") +
+             " resolution=" + std::getenv("PSPRECOMP_MOTORSTORM_RESOLUTION") +
+             " AA=" + std::getenv("PSPRECOMP_MOTORSTORM_AA") +
+             " fullscreen=" + std::getenv("PSPRECOMP_MOTORSTORM_FULLSCREEN") +
+             (fullscreen_overridden ? " (environment override; INI fullscreen ignored)" : " (INI)") +
+             " fps=" + std::getenv("PSPRECOMP_MOTORSTORM_FPS"));
+    for (const auto &warning : paths.config.warnings) log_line("CONFIG", "warning: " + warning);
     log_line(category::kBoot, "MotorStorm profile bootstrap");
     log_line(category::kBoot, "executable=\"" + paths.psp_executable.string() + "\"");
     log_line(category::kBoot, "disc0 root=\"" + paths.disc_root.string() + "\"");
@@ -323,8 +292,8 @@ int run(const BootstrapPaths &paths) {
 
     HleOptions hle_options;
     hle_options.disc_root = paths.disc_root;
-    hle_options.trace_imports = true;
-    hle_options.trace_filesystem = true;
+    hle_options.trace_imports = paths.config.trace_imports || paths.verbose;
+    hle_options.trace_filesystem = paths.config.trace_filesystem || paths.verbose;
     if (paths.verbose) hle_options.import_trace_limit = 0;
     install_hle(runtime, user_arena_start, hle_options);
 

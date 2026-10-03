@@ -18,8 +18,13 @@ namespace motorstorm {
 // Creates the window before the guest produces its first frame.
 void window_start();
 
+// Borderless fullscreen on the window's current monitor. Changes are posted
+// to the owning UI thread; window_fullscreen reports the applied state.
+void window_set_fullscreen(bool enabled);
+[[nodiscard]] bool window_fullscreen();
+
 // Publishes the framebuffer the guest just handed to the display.
-void window_present(const psprecomp::GuestMemory &memory, std::uint32_t framebuffer,
+void window_present(psprecomp::GuestMemory &memory, std::uint32_t framebuffer,
                     std::uint32_t stride, std::uint32_t format, std::uint32_t width,
                     std::uint32_t height);
 

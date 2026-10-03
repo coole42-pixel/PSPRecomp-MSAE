@@ -155,8 +155,10 @@ GuestMemory::ResolvedAddress GuestMemory::resolve(std::uint32_t address, std::si
     const std::uint32_t c = canonical(address);
     if (c >= kScratchpadPhysicalBase && c < kScratchpadPhysicalBase + kScratchpadSize)
         return {Region::Scratchpad, static_cast<std::size_t>(c - kScratchpadPhysicalBase)};
-    if (is_vram_window(c))
+    if (is_vram_window(c)) {
+        notify_vram_access();
         return {Region::Vram, vram_offset(c)};
+    }
     return {Region::Ram, static_cast<std::size_t>(c - kPhysicalBase)};
 }
 
@@ -180,6 +182,7 @@ std::uint8_t GuestMemory::aot_load8_slow(std::uint32_t address) const {
         return value;
     }
     if (is_vram_window(c)) {
+        notify_vram_access();
         const std::uint8_t value = vram_[vram_offset(c)];
         log_read_watch(address, 1u, value);
         return value;
@@ -200,6 +203,7 @@ std::uint16_t GuestMemory::aot_load16_slow(std::uint32_t address) const {
         return value;
     }
     if (is_vram_window(c)) {
+        notify_vram_access();
         const std::size_t offset = vram_offset(c);
         if (offset + 2u <= vram_.size()) {
             const std::uint16_t value =
@@ -231,6 +235,7 @@ std::uint32_t GuestMemory::aot_load32_slow(std::uint32_t address) const {
     const std::vector<std::uint8_t> *data = nullptr;
     std::size_t offset = 0u;
     if (is_vram_window(c)) {
+        notify_vram_access();
         data = &vram_;
         offset = vram_offset(c);
     } else if (c >= kPhysicalBase) {
@@ -263,7 +268,7 @@ std::uint32_t GuestMemory::aot_load_word_right(std::uint32_t address, std::uint3
 void GuestMemory::aot_store8_slow(std::uint32_t address, std::uint8_t value) {
     if (write_watch_enabled_) { store8(address, value); return; }
     const std::uint32_t c = canonical(address);
-    if (is_vram_window(c)) { vram_[vram_offset(c)] = value; return; }
+    if (is_vram_window(c)) { notify_vram_access(); vram_[vram_offset(c)] = value; return; }
     if (c >= kPhysicalBase && c - kPhysicalBase < bytes_.size()) {
         bytes_[static_cast<std::size_t>(c - kPhysicalBase)] = value;
         return;
@@ -275,7 +280,7 @@ void GuestMemory::aot_store16_slow(std::uint32_t address, std::uint16_t value) {
     const std::uint32_t c = canonical(address);
     std::vector<std::uint8_t> *data = nullptr;
     std::size_t offset = 0u;
-    if (is_vram_window(c)) { data = &vram_; offset = vram_offset(c); }
+    if (is_vram_window(c)) { notify_vram_access(); data = &vram_; offset = vram_offset(c); }
     else if (c >= kPhysicalBase) { data = &bytes_; offset = static_cast<std::size_t>(c - kPhysicalBase); }
     if (data != nullptr && offset + 2u <= data->size()) {
         (*data)[offset] = static_cast<std::uint8_t>(value & 0xFFu);
@@ -289,7 +294,7 @@ void GuestMemory::aot_store32_slow(std::uint32_t address, std::uint32_t value) {
     const std::uint32_t c = canonical(address);
     std::vector<std::uint8_t> *data = nullptr;
     std::size_t offset = 0u;
-    if (is_vram_window(c)) { data = &vram_; offset = vram_offset(c); }
+    if (is_vram_window(c)) { notify_vram_access(); data = &vram_; offset = vram_offset(c); }
     else if (c >= kPhysicalBase) { data = &bytes_; offset = static_cast<std::size_t>(c - kPhysicalBase); }
     if (data != nullptr && offset + 4u <= data->size()) {
         (*data)[offset] = static_cast<std::uint8_t>(value & 0xFFu);

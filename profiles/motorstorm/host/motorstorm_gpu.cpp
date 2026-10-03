@@ -1,7 +1,11 @@
 #include "motorstorm_gpu.hpp"
+#include "motorstorm_presentation.hpp"
 #include "motorstorm_perf.hpp"
 
 #include <algorithm>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -29,6 +33,11 @@ bool attempted{};
 // submission may have changed guest-visible pixels; chunk submissions that are
 // still in flight do not publish anything, so they must not advance it.
 std::uint64_t gpu_publish_epoch{};
+// When set, the end of a GE list submits its readbacks without waiting; they
+// are published to guest memory at the next point that needs guest-visible
+// pixels (the next list, transfers, software draws, captures). The GPU tail of
+// each frame then overlaps the guest CPU work for the next one.
+bool deferred_readback{};
 #if defined(_WIN32)
 using Microsoft::WRL::ComPtr;
 #include "motorstorm_gpu_shader.inc"
@@ -55,7 +64,7 @@ struct Surface {
     UINT64 native_version{~0ull};
     std::vector<std::uint8_t> guest_shadow;
     D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COPY_DEST};
-    bool loaded{}, dirty{};
+    bool loaded{}, dirty{}, readback_pending{};
     UINT64 version{}, snapshot_version{~0ull};
     UINT64 snapshot_bytes{};
     UINT64 snapshot_guest_epoch{~0ull};
@@ -112,11 +121,16 @@ struct State {
     ComPtr<IDXGIFactory6> factory;
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
-    CommandSlot slots[kCommandSlotCapacity];
+    // The extra slot is reserved for presentation so presenting never waits
+    // for a GE chunk that happens to share a ring slot.
+    CommandSlot slots[kCommandSlotCapacity + 1];
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
     UINT slot_index{};
     UINT64 frame_fence{}, chunk_draws{};
+    // readback_fence: submitted GE work whose readbacks are not yet published.
+    // arena_fence: last submission that may still read the upload arena.
+    UINT64 readback_fence{}, arena_fence{};
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pipeline, line_pipeline, point_pipeline, present_pipeline, expand_pipeline,
         resolve_pipeline, capture_pipeline;
@@ -135,17 +149,74 @@ struct State {
     std::vector<std::unique_ptr<Surface>> surfaces;
     std::unordered_map<std::uint64_t, Texture> textures;
     ComPtr<IDXGISwapChain3> swapchain;
-    ComPtr<ID3D12Resource> backbuffers[2];
+    HANDLE frame_latency{};
+    // Three buffers keep the GE queue from waiting at vblank for a free one.
+    static constexpr UINT kBackBuffers = 3;
+    ComPtr<ID3D12Resource> backbuffers[kBackBuffers];
     HWND window{};
     UINT present_width{}, present_height{}, rtv_size{};
+    // DXGI Present runs on its own thread: it blocks at the display refresh,
+    // which would otherwise cap emulation at the monitor's frame rate.
+    std::thread presenter;
+    std::mutex present_mutex;
+    std::condition_variable present_cv;
+    bool present_requested{}, present_busy{}, presenter_stop{};
+    HRESULT present_result{S_OK};
+    // Presentation runs on its own queue, which owns the swap chain. A flip
+    // present waits on its queue for a free back buffer at vblank; on the GE
+    // queue that wait stalled every GE chunk behind it and capped emulation at
+    // the display refresh. The GE queue only copies the displayed target into
+    // a snapshot ring; the present queue scales/filters from the snapshot.
+    struct PresentFrame {
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12GraphicsCommandList> list;
+        ComPtr<ID3D12Resource> image, constants;
+        UINT64 bytes{}, fence{};
+        void *mapped{};
+    };
+    static constexpr UINT kPresentFrames = 3;
+    ComPtr<ID3D12CommandQueue> present_queue;
+    ComPtr<ID3D12Fence> present_fence;
+    HANDLE present_event{};
+    UINT64 present_fence_value{};
+    PresentFrame present_frames[kPresentFrames];
+    UINT present_frame{};
+    void wait_presenter_idle() {
+        std::unique_lock lock(present_mutex);
+        present_cv.wait(lock, [&] { return !present_busy; });
+    }
+    void stop_presenter() {
+        if (!presenter.joinable())
+            return;
+        {
+            std::lock_guard lock(present_mutex);
+            presenter_stop = true;
+        }
+        present_cv.notify_all();
+        presenter.join();
+    }
     ~State() {
+        stop_presenter();
+        // Release nothing the present queue may still be reading.
+        if (present_queue && present_fence && present_event) {
+            const UINT64 value = ++present_fence_value;
+            if (SUCCEEDED(present_queue->Signal(present_fence.Get(), value)) &&
+                present_fence->GetCompletedValue() < value &&
+                SUCCEEDED(present_fence->SetEventOnCompletion(value, present_event)))
+                WaitForSingleObject(present_event, 5000);
+        }
         if (upload && mapped)
             upload->Unmap(0, nullptr);
         if (event)
             CloseHandle(event);
+        if (frame_latency)
+            CloseHandle(frame_latency);
+        if (present_event)
+            CloseHandle(present_event);
     }
 };
 std::unique_ptr<State> state;
+void publish_readbacks(State &s, psprecomp::GuestMemory &memory);
 struct Constants {
     std::array<std::uint32_t, 256> commands;
     std::array<float, 16> clip;
@@ -218,12 +289,19 @@ void open_chunk(State &s, UINT index) {
     ID3D12DescriptorHeap *heaps[]{s.srv.Get()};
     s.list->SetDescriptorHeaps(1, heaps);
 }
-void begin(State &s) {
+constexpr UINT kPresentSlot = kCommandSlotCapacity;
+void begin(State &s, UINT slot = 0) {
     if (s.recording)
         return;
-    s.used = 0;
+    // Deferred readbacks and presentation leave submissions in flight that
+    // still read the upload arena. Append behind them until they complete;
+    // wait only when the arena would otherwise run short.
+    if (s.arena_fence != 0u && s.fence->GetCompletedValue() < s.arena_fence && s.used > kUploadBytes / 2u)
+        wait_value(s, s.arena_fence);
+    if (s.arena_fence == 0u || s.fence->GetCompletedValue() >= s.arena_fence)
+        s.used = 0;
     s.frame_fence = 0;
-    open_chunk(s, 0);
+    open_chunk(s, slot);
 }
 // Close and execute the recording chunk without waiting for it.
 void submit_chunk(State &s) {
@@ -235,6 +313,7 @@ void submit_chunk(State &s) {
     slot.fence_value = signal_fence(s);
     slot.pending = true;
     s.frame_fence = slot.fence_value;
+    s.arena_fence = slot.fence_value;
     s.recording = false;
     s.has_commands = false;
     s.chunk_draws = 0;
@@ -290,6 +369,20 @@ void create_pipeline(State &s) {
     D3D12_ROOT_SIGNATURE_DESC desc{};
     desc.NumParameters = 7;
     desc.pParameters = params;
+    D3D12_STATIC_SAMPLER_DESC samplers[4]{};
+    for (UINT i = 0u; i < 4u; ++i) {
+        samplers[i].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        samplers[i].AddressU = (i & 1u) ? D3D12_TEXTURE_ADDRESS_MODE_CLAMP : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        samplers[i].AddressV = (i & 2u) ? D3D12_TEXTURE_ADDRESS_MODE_CLAMP : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        samplers[i].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samplers[i].MaxAnisotropy = 1u;
+        samplers[i].ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        samplers[i].MaxLOD = D3D12_FLOAT32_MAX;
+        samplers[i].ShaderRegister = i;
+        samplers[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
+    desc.NumStaticSamplers = 4u;
+    desc.pStaticSamplers = samplers;
     desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> serialized, errors;
     check(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors),
@@ -393,7 +486,18 @@ void load_surface(State &s, Surface &surface, const psprecomp::GuestMemory &memo
     if (surface.loaded)
         return;
     std::vector<std::uint8_t> guest(static_cast<std::size_t>(surface.guest_bytes()));
-    memory.copy_out(surface.address, guest);
+    if (surface.readback_pending) {
+        // Reading this target's own bytes publishes its deferred readback.
+        memory.copy_out(surface.address, guest);
+    } else {
+        // Already-published bytes: a renderer read must not force another
+        // target's deferred readback (e.g. presenting the front buffer while
+        // the back buffer is still rendering).
+        const bool armed = memory.vram_hook_armed();
+        memory.arm_vram_hook(false);
+        memory.copy_out(surface.address, guest);
+        memory.arm_vram_hook(armed);
+    }
     // Retain real subpixel detail after resolving into guest VRAM. A reload is
     // required only when the CPU or a transfer actually changed those bytes.
     if (surface.version && guest == surface.guest_shadow) {
@@ -501,7 +605,7 @@ Texture &get_texture(State &s, const GpuTexture &texture) {
     desc.Height = texture.height;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = static_cast<UINT16>(texture.levels.size());
-    desc.Format = DXGI_FORMAT_R32_UINT;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.SampleDesc.Count = 1;
     check(s.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
@@ -534,7 +638,7 @@ Texture &get_texture(State &s, const GpuTexture &texture) {
                           D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
     s.list->ResourceBarrier(1, &barrier);
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
-    view.Format = DXGI_FORMAT_R32_UINT;
+    view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     view.Texture2D.MipLevels = desc.MipLevels;
@@ -571,10 +675,25 @@ ID3D12Resource *feedback_snapshot(State &s, const psprecomp::GuestMemory &memory
         const auto offset = allocate(s, native_bytes, 4);
         auto *out = reinterpret_cast<std::uint32_t *>(s.mapped + offset);
         const auto base = source ? source->address : address;
-        for (UINT64 i = native_from / 4; i < (native_from + native_bytes) / 4; ++i) {
-            const auto at = base + static_cast<std::uint32_t>(i * bpp);
-            out[i - native_from / 4] =
-                memory.contains(at, bpp) ? (bpp == 4 ? memory.aot_load32(at) : memory.aot_load16(at)) : 0;
+        const UINT64 first_texel = native_from / 4, texels = native_bytes / 4;
+        const auto start = base + static_cast<std::uint32_t>(first_texel * bpp);
+        if (memory.contains(start, static_cast<std::size_t>(texels * bpp))) {
+            // One bulk VRAM read instead of a slow-path load per texel.
+            if (bpp == 4) {
+                memory.copy_out(start, {reinterpret_cast<std::uint8_t *>(out), static_cast<std::size_t>(texels * 4)});
+            } else {
+                thread_local std::vector<std::uint16_t> packed;
+                packed.resize(static_cast<std::size_t>(texels));
+                memory.copy_out(start, {reinterpret_cast<std::uint8_t *>(packed.data()), packed.size() * 2});
+                for (UINT64 i = 0; i < texels; ++i)
+                    out[i] = packed[static_cast<std::size_t>(i)];
+            }
+        } else {
+            for (UINT64 i = first_texel; i < first_texel + texels; ++i) {
+                const auto at = base + static_cast<std::uint32_t>(i * bpp);
+                out[i - first_texel] =
+                    memory.contains(at, bpp) ? (bpp == 4 ? memory.aot_load32(at) : memory.aot_load16(at)) : 0;
+            }
         }
         if (scale == 1)
             s.list->CopyBufferRegion(destination, from, s.upload.Get(), offset, native_bytes);
@@ -801,6 +920,9 @@ void gpu_submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<c
     bool valid_depth =
         draw.depthbuffer && draw.depth_stride > 0 && draw.depth_stride <= 1024 &&
         memory.contains(draw.depthbuffer, static_cast<std::size_t>(draw.depth_stride) * height * 2);
+    // Targets compare guest bytes on load; publish any deferred readback first.
+    if (!s.recording && s.readback_fence != 0u)
+        publish_readbacks(s, memory);
     // Keep enough arena space for the maximum texture chain and target reloads.
     if (s.recording && s.used > kUploadBytes - 20 * 1024 * 1024)
         gpu_sync(memory);
@@ -908,13 +1030,12 @@ void gpu_submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<c
         flush_chunk(s);
 #endif
 }
-void gpu_sync(psprecomp::GuestMemory &memory) {
 #if defined(_WIN32)
-    if (!state || !state->recording)
-        return;
-    perf::Scope sync_profile(perf::kGpuSync);
-    auto &s = *state;
-    for (const auto &surface : s.surfaces)
+namespace {
+// Record the readback of every surface drawn by this list and submit the list.
+// The copies land in the readback buffers once the queue reaches them.
+void finish_list(State &s) {
+    for (const auto &surface : s.surfaces) {
         if (surface->dirty) {
             auto *resolved = resolve_surface(s, *surface);
             if (surface->raster_scale == 1)
@@ -926,46 +1047,70 @@ void gpu_sync(psprecomp::GuestMemory &memory) {
                 transition(s, *surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             else
                 native_transition(s, *surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        }
-    if (s.recording) {
-        if (s.has_commands) {
-            submit_chunk(s);
-        } else {
-            check(s.list->Close(), "close GE chunk");
-            s.recording = false;
-        }
-    }
-    if (s.frame_fence != 0u) {
-        perf::Scope fence_profile(perf::kGpuFence);
-        wait_value(s, s.frame_fence);
-        s.frame_fence = 0u;
-    }
-    ++gpu_publish_epoch;
-    perf::Scope readback_profile(perf::kGpuReadback);
-    for (const auto &surface : s.surfaces) {
-        if (surface->dirty) {
-            void *mapped_pixels{};
-            D3D12_RANGE range{0, static_cast<SIZE_T>(surface->native_bytes())};
-            check(surface->readback->Map(0, &range, &mapped_pixels), "map GE readback");
-            const auto *pixels = static_cast<const std::uint32_t *>(mapped_pixels);
-            surface->guest_shadow.resize(static_cast<std::size_t>(surface->guest_bytes()));
-            if (surface->bpp == 4) {
-                memory.copy_in(surface->address, {reinterpret_cast<const std::uint8_t *>(pixels),
-                                                  static_cast<std::size_t>(surface->native_bytes())});
-                std::memcpy(surface->guest_shadow.data(), pixels, surface->guest_shadow.size());
-            } else {
-                for (UINT64 i = 0; i < surface->native_bytes() / 4; ++i) {
-                    const auto value = static_cast<std::uint16_t>(pixels[i]);
-                    std::memcpy(surface->guest_shadow.data() + i * 2, &value, 2);
-                }
-                memory.copy_in(surface->address, surface->guest_shadow);
-            }
-            D3D12_RANGE none{};
-            surface->readback->Unmap(0, &none);
             surface->dirty = false;
+            surface->readback_pending = true;
         }
         surface->loaded = false;
     }
+    if (s.has_commands) {
+        submit_chunk(s);
+    } else {
+        check(s.list->Close(), "close GE chunk");
+        s.recording = false;
+    }
+    s.readback_fence = std::max(s.readback_fence, s.frame_fence);
+    s.frame_fence = 0u;
+}
+// Wait for submitted GE work and copy its pixels into guest memory. Bytes the
+// CPU changed after the list ended keep the CPU's value, exactly as if the
+// readback had been published at the list boundary and the CPU wrote after.
+void publish_readbacks(State &s, psprecomp::GuestMemory &memory) {
+    memory.arm_vram_hook(false);
+    if (s.readback_fence == 0u)
+        return;
+    {
+        perf::Scope fence_profile(perf::kGpuFence);
+        wait_value(s, s.readback_fence);
+    }
+    s.readback_fence = 0u;
+    ++gpu_publish_epoch;
+    perf::Scope readback_profile(perf::kGpuReadback);
+    std::vector<std::uint8_t> current;
+    for (const auto &surface : s.surfaces) {
+        if (!surface->readback_pending)
+            continue;
+        void *mapped_pixels{};
+        D3D12_RANGE range{0, static_cast<SIZE_T>(surface->native_bytes())};
+        check(surface->readback->Map(0, &range, &mapped_pixels), "map GE readback");
+        const auto *pixels = static_cast<const std::uint32_t *>(mapped_pixels);
+        std::vector<std::uint8_t> published(static_cast<std::size_t>(surface->guest_bytes()));
+        if (surface->bpp == 4) {
+            std::memcpy(published.data(), pixels, published.size());
+        } else {
+            for (UINT64 i = 0; i < surface->native_bytes() / 4; ++i) {
+                const auto value = static_cast<std::uint16_t>(pixels[i]);
+                std::memcpy(published.data() + i * 2, &value, 2);
+            }
+        }
+        D3D12_RANGE none{};
+        surface->readback->Unmap(0, &none);
+        current.resize(published.size());
+        memory.copy_out(surface->address, current);
+        if (current == surface->guest_shadow || current.size() != surface->guest_shadow.size()) {
+            memory.copy_in(surface->address, published);
+        } else {
+            for (std::size_t i = 0; i < current.size(); ++i)
+                if (current[i] == surface->guest_shadow[i])
+                    current[i] = published[i];
+            memory.copy_in(surface->address, current);
+        }
+        surface->guest_shadow = std::move(published);
+        surface->readback_pending = false;
+    }
+    // A publish can run while a list is recording (VRAM hook); that list may
+    // still reference transient resources and cached textures.
+    if (s.recording)
+        return;
     s.transient.clear();
     // Retire caches only after the fence, never while recorded draws use them.
     if (s.textures.size() > 4096 || s.texture_bytes > 256ull * 1024 * 1024) {
@@ -982,8 +1127,49 @@ void gpu_sync(psprecomp::GuestMemory &memory) {
             s.textures.erase(found);
         }
     }
+}
+} // namespace
+#endif
+void gpu_sync(psprecomp::GuestMemory &memory) {
+#if defined(_WIN32)
+    if (!state)
+        return;
+    auto &s = *state;
+    if (!s.recording && s.readback_fence == 0u)
+        return;
+    perf::Scope sync_profile(perf::kGpuSync);
+    if (s.recording)
+        finish_list(s);
+    publish_readbacks(s, memory);
 #endif
 }
+void gpu_end_list(psprecomp::GuestMemory &memory) {
+#if defined(_WIN32)
+    if (!deferred_readback) {
+        gpu_sync(memory);
+        return;
+    }
+    if (!state || !state->recording)
+        return;
+    perf::Scope sync_profile(perf::kGpuSync);
+    publish_readbacks(*state, memory);
+    finish_list(*state);
+    // The game's CPU code reads and writes the framebuffer between lists.
+    // Publish the moment anything touches VRAM so it never sees stale pixels.
+    memory.set_vram_access_hook([](void *context) {
+        if (state)
+            publish_readbacks(*state, *static_cast<psprecomp::GuestMemory *>(context));
+    }, &memory);
+    memory.arm_vram_hook(state->readback_fence != 0u);
+#endif
+}
+void gpu_settle(psprecomp::GuestMemory &memory) {
+#if defined(_WIN32)
+    if (state)
+        publish_readbacks(*state, memory);
+#endif
+}
+void gpu_set_deferred_readback(bool enabled) noexcept { deferred_readback = enabled; }
 void gpu_sync_texture(psprecomp::GuestMemory &memory, std::uint32_t address, std::uint32_t bytes) {
 #if defined(_WIN32)
     if (!state)
@@ -1014,13 +1200,14 @@ bool gpu_feedback_available(std::uint32_t address, std::uint32_t stride, std::ui
 }
 GpuReport gpu_report() { return report; }
 std::uint64_t gpu_memory_epoch() noexcept { return gpu_publish_epoch; }
-GpuImage gpu_capture(const psprecomp::GuestMemory &memory, std::uint32_t framebuffer, std::uint32_t stride,
+GpuImage gpu_capture(psprecomp::GuestMemory &memory, std::uint32_t framebuffer, std::uint32_t stride,
                      std::uint32_t format, std::uint32_t width, std::uint32_t height) {
     GpuImage result;
 #if defined(_WIN32)
     if (!state || state->recording || !width || !height)
         return result;
     auto &s = *state;
+    publish_readbacks(s, memory);
     Surface *color = nullptr;
     for (const auto &target : s.surfaces)
         if (target->address == physical(framebuffer) && target->stride == stride &&
@@ -1067,7 +1254,43 @@ GpuImage gpu_capture(const psprecomp::GuestMemory &memory, std::uint32_t framebu
 #endif
     return result;
 }
-bool gpu_present(const psprecomp::GuestMemory &memory, void *window, std::uint32_t framebuffer,
+#if defined(_WIN32)
+namespace {
+void create_present_queue(State &s) {
+    if (s.present_queue)
+        return;
+    D3D12_COMMAND_QUEUE_DESC desc{};
+    desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    check(s.device->CreateCommandQueue(&desc, IID_PPV_ARGS(&s.present_queue)), "create present queue");
+    check(s.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s.present_fence)), "create present fence");
+    s.present_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!s.present_event)
+        throw std::runtime_error("Cannot create present fence event");
+    for (auto &frame : s.present_frames) {
+        check(s.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&frame.allocator)),
+              "create present allocator");
+        check(s.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, frame.allocator.Get(), nullptr,
+                                          IID_PPV_ARGS(&frame.list)),
+              "create present list");
+        check(frame.list->Close(), "close present list");
+        frame.constants = buffer(s, 4096, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        check(frame.constants->Map(0, nullptr, &frame.mapped), "map present constants");
+    }
+}
+// Wait until the present queue has finished everything submitted to it.
+void drain_present_queue(State &s) {
+    if (!s.present_queue)
+        return;
+    const UINT64 value = ++s.present_fence_value;
+    check(s.present_queue->Signal(s.present_fence.Get(), value), "signal present fence");
+    if (s.present_fence->GetCompletedValue() < value) {
+        check(s.present_fence->SetEventOnCompletion(value, s.present_event), "arm present fence");
+        WaitForSingleObject(s.present_event, 30000);
+    }
+}
+} // namespace
+#endif
+bool gpu_present(psprecomp::GuestMemory &memory, void *window, std::uint32_t framebuffer,
                  std::uint32_t stride, std::uint32_t format, std::uint32_t width, std::uint32_t height) {
 #if defined(_WIN32)
     if (!state || !window || !width || !height)
@@ -1087,15 +1310,25 @@ bool gpu_present(const psprecomp::GuestMemory &memory, void *window, std::uint32
     // until the first GPU draw initializes this framebuffer.
     if (s.recording)
         return false;
+    // A pending deferred readback means nothing has touched VRAM since the
+    // list ended (any access publishes it through the VRAM hook), so the GPU
+    // image is the current frame: present it without waiting.
+    const bool current_on_gpu = color->readback_pending;
     RECT client{};
     GetClientRect(static_cast<HWND>(window), &client);
     const UINT w = std::max<LONG>(1, client.right), h = std::max<LONG>(1, client.bottom);
     if (s.swapchain && (s.window != window || s.present_width != w || s.present_height != h)) {
+        s.wait_presenter_idle();
         wait(s);
+        drain_present_queue(s);
         for (auto &back : s.backbuffers)
             back.Reset();
         s.swapchain.Reset();
         s.rtv.Reset();
+        if (s.frame_latency) {
+            CloseHandle(s.frame_latency);
+            s.frame_latency = nullptr;
+        }
     }
     if (!s.swapchain) {
         DXGI_SWAP_CHAIN_DESC1 desc{};
@@ -1104,20 +1337,26 @@ bool gpu_present(const psprecomp::GuestMemory &memory, void *window, std::uint32
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         desc.SampleDesc.Count = 1;
         desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        desc.BufferCount = 2;
+        desc.BufferCount = State::kBackBuffers;
         desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
         ComPtr<IDXGISwapChain1> chain;
-        check(s.factory->CreateSwapChainForHwnd(s.queue.Get(), static_cast<HWND>(window), &desc, nullptr,
+        create_present_queue(s);
+        check(s.factory->CreateSwapChainForHwnd(s.present_queue.Get(), static_cast<HWND>(window), &desc, nullptr,
                                                 nullptr, &chain),
               "create swapchain");
         check(chain.As(&s.swapchain), "query swapchain");
+        // Two queued frames; beyond that the display cannot show more and
+        // presenting would block the guest (see the skip below).
+        check(s.swapchain->SetMaximumFrameLatency(2), "set frame latency");
+        s.frame_latency = s.swapchain->GetFrameLatencyWaitableObject();
         s.factory->MakeWindowAssociation(static_cast<HWND>(window), DXGI_MWA_NO_ALT_ENTER);
         D3D12_DESCRIPTOR_HEAP_DESC heap{};
         heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        heap.NumDescriptors = 2;
+        heap.NumDescriptors = State::kBackBuffers;
         check(s.device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&s.rtv)), "create RTV heap");
         s.rtv_size = s.device->GetDescriptorHandleIncrementSize(heap.Type);
-        for (UINT i = 0; i < 2; ++i) {
+        for (UINT i = 0; i < State::kBackBuffers; ++i) {
             check(s.swapchain->GetBuffer(i, IID_PPV_ARGS(&s.backbuffers[i])), "get swapchain buffer");
             auto handle = s.rtv->GetCPUDescriptorHandleForHeapStart();
             handle.ptr += i * s.rtv_size;
@@ -1127,45 +1366,120 @@ bool gpu_present(const psprecomp::GuestMemory &memory, void *window, std::uint32
         s.present_width = w;
         s.present_height = h;
     }
-    begin(s);
+    // When the presenter is still inside the previous Present, or the display
+    // has two frames queued, drop this presentation instead of stalling
+    // emulation; a newer frame follows shortly.
+    {
+        // Present usually returns within a few milliseconds of the request; a
+        // short bounded wait avoids dropping a frame at a vblank boundary.
+        std::unique_lock lock(s.present_mutex);
+        check(s.present_result, "present");
+        if (!s.present_cv.wait_for(lock, std::chrono::milliseconds(3), [&] { return !s.present_busy; })) {
+            ++report.skipped_presents;
+            return true;
+        }
+    }
+    if (s.frame_latency && WaitForSingleObject(s.frame_latency, 0) == WAIT_TIMEOUT) {
+        ++report.skipped_presents;
+        return true;
+    }
+    if (!s.presenter.joinable()) {
+        s.presenter = std::thread([&s] {
+            std::unique_lock lock(s.present_mutex);
+            for (;;) {
+                s.present_cv.wait(lock, [&] { return s.present_requested || s.presenter_stop; });
+                if (s.presenter_stop)
+                    return;
+                s.present_requested = false;
+                lock.unlock();
+                const HRESULT result = s.swapchain->Present(0, 0);
+                lock.lock();
+                if (FAILED(result))
+                    s.present_result = result;
+                s.present_busy = false;
+                s.present_cv.notify_all();
+            }
+        });
+    }
+    State::PresentFrame &frame = s.present_frames[s.present_frame];
+    if (frame.fence != 0u && s.present_fence->GetCompletedValue() < frame.fence) {
+        ++report.skipped_presents;  // every snapshot is still queued for display
+        return true;
+    }
+    begin(s, kPresentSlot);
     // Movies and CPU writes may update a displayed buffer without any GE draw.
     // Reload the synchronized guest bytes before direct presentation.
-    load_surface(s, *color, memory);
-    transition(s, *color, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (!current_on_gpu)
+        load_surface(s, *color, memory);
+    // Snapshot the displayed target on the GE queue. Buffers decay to COMMON
+    // after each submission, so the present queue reads it without barriers.
+    const UINT64 bytes = color->bytes();
+    if (!frame.image || frame.bytes < bytes) {
+        frame.image = buffer(s, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
+        frame.bytes = bytes;
+    }
+    transition(s, *color, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    s.list->CopyBufferRegion(frame.image.Get(), 0, color->image.Get(), 0, bytes);
+    transition(s, *color, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    check(s.list->Close(), "close presentation copy");
+    s.recording = false;
+    ID3D12CommandList *copy_lists[]{s.list.Get()};
+    s.queue->ExecuteCommandLists(1, copy_lists);
+    CommandSlot &slot = s.slots[s.slot_index];
+    slot.fence_value = signal_fence(s);
+    slot.pending = true;
+    s.arena_fence = slot.fence_value;
+    color->loaded = false;
+
+    check(frame.allocator->Reset(), "reset present allocator");
+    check(frame.list->Reset(frame.allocator.Get(), s.present_pipeline.Get()), "reset present list");
+    auto *list = frame.list.Get();
+    list->SetGraphicsRootSignature(s.root.Get());
+    ID3D12DescriptorHeap *heaps[]{s.srv.Get()};
+    list->SetDescriptorHeaps(1, heaps);
     Constants constants{};
     constants.surface = {width, height, stride * s.raster_scale, 0};
     constants.mode[0] = format;
     constants.render = {s.raster_scale, s.output_scale, s.antialiasing, 0};
-    const auto offset = allocate(s, sizeof(constants), 256);
-    std::memcpy(s.mapped + offset, &constants, sizeof(constants));
-    s.list->SetPipelineState(s.present_pipeline.Get());
-    s.list->SetGraphicsRootConstantBufferView(0, s.upload->GetGPUVirtualAddress() + offset);
-    s.list->SetGraphicsRootShaderResourceView(4, color->image->GetGPUVirtualAddress());
+    std::memcpy(frame.mapped, &constants, sizeof(constants));
+    list->SetGraphicsRootConstantBufferView(0, frame.constants->GetGPUVirtualAddress());
+    list->SetGraphicsRootShaderResourceView(4, frame.image->GetGPUVirtualAddress());
     const UINT index = s.swapchain->GetCurrentBackBufferIndex();
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition = {s.backbuffers[index].Get(), 0, D3D12_RESOURCE_STATE_PRESENT,
                           D3D12_RESOURCE_STATE_RENDER_TARGET};
-    s.list->ResourceBarrier(1, &barrier);
+    list->ResourceBarrier(1, &barrier);
     auto rtv = s.rtv->GetCPUDescriptorHandleForHeapStart();
     rtv.ptr += index * s.rtv_size;
-    s.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-    D3D12_VIEWPORT viewport{0, 0, static_cast<float>(w), static_cast<float>(h), 0, 1};
-    D3D12_RECT rect{0, 0, static_cast<LONG>(w), static_cast<LONG>(h)};
-    s.list->RSSetViewports(1, &viewport);
-    s.list->RSSetScissorRects(1, &rect);
-    s.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    s.list->DrawInstanced(3, 1, 0, 0);
+    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    constexpr float black[]{0, 0, 0, 1};
+    list->ClearRenderTargetView(rtv, black, 0, nullptr);
+    const auto fitted = fit_presentation(w, h, width, height);
+    D3D12_VIEWPORT viewport{static_cast<float>(fitted.left), static_cast<float>(fitted.top),
+        static_cast<float>(fitted.width), static_cast<float>(fitted.height), 0, 1};
+    D3D12_RECT rect{static_cast<LONG>(fitted.left), static_cast<LONG>(fitted.top),
+        static_cast<LONG>(fitted.left + fitted.width), static_cast<LONG>(fitted.top + fitted.height)};
+    list->RSSetViewports(1, &viewport);
+    list->RSSetScissorRects(1, &rect);
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list->DrawInstanced(3, 1, 0, 0);
     std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
-    s.list->ResourceBarrier(1, &barrier);
-    transition(s, *color, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    check(s.list->Close(), "close presentation list");
-    s.recording = false;
-    ID3D12CommandList *lists[]{s.list.Get()};
-    s.queue->ExecuteCommandLists(1, lists);
-    check(s.swapchain->Present(0, 0), "present");
-    wait(s);
-    color->loaded = false;
+    list->ResourceBarrier(1, &barrier);
+    check(list->Close(), "close presentation list");
+    // GPU-side wait for the snapshot copy; the CPU never blocks here.
+    check(s.present_queue->Wait(s.fence.Get(), slot.fence_value), "present queue wait");
+    ID3D12CommandList *present_lists[]{list};
+    s.present_queue->ExecuteCommandLists(1, present_lists);
+    frame.fence = ++s.present_fence_value;
+    check(s.present_queue->Signal(s.present_fence.Get(), frame.fence), "signal present fence");
+    s.present_frame = (s.present_frame + 1u) % State::kPresentFrames;
+    {
+        std::lock_guard lock(s.present_mutex);
+        s.present_busy = true;
+        s.present_requested = true;
+    }
+    s.present_cv.notify_all();
     ++report.presents;
     return true;
 #else

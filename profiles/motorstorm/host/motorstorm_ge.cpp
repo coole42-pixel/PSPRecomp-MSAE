@@ -42,11 +42,15 @@ struct Vertex {
     std::array<float, 4> clip{};
 };
 
+inline std::uint64_t g_lighting_generation{};
 struct GeState {
     GeState() {
         for (auto &bone : bones)
             bone[0] = bone[4] = bone[8] = 1.0f;
     }
+    // Changes whenever a lighting command or the view matrix may have changed;
+    // light_vertex caches its per-light setup against it.
+    std::uint64_t lighting_epoch{++g_lighting_generation};
     // Framebuffer.
     std::uint32_t framebuffer{};
     std::uint32_t framebuffer_stride{};
@@ -1210,62 +1214,128 @@ Vec3 normalize3(const Vec3 &v) {
     return {v[0] / length, v[1] / length, v[2] / length};
 }
 
+// Everything light_vertex needs that depends only on GE commands and the view
+// matrix. Rebuilt when GeState::lighting_epoch changes; every value is
+// computed by the same expression the per-vertex code used, so lighting is
+// bit-identical.
+struct LightSetup {
+    std::uint64_t epoch{};
+    std::array<float, 3> emissive{}, ambient_light{};
+    std::array<std::array<float, 3>, 3> material{};  // ambient, diffuse, specular command colors
+    Vec3 view_direction{};
+    float exponent{};
+    struct Light {
+        bool enabled{};
+        std::uint32_t type{}, kind{};
+        Vec3 direction{};         // raw command vector (position for point/spot lights)
+        Vec3 unit_direction{};    // normalized, directional lights only
+        Vec3 halfway{};           // directional specular halfway vector
+        float a0{}, a1{}, a2{};   // attenuation
+        Vec3 spot{};
+        float cutoff{}, spot_exponent{};
+        std::array<float, 3> ambient{}, diffuse{}, specular{};
+    };
+    std::array<Light, 4> lights{};
+};
+
+float color_component(std::uint32_t color, std::size_t i) {
+    return static_cast<float>((color >> (i * 8u)) & 255u) / 255.0f;
+}
+
+const LightSetup &light_setup(const GeState &state) {
+    thread_local LightSetup setup;
+    if (setup.epoch == state.lighting_epoch)
+        return setup;
+    const auto &c = state.commands;
+    setup.epoch = state.lighting_epoch;
+    for (std::size_t j = 0; j < 3u; ++j) {
+        setup.emissive[j] = color_component(c[0x54u], j);
+        setup.ambient_light[j] = color_component(c[0x5Cu], j);
+        for (std::size_t m = 0; m < 3u; ++m)
+            setup.material[m][j] = color_component(c[0x55u + m], j);
+    }
+    setup.view_direction = normalize3({state.view[2], state.view[5], state.view[8]});
+    setup.exponent = std::max(0.0f, command_float(c[0x5Bu]));
+    for (std::size_t i = 0; i < 4u; ++i) {
+        auto &light = setup.lights[i];
+        light.enabled = (c[0x18u + i] & 1u) != 0u;
+        if (!light.enabled)
+            continue;
+        light.type = (c[0x5Fu + i] >> 8u) & 3u;
+        light.kind = c[0x5Fu + i] & 3u;
+        for (std::size_t j = 0; j < 3u; ++j)
+            light.direction[j] = command_float(c[0x63u + i * 3u + j]);
+        light.a0 = command_float(c[0x7Bu + i * 3u]);
+        light.a1 = command_float(c[0x7Cu + i * 3u]);
+        light.a2 = command_float(c[0x7Du + i * 3u]);
+        if (light.type == 0u) {
+            light.unit_direction = normalize3(light.direction);
+            light.halfway = normalize3({light.unit_direction[0] + setup.view_direction[0],
+                                        light.unit_direction[1] + setup.view_direction[1],
+                                        light.unit_direction[2] + setup.view_direction[2]});
+        }
+        if (light.type >= 2u) {
+            light.spot = normalize3({command_float(c[0x6Fu + i * 3u]), command_float(c[0x70u + i * 3u]),
+                                     command_float(c[0x71u + i * 3u])});
+            light.cutoff = command_float(c[0x8Bu + i]);
+            light.spot_exponent = std::max(0.0f, command_float(c[0x87u + i]));
+        }
+        for (std::size_t j = 0; j < 3u; ++j) {
+            light.ambient[j] = color_component(c[0x8Fu + i * 3u], j);
+            light.diffuse[j] = color_component(c[0x90u + i * 3u], j);
+            light.specular[j] = color_component(c[0x91u + i * 3u], j);
+        }
+    }
+    return setup;
+}
+
 void light_vertex(const GeState &state, const Vec3 &position, const Vec3 &normal, Vertex &vertex) {
     const auto &c = state.commands;
-    const auto component = [](std::uint32_t color, std::size_t i) {
-        return static_cast<float>((color >> (i * 8u)) & 255u) / 255.0f;
-    };
-    const auto material = [&](std::uint32_t bit, std::uint32_t command) {
-        return vertex.has_color && (c[0x53u] & bit) != 0u ? vertex.color : c[command];
-    };
-    const auto ambient = material(1u, 0x55u), diffuse = material(2u, 0x56u), specular = material(4u, 0x57u);
+    const auto &setup = light_setup(state);
+    // Vertex colors replace a material color when its 0x53 bit is set.
+    std::array<std::array<float, 3>, 3> material = setup.material;
+    if (vertex.has_color)
+        for (std::size_t m = 0; m < 3u; ++m)
+            if ((c[0x53u] & (1u << m)) != 0u)
+                for (std::size_t j = 0; j < 3u; ++j)
+                    material[m][j] = color_component(vertex.color, j);
+    const auto &ambient = material[0], &diffuse = material[1], &specular = material[2];
     std::array<float, 3> result{}, highlight{};
     for (std::size_t j = 0; j < 3u; ++j)
-        result[j] = component(c[0x54u], j) + component(ambient, j) * component(c[0x5Cu], j);
-    const auto view_direction = normalize3({state.view[2], state.view[5], state.view[8]});
-    const float exponent = std::max(0.0f, command_float(c[0x5Bu]));
-    for (std::size_t i = 0; i < 4u; ++i) {
-        if ((c[0x18u + i] & 1u) == 0u)
+        result[j] = setup.emissive[j] + ambient[j] * setup.ambient_light[j];
+    const float exponent = setup.exponent;
+    for (const auto &light : setup.lights) {
+        if (!light.enabled)
             continue;
-        const auto type = (c[0x5Fu + i] >> 8u) & 3u, kind = c[0x5Fu + i] & 3u;
-        Vec3 direction{};
-        for (std::size_t j = 0; j < 3u; ++j)
-            direction[j] = command_float(c[0x63u + i * 3u + j]);
+        Vec3 direction = light.direction;
         float attenuation = 1.0f;
-        if (type != 0u) {
+        if (light.type != 0u) {
             for (std::size_t j = 0; j < 3u; ++j)
                 direction[j] -= position[j];
             const float distance = std::sqrt(dot3(direction, direction));
-            const float denominator = command_float(c[0x7Bu + i * 3u]) +
-                                      distance * command_float(c[0x7Cu + i * 3u]) +
-                                      distance * distance * command_float(c[0x7Du + i * 3u]);
+            const float denominator = light.a0 + distance * light.a1 + distance * distance * light.a2;
             attenuation = denominator > 0.0f ? std::clamp(1.0f / denominator, 0.0f, 1.0f) : 1.0f;
+            direction = normalize3(direction);
+        } else {
+            direction = light.unit_direction;
         }
-        direction = normalize3(direction);
-        if (type >= 2u) {
-            const Vec3 spot = normalize3({command_float(c[0x6Fu + i * 3u]), command_float(c[0x70u + i * 3u]),
-                                          command_float(c[0x71u + i * 3u])});
-            const float cosine = -dot3(direction, spot);
-            const float cutoff = command_float(c[0x8Bu + i]);
-            attenuation *= cosine >= cutoff
-                               ? std::pow(std::max(cosine, 0.0f), std::max(0.0f, command_float(c[0x87u + i])))
-                               : 0.0f;
+        if (light.type >= 2u) {
+            const float cosine = -dot3(direction, light.spot);
+            attenuation *= cosine >= light.cutoff ? std::pow(std::max(cosine, 0.0f), light.spot_exponent) : 0.0f;
         }
         const float facing = std::max(0.0f, dot3(normal, direction));
-        const float diffuse_factor = kind == 2u ? std::pow(facing, exponent) : facing;
+        const float diffuse_factor = light.kind == 2u ? std::pow(facing, exponent) : facing;
         float specular_factor = 0.0f;
-        if (kind == 1u && facing > 0.0f) {
-            const auto halfway =
-                normalize3({direction[0] + view_direction[0], direction[1] + view_direction[1],
-                            direction[2] + view_direction[2]});
+        if (light.kind == 1u && facing > 0.0f) {
+            const auto halfway = light.type == 0u
+                ? light.halfway
+                : normalize3({direction[0] + setup.view_direction[0], direction[1] + setup.view_direction[1],
+                              direction[2] + setup.view_direction[2]});
             specular_factor = std::pow(std::max(0.0f, dot3(normal, halfway)), exponent);
         }
         for (std::size_t j = 0; j < 3u; ++j) {
-            result[j] +=
-                attenuation * (component(ambient, j) * component(c[0x8Fu + i * 3u], j) +
-                               diffuse_factor * component(diffuse, j) * component(c[0x90u + i * 3u], j));
-            highlight[j] +=
-                attenuation * specular_factor * component(specular, j) * component(c[0x91u + i * 3u], j);
+            result[j] += attenuation * (ambient[j] * light.ambient[j] + diffuse_factor * diffuse[j] * light.diffuse[j]);
+            highlight[j] += attenuation * specular_factor * specular[j] * light.specular[j];
         }
     }
     const auto alpha = vertex.has_color && (c[0x53u] & 1u) != 0u ? vertex.color >> 24u : state.material_alpha;
@@ -1729,6 +1799,8 @@ void execute_list(GuestMemory &memory, std::uint32_t address, std::uint32_t stal
         const std::uint32_t command = word >> 24u;
         const std::uint32_t data = word & 0xFFFFFFu;
         g_state.commands[command] = data;
+        if ((command >= 0x53u && command <= 0x92u) || (command >= 0x18u && command <= 0x1Bu))
+            g_state.lighting_epoch = ++g_lighting_generation;
         const std::uint32_t preceding = previous_word;
         previous_word = word;
         ++g_summary.commands;
@@ -1909,6 +1981,7 @@ void execute_list(GuestMemory &memory, std::uint32_t address, std::uint32_t stal
             if (g_state.view_cursor < 12u)
                 g_state.view[g_state.view_cursor] = std::bit_cast<float>(data << 8u);
             g_state.view_cursor = (g_state.view_cursor + 1u) & 15u;
+            g_state.lighting_epoch = ++g_lighting_generation;
             break;
         case 0x3Eu:
             g_state.projection_cursor = data & 15u;
@@ -2264,12 +2337,12 @@ std::vector<GeInterrupt> software_ge_execute_list(GuestMemory &memory, std::uint
                                                   std::uint32_t stall, bool rasterize,
                                                   std::uint64_t submission) {
     ++g_summary.lists_executed;
-    if(rasterize) gpu_initialize();
+    if(rasterize) { gpu_initialize(); gpu_settle(memory); }
     g_list_texture_keys.clear();
     if(g_gpu_textures.size()>4096 || g_gpu_texture_bytes>256ull*1024*1024) { g_gpu_textures.clear(); g_gpu_texture_bytes=0; }
     std::vector<GeInterrupt> interrupts;
     execute_list(memory, address, stall, rasterize, interrupts, submission);
-    gpu_sync(memory);
+    gpu_end_list(memory);
     return interrupts;
 }
 

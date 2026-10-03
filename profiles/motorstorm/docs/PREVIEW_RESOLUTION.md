@@ -2,6 +2,10 @@
 
 Verified 2026-10-02, following the initial hardware D3D12 implementation.
 
+The launcher/executable now default to the user's 4x/SSAA4x preference through the documented
+`MotorStormNative.ini`. The measurements below retain their stated historical
+resolution. See [current build and fullscreen controls](../README.md).
+
 Music playback is now repaired and verified separately. See
 [the audio root cause, fix and captured evidence](audio_report.md). The fix
 restores PSP ATRAC first-frame trimming and removes the event-flag workaround

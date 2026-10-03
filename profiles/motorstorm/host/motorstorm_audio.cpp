@@ -1,10 +1,12 @@
 #include "motorstorm_audio.hpp"
 #include "motorstorm_bootstrap.hpp"
 #include "motorstorm_perf.hpp"
+#include "motorstorm_audio_recovery.hpp"
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <mmsystem.h>
+#include <avrt.h>
 #include <algorithm>
 #include <atomic>
 #include <array>
@@ -39,8 +41,10 @@ std::thread g_worker;
 std::condition_variable g_room;
 bool g_stopping{};
 bool g_starved{};
+AudioRecoveryRamp g_recovery;
 std::chrono::steady_clock::time_point g_starved_since;
 constexpr std::size_t kQueuedFrames=8192;
+std::atomic<std::uint64_t> g_blocked_us{};
 
 void completed() {
     for(std::size_t i=0;i<kBufferCount;++i)
@@ -83,9 +87,20 @@ void capture_header() {
 }
 void audio_worker() {
 #if defined(_WIN32)
-    // The feeder shares the machine with a CPU-hungry recompiler; raising its
-    // priority keeps completed buffers recycled before the device runs dry.
-    SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_HIGHEST);
+    // Let Windows schedule this as audio work rather than an ordinary high
+    // priority thread. Registration/reversion must occur on the same thread.
+    struct MultimediaTask {
+        HANDLE handle{};
+        ~MultimediaTask() { if (handle) AvRevertMmThreadCharacteristics(handle); }
+    } task;
+    DWORD task_index{};
+    task.handle = AvSetMmThreadCharacteristicsW(L"Audio", &task_index);
+    if (task.handle) AvSetMmThreadPriority(task.handle, AVRT_PRIORITY_HIGH);
+    else SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    {
+        std::lock_guard lock(g_mutex);
+        g_report.mmcss = task.handle != nullptr;
+    }
 #endif
     for(;;) {
         std::unique_lock lock(g_mutex);completed();
@@ -102,6 +117,7 @@ void audio_worker() {
         if(slot<kBufferCount && (pcm_ready || (g_stopping && !g_pcm.empty()))) {
             const auto frames=std::min(kBufferFrames,g_pcm.size()/2);
             for(std::size_t i=0;i<frames*2;++i) {g_buffers[slot][i]=g_pcm.front();g_pcm.pop_front();}
+            g_recovery.pcm({g_buffers[slot].data(), frames * 2u}, g_rate, g_starved);
             g_room.notify_all();g_headers[slot].dwBufferLength=static_cast<DWORD>(frames*4);
             const auto result=waveOutWrite(g_device,&g_headers[slot],sizeof(WAVEHDR));
             if(result!=MMSYSERR_NOERROR) {error(result,"waveOutWrite");g_report.dropped_frames+=frames;g_pcm.clear();g_enabled.store(false);g_room.notify_all();return;}
@@ -118,7 +134,7 @@ void audio_worker() {
             // instead of pausing the device: pause/restart cycles click, and a
             // stopped device would need a fresh start-up reserve to resume.
             // The gap is still reported through the underrun counters.
-            std::fill(g_buffers[slot].begin(),g_buffers[slot].end(),0);
+            g_recovery.silence(g_buffers[slot], g_rate);
             g_headers[slot].dwBufferLength=static_cast<DWORD>(kBufferFrames*4);
             const auto result=waveOutWrite(g_device,&g_headers[slot],sizeof(WAVEHDR));
             if(result!=MMSYSERR_NOERROR) {error(result,"waveOutWrite(silence)");g_enabled.store(false);g_room.notify_all();return;}
@@ -141,11 +157,12 @@ void audio_worker() {
 } // namespace
 
 bool audio_enabled() {return g_enabled.load();}
+std::uint64_t audio_blocked_us() noexcept {return g_blocked_us.load(std::memory_order_relaxed);}
 AudioReport audio_report() {std::lock_guard lock(g_mutex);completed();auto report=g_report;report.buffered_frames=g_pcm.size()/2;return report;}
 void audio_start(std::uint32_t sample_rate) {
     if(!requested()) return;
     std::lock_guard lock(g_mutex);if(g_open.load()) return;
-    g_report={};g_next=0;g_rate=sample_rate?sample_rate:44100;g_pcm.clear();g_stopping=false;g_starved=false;
+    g_report={};g_next=0;g_rate=sample_rate?sample_rate:44100;g_pcm.clear();g_stopping=false;g_starved=false;g_recovery={};
     g_event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
     if(!g_event) {error(MMSYSERR_NOMEM,"completion event");return;}
     WAVEFORMATEX format{};format.wFormatTag=WAVE_FORMAT_PCM;format.nChannels=2;
@@ -181,8 +198,16 @@ void audio_submit(const psprecomp::GuestMemory &memory,std::uint32_t buffer,std:
     for(auto &sample:samples) sample=static_cast<std::int16_t>(std::clamp<std::int64_t>(static_cast<std::int64_t>(sample)*volume/0x8000,-32768,32767));
     std::unique_lock lock(g_mutex);
     const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
-    {
+    if(g_pcm.size()/2+sample_count>kQueuedFrames) {
         perf::Scope audio_profile(perf::kAudioWait);
+        const auto blocked_since=std::chrono::steady_clock::now();
+        struct Account {
+            std::chrono::steady_clock::time_point since;
+            ~Account() {
+                g_blocked_us.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now()-since).count()),std::memory_order_relaxed);
+            }
+        } account{blocked_since};
         while(g_pcm.size()/2+sample_count>kQueuedFrames && g_enabled.load() && !g_stopping) {
             if(g_room.wait_until(lock,deadline)==std::cv_status::timeout) {
                 error(MMSYSERR_ERROR,"PCM queue timeout");g_report.dropped_frames+=sample_count;return;
@@ -217,6 +242,6 @@ void audio_shutdown() {
         " nonzero_samples="+std::to_string(g_report.nonzero_samples)+" peak="+std::to_string(g_report.peak)+
         " dropped_frames="+std::to_string(g_report.dropped_frames)+" errors="+std::to_string(g_report.errors));
     log_line("AUDIO","underruns="+std::to_string(g_report.underruns)+" longest_gap_us="+std::to_string(g_report.longest_gap_us)+
-        " silent_frames="+std::to_string(g_report.silent_frames));
+        " silent_frames="+std::to_string(g_report.silent_frames)+" mmcss="+std::to_string(g_report.mmcss));
 }
 } // namespace motorstorm

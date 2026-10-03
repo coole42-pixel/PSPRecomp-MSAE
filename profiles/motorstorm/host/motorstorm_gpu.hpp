@@ -35,7 +35,7 @@ struct GpuTexture {
 struct GpuReport {
     std::string adapter;
     std::uint64_t draws{}, hardware_transform_draws{}, vertices{}, submissions{}, texture_uploads{},
-        feedback_syncs{}, feedback_draws{}, software_draws{}, presents{};
+        feedback_syncs{}, feedback_draws{}, software_draws{}, presents{}, skipped_presents{};
     bool active{};
     std::uint32_t resolution_scale{1}, raster_scale{1}, antialiasing{};
 };
@@ -51,13 +51,19 @@ void gpu_submit(psprecomp::GuestMemory &, const GpuDraw &, std::span<const GpuVe
 // GE synchronization publishes GPU writes to guest memory before callbacks,
 // transfers and CPU reads. This is also the software/GPU fallback boundary.
 void gpu_sync(psprecomp::GuestMemory &);
+// End-of-list synchronization. With deferred readback enabled the list is
+// submitted without waiting and its pixels reach guest memory at gpu_settle
+// (or any gpu_sync / submission / capture); otherwise this is gpu_sync.
+void gpu_end_list(psprecomp::GuestMemory &);
+void gpu_settle(psprecomp::GuestMemory &);
+void gpu_set_deferred_readback(bool enabled) noexcept;
 void gpu_sync_texture(psprecomp::GuestMemory &, std::uint32_t address, std::uint32_t bytes);
 bool gpu_feedback_available(std::uint32_t address, std::uint32_t stride, std::uint32_t format) noexcept;
 void gpu_note_software_draw() noexcept;
 GpuReport gpu_report();
 std::uint64_t gpu_memory_epoch() noexcept;
-GpuImage gpu_capture(const psprecomp::GuestMemory &, std::uint32_t framebuffer, std::uint32_t stride,
+GpuImage gpu_capture(psprecomp::GuestMemory &, std::uint32_t framebuffer, std::uint32_t stride,
                      std::uint32_t format, std::uint32_t width, std::uint32_t height);
-bool gpu_present(const psprecomp::GuestMemory &, void *window, std::uint32_t framebuffer,
+bool gpu_present(psprecomp::GuestMemory &, void *window, std::uint32_t framebuffer,
                  std::uint32_t stride, std::uint32_t format, std::uint32_t width, std::uint32_t height);
 } // namespace motorstorm

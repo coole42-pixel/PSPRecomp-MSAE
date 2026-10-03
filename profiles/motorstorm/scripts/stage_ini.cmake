@@ -1,0 +1,7 @@
+if(NOT DEFINED SOURCE OR NOT DEFINED DESTINATION)
+    message(FATAL_ERROR "stage_ini requires SOURCE and DESTINATION")
+endif()
+configure_file("${SOURCE}" "${DESTINATION}/MotorStormNative.default.ini" COPYONLY)
+if(NOT EXISTS "${DESTINATION}/MotorStormNative.ini")
+    configure_file("${SOURCE}" "${DESTINATION}/MotorStormNative.ini" COPYONLY)
+endif()

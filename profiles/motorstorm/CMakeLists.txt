@@ -77,12 +77,14 @@ endif()
 
 set(MOTORSTORM_HOST_SOURCES
     host/main.cpp
+    host/motorstorm_config.cpp
     host/motorstorm_bootstrap.cpp
     host/motorstorm_hle.cpp
     host/motorstorm_ge.cpp
     host/motorstorm_gpu.cpp
     host/motorstorm_window.cpp
     host/motorstorm_audio.cpp
+    host/motorstorm_pacing.cpp
     host/motorstorm_atrac.cpp
     host/motorstorm_media.cpp
     ../vcs/host/vcs_media_decoder.cpp
@@ -96,7 +98,7 @@ function(motorstorm_target_common target)
     target_include_directories(${target} PRIVATE
         "${MOTORSTORM_PROFILE_DIR}/../vcs/host"
         "${MOTORSTORM_PROFILE_DIR}/../vcs/third_party/ffmpeg/include")
-    target_link_libraries(${target} PRIVATE psprecomp_core winmm d3d12 dxgi d3dcompiler dxguid)
+    target_link_libraries(${target} PRIVATE psprecomp_core winmm avrt d3d12 dxgi d3dcompiler dxguid)
     foreach(media_library avcodec avformat avutil swresample swscale)
         target_link_libraries(${target} PRIVATE
             "${MOTORSTORM_PROFILE_DIR}/../vcs/third_party/ffmpeg/lib/${media_library}.lib")
@@ -139,9 +141,10 @@ if(MSVC)
 endif()
 
 add_custom_command(TARGET MotorStormNative POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${MOTORSTORM_PROFILE_DIR}/config/motorstorm.ini"
-        "$<TARGET_FILE_DIR:MotorStormNative>/MotorStormNative.ini"
+    COMMAND ${CMAKE_COMMAND}
+        "-DSOURCE=${MOTORSTORM_PROFILE_DIR}/config/motorstorm.ini"
+        "-DDESTINATION=$<TARGET_FILE_DIR:MotorStormNative>"
+        -P "${MOTORSTORM_PROFILE_DIR}/scripts/stage_ini.cmake"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "$<TARGET_FILE:MotorStormNative>"
         "$<TARGET_FILE_DIR:MotorStormNative>/MotorStormNativePhase12.exe"
@@ -153,12 +156,14 @@ if(PSPRECOMP_BUILD_PROFILE_TESTS)
     endif()
     add_executable(motorstorm_profile_tests
         tests/motorstorm_profile_tests.cpp
+        host/motorstorm_config.cpp
         host/motorstorm_bootstrap.cpp
         host/motorstorm_hle.cpp
         host/motorstorm_ge.cpp
         host/motorstorm_gpu.cpp
         host/motorstorm_window.cpp
         host/motorstorm_audio.cpp
+        host/motorstorm_pacing.cpp
         host/motorstorm_atrac.cpp
         host/motorstorm_media.cpp
         ../vcs/host/vcs_media_decoder.cpp)
@@ -168,6 +173,23 @@ if(PSPRECOMP_BUILD_PROFILE_TESTS)
         target_link_options(motorstorm_profile_tests PRIVATE /STACK:67108864)
     endif()
     add_test(NAME motorstorm_profile_tests COMMAND motorstorm_profile_tests)
+    add_executable(motorstorm_config_tests tests/motorstorm_config_tests.cpp host/motorstorm_config.cpp)
+    target_include_directories(motorstorm_config_tests PRIVATE "${MOTORSTORM_PROFILE_DIR}/host")
+    target_compile_definitions(motorstorm_config_tests PRIVATE
+        MOTORSTORM_CONFIG_TEMPLATE="${MOTORSTORM_PROFILE_DIR}/config/motorstorm.ini")
+    motorstorm_set_runtime_output(motorstorm_config_tests)
+    add_test(NAME motorstorm_config_tests COMMAND motorstorm_config_tests)
+
+    add_executable(motorstorm_window_tests tests/motorstorm_window_tests.cpp
+        host/motorstorm_window.cpp host/motorstorm_gpu.cpp host/motorstorm_ge.cpp)
+    target_include_directories(motorstorm_window_tests PRIVATE "${MOTORSTORM_PROFILE_DIR}/host")
+    target_link_libraries(motorstorm_window_tests PRIVATE psprecomp_core d3d12 dxgi d3dcompiler dxguid user32 gdi32)
+    motorstorm_set_runtime_output(motorstorm_window_tests)
+    option(PSPRECOMP_MOTORSTORM_WINDOW_TESTS "Register tests requiring a Windows desktop" OFF)
+    if(PSPRECOMP_MOTORSTORM_WINDOW_TESTS)
+        add_test(NAME motorstorm_window_tests COMMAND motorstorm_window_tests)
+        set_tests_properties(motorstorm_window_tests PROPERTIES TIMEOUT 20)
+    endif()
     add_executable(motorstorm_gpu_tests tests/motorstorm_gpu_tests.cpp
         host/motorstorm_ge.cpp host/motorstorm_gpu.cpp)
     target_include_directories(motorstorm_gpu_tests PRIVATE "${MOTORSTORM_PROFILE_DIR}/host")
@@ -178,5 +200,7 @@ if(PSPRECOMP_BUILD_PROFILE_TESTS)
     if(PSPRECOMP_MOTORSTORM_GPU_TESTS)
         add_test(NAME motorstorm_gpu_tests COMMAND motorstorm_gpu_tests)
         add_test(NAME motorstorm_profile_d3d12_tests COMMAND motorstorm_profile_tests --d3d12)
+        add_test(NAME motorstorm_window_d3d12_tests COMMAND motorstorm_window_tests --d3d12)
+        set_tests_properties(motorstorm_window_d3d12_tests PROPERTIES TIMEOUT 30)
     endif()
 endif()

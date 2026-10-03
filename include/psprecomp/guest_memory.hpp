@@ -271,7 +271,28 @@ public:
     [[nodiscard]] const std::vector<std::uint8_t> &bytes() const noexcept;
     [[nodiscard]] const std::vector<std::uint8_t> &vram_bytes() const noexcept;
 
+    // One-shot notification of the next EDRAM access. A renderer that defers
+    // publishing GPU output into VRAM arms it; the first load or store that
+    // touches VRAM (generated code, interpreter or host copies) disarms it and
+    // runs the hook before the access, so every reader sees published pixels.
+    using VramAccessHook = void (*)(void *context);
+    void set_vram_access_hook(VramAccessHook hook, void *context) noexcept {
+        vram_hook_ = hook;
+        vram_hook_context_ = context;
+    }
+    void arm_vram_hook(bool armed) const noexcept { vram_hook_armed_ = armed && vram_hook_ != nullptr; }
+    [[nodiscard]] bool vram_hook_armed() const noexcept { return vram_hook_armed_; }
+
 private:
+    void notify_vram_access() const {
+        if (!vram_hook_armed_) return;
+        vram_hook_armed_ = false;
+        vram_hook_(vram_hook_context_);
+    }
+    VramAccessHook vram_hook_{};
+    void *vram_hook_context_{};
+    mutable bool vram_hook_armed_{};
+
     enum class Region { Scratchpad, Vram, Ram };
     struct ResolvedAddress {
         Region region;

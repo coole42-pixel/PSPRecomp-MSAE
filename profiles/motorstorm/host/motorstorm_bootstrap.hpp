@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include "motorstorm_config.hpp"
 
 namespace motorstorm {
 
@@ -42,6 +43,7 @@ bool open_log_file(const std::filesystem::path &path);
 void close_log_file();
 
 struct BootstrapPaths {
+    NativeConfig config;
     std::filesystem::path psp_executable;
     std::filesystem::path disc_root;   // mounted as disc0:/
     std::filesystem::path log_file;
@@ -50,7 +52,8 @@ struct BootstrapPaths {
     bool paths_from_command_line{};
 };
 
-// Explicit command-line arguments win.  With no arguments the profile looks
+// Environment path overrides are tried first, then positional arguments and
+// INI paths. --config <path> selects a custom INI. With no arguments it looks
 // next to the executable and inside the source tree layout:
 //   <exe_dir>/PSP_DATA/EBOOT_DECRYPTED.BIN  (deployment)
 //   <exe_dir>/game/EBOOT_DECRYPTED.BIN      (running from the build tree)

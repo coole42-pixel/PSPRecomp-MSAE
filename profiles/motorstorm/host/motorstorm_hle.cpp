@@ -1,3 +1,4 @@
+#include "motorstorm_env.hpp"
 #include "motorstorm_hle.hpp"
 #include "motorstorm_bootstrap.hpp"
 #include "motorstorm_audio.hpp"
@@ -6,6 +7,8 @@
 #include "motorstorm_window.hpp"
 #include "motorstorm_media.hpp"
 #include "motorstorm_atrac.hpp"
+#include "motorstorm_frame_rate.hpp"
+#include "motorstorm_pacing.hpp"
 #include "motorstorm_perf.hpp"
 
 #include "psprecomp/common.hpp"
@@ -16,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -240,6 +244,7 @@ std::int32_t g_next_block_uid = 0x400;
 std::uint32_t g_arena_next{};
 std::uint32_t g_stack_next_top{};
 std::uint64_t g_virtual_time_us{};
+FrameRatePlan g_frame_rate;
 std::uint64_t g_music_next_trace{};
 std::uint32_t g_ctrl_requested_cycle{}, g_ctrl_requested_mode{};
 struct ScriptedInput { std::uint64_t time{}; std::uint32_t buttons{}; std::uint8_t x{128}, y{128}; };
@@ -315,7 +320,7 @@ std::vector<GeListRecord> g_ge_list_records;
 // Read-only, profile-gated scene diagnostics. These addresses are observations
 // from the guest scene runner, not state changes or gameplay bypasses.
 void trace_game_state(const Runtime &runtime) {
-    if (std::getenv("PSPRECOMP_MOTORSTORM_TRACE_STATE") == nullptr) return;
+    if (!MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_TRACE_STATE")) return;
     const auto &memory = runtime.memory();
     const auto read = [&](std::uint32_t address) {
         return memory.contains(address, 4u) ? memory.load32(address) : 0u;
@@ -631,10 +636,12 @@ void notify_guest_function(Runtime &runtime, AllegrexContext &ctx, std::uint32_t
     ctx.gpr[31] = kCallbackReturnAddress;
     ctx.pc = entry;
 
-    std::ostringstream out;
-    out << "entering " << name << " entry=" << hex32(entry) << " a0=" << hex32(arg0)
-        << " a1=" << hex32(arg1) << " thread=" << g_current_uid << " source=" << source;
-    log_line(category::kCallback, out.str());
+    if (g_options.trace_imports) {
+        std::ostringstream out;
+        out << "entering " << name << " entry=" << hex32(entry) << " a0=" << hex32(arg0)
+            << " a1=" << hex32(arg1) << " thread=" << g_current_uid << " source=" << source;
+        log_line(category::kCallback, out.str());
+    }
 }
 
 // Delivers one callback invocation on the current PSP thread.  PSP callbacks
@@ -666,17 +673,19 @@ void notify_callback(Runtime &runtime, AllegrexContext &ctx, std::int32_t callba
     ctx.gpr[31] = kCallbackReturnAddress;
     ctx.pc = record.entry;
 
-    std::ostringstream out;
-    out << "entering uid=" << callback_uid << " name=\"" << record.name << "\""
-        << " entry=" << hex32(record.entry) << " notify_arg=" << hex32(notify_arg)
-        << " common_arg=" << hex32(record.arg)
-        << " thread=" << g_current_uid << " source=" << source;
-    log_line(category::kCallback, out.str());
+    if (g_options.trace_imports) {
+        std::ostringstream out;
+        out << "entering uid=" << callback_uid << " name=\"" << record.name << "\""
+            << " entry=" << hex32(record.entry) << " notify_arg=" << hex32(notify_arg)
+            << " common_arg=" << hex32(record.arg)
+            << " thread=" << g_current_uid << " source=" << source;
+        log_line(category::kCallback, out.str());
+    }
 }
 
 bool service_owned_callback(Runtime &runtime, AllegrexContext &ctx, std::uint32_t resume_pc,bool check) {
     const auto active=g_callback_frames.find(g_current_uid);
-    if (check && std::getenv("PSPRECOMP_MOTORSTORM_TRACE_CALLBACK_OWNER")) {
+    if (check && MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_TRACE_CALLBACK_OWNER")) {
         static std::unordered_set<std::int32_t> reported;
         for (const auto &[uid,cb] : g_callbacks) {
             if (cb.owner_uid!=g_current_uid || !cb.notify_count || !reported.insert(uid).second) continue;
@@ -745,13 +754,15 @@ void callback_return(Runtime &runtime, AllegrexContext &ctx) {
     found->second.pop_back();
     const std::uint32_t result = ctx.gpr[2];
 
-    std::ostringstream out;
-    out << "returned uid=" << frame.callback_uid << " name=\""
-        << (g_callbacks.contains(frame.callback_uid) ? g_callbacks.at(frame.callback_uid).name
-                                                     : std::string(frame.name))
-        << "\" result=" << hex32(result) << " notify_arg=" << hex32(frame.notify_arg)
-        << " thread=" << uid;
-    log_line(category::kCallback, out.str());
+    if (g_options.trace_imports) {
+        std::ostringstream out;
+        out << "returned uid=" << frame.callback_uid << " name=\""
+            << (g_callbacks.contains(frame.callback_uid) ? g_callbacks.at(frame.callback_uid).name
+                                                         : std::string(frame.name))
+            << "\" result=" << hex32(result) << " notify_arg=" << hex32(frame.notify_arg)
+            << " thread=" << uid;
+        log_line(category::kCallback, out.str());
+    }
 
     // The kernel deletes a callback whose function returns non-zero.
     if (result != 0u && g_callbacks.erase(frame.callback_uid) == 1u) {
@@ -817,7 +828,7 @@ void starvation_tick(Runtime &runtime, AllegrexContext &ctx) {
     // inside a call.  set_runtime_thread_identity() makes the runtime
     // invalidate every nested native chain and re-dispatch from the new
     // context.
-    if (std::getenv("PSPRECOMP_MOTORSTORM_TRACE_PREEMPT") != nullptr) {
+    if (MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_TRACE_PREEMPT")) {
         std::ostringstream out;
         out << "[PREEMPT] uid=" << thread->uid << " name=" << thread->name
             << " pc=" << hex32(ctx.pc)
@@ -995,6 +1006,211 @@ void register_thread_return_target(Runtime &runtime) {
         "psp_thread_return");
 }
 
+// ---------------------------------------------------------------------------
+// Frame-rate unlock (see motorstorm_frame_rate.hpp)
+// ---------------------------------------------------------------------------
+
+namespace {
+constexpr std::uint32_t kSetFrameRateAddress = 0x0891BF0Cu;
+constexpr std::uint32_t kFlipVcountReturn = 0x089315FCu;
+constexpr std::uint32_t kFrameIntervalAddress = 0x08A78E68u;
+// Globals written by the timestep setters (0x0891BF0C from fps, 0x0891BF8C
+// from a time-scaled step) and the scene's saved copy of the base step.
+constexpr std::uint32_t kTimestepFps = 0x08A9F3C4u, kTimestepFlag = 0x08A78D60u,
+    kTimestepStep = 0x08A9E21Cu, kTimestepBaseStep = 0x08A9E478u, kTimestepSavedStep = 0x08A9E3A0u,
+    kTimestepDamping = 0x08A9E6B8u, kTimestepRate = 0x08AACDA8u;
+
+// Pacing in effect: the INI target, or the retail 30 fps when the governor
+// has fallen back. g_frame_rate keeps the configured target.
+FrameRatePlan g_active_rate;
+bool g_timestep_initialized{};
+// sceDisplayGetVcount stays continuous when the vblank period changes.
+std::uint64_t g_vblank_base_us{}, g_vblank_base_count{};
+
+std::uint64_t vblank_count(std::uint64_t time_us) {
+    return g_vblank_base_count + (time_us - g_vblank_base_us) / g_active_rate.vblank_us;
+}
+std::uint64_t next_vblank_us(std::uint64_t time_us) {
+    const std::uint64_t period = g_active_rate.vblank_us;
+    return g_vblank_base_us + ((time_us - g_vblank_base_us) / period + 1u) * period;
+}
+
+float load_float(GuestMemory &memory, std::uint32_t address) {
+    return std::bit_cast<float>(memory.load32(address));
+}
+void store_float(GuestMemory &memory, std::uint32_t address, float value) {
+    memory.store32(address, std::bit_cast<std::uint32_t>(value));
+}
+
+// 0x0891BF0C body: every per-frame constant from frames per second. Operation
+// order and constants match the original exactly. Returns its final f12.
+float write_timestep(GuestMemory &memory, float fps) {
+    const float step = std::bit_cast<float>(0x3F800000u) / fps;          // 1.0 / fps
+    const float scale = std::bit_cast<float>(0x42480000u) / fps;         // 50.0 / fps
+    const float ratio = fps / std::bit_cast<float>(0x42480000u);         // fps / 50.0
+    const float damping = scale * std::bit_cast<float>(0x3F19999Au);     // * 0.6
+    const float rate = ratio * std::bit_cast<float>(0x3FD5566Du);        // * 1.6667
+    store_float(memory, kTimestepFps, fps);
+    store_float(memory, kTimestepStep, step);
+    store_float(memory, kTimestepBaseStep, step);
+    store_float(memory, kTimestepDamping, damping);
+    store_float(memory, kTimestepRate, rate);
+    return rate;
+}
+// 0x0891BF8C body: a time-scaled step (slow motion); the base step is kept.
+void write_scaled_step(GuestMemory &memory, float step) {
+    const float damping = step * std::bit_cast<float>(0x41F00001u);      // * 30.000002
+    store_float(memory, kTimestepStep, step);
+    store_float(memory, kTimestepDamping, damping);
+    store_float(memory, kTimestepRate, std::bit_cast<float>(0x3F800000u) / damping);
+    store_float(memory, kTimestepFps, std::bit_cast<float>(0x3F800000u) / step);
+}
+
+// Replaces the guest timestep setter (f12 = frames per second) so scenes use
+// the active rate instead of their own 29.97/19.98.
+void set_frame_rate(Runtime &runtime, AllegrexContext &ctx) {
+    auto &memory = runtime.memory();
+    const float rate = write_timestep(memory, g_active_rate.game_fps);
+    memory.store8(kTimestepFlag, 1u);
+    g_timestep_initialized = true;
+    ctx.fpr[12] = rate;
+    ctx.pc = ctx.gpr[31];
+}
+
+void switch_frame_rate(GuestMemory &memory, const FrameRatePlan &next, const std::string &reason) {
+    const auto count = vblank_count(g_virtual_time_us);
+    g_vblank_base_us += (count - g_vblank_base_count) * g_active_rate.vblank_us;
+    g_vblank_base_count = count;
+    const float previous_fps = g_active_rate.game_fps;
+    g_active_rate = next;
+    if (g_timestep_initialized) {
+        const float base = load_float(memory, kTimestepBaseStep), step = load_float(memory, kTimestepStep);
+        const float saved = load_float(memory, kTimestepSavedStep);
+        write_timestep(memory, next.game_fps);
+        const float new_base = load_float(memory, kTimestepBaseStep);
+        // Keep an active time scale (slow motion) as the same share of the base.
+        if (base > 0.0f && step != base)
+            write_scaled_step(memory, new_base * (step / base));
+        if (saved == base)
+            store_float(memory, kTimestepSavedStep, new_base);
+        else if (saved > 0.0f)
+            store_float(memory, kTimestepSavedStep, saved * (previous_fps / next.game_fps));
+    }
+    hle_line("frame rate: now " + std::to_string(next.game_fps) + " fps (" + reason + ")");
+}
+
+struct Pacer {
+    bool limit{}, govern{};
+    std::uint64_t anchor_wall{}, anchor_guest{};
+    std::uint64_t sample_wall{}, sample_guest{}, sample_idle{}, sample_frames{}, slept_us{}, frames{};
+    std::uint64_t fallbacks{}, restores{};
+    FrameRateGovernor governor;
+};
+Pacer g_pacer;
+
+// Called once per displayed frame.
+void pace_frame(GuestMemory &memory) {
+    ++g_pacer.frames;
+    // Audio backpressure normally ties guest time to real time. Without it
+    // (audio disabled or unavailable) hold the visible game to the wall clock
+    // instead of letting it run fast. Falling far behind re-anchors rather
+    // than fast-forwarding to catch up.
+    if (g_pacer.limit && window_enabled() && !audio_enabled()) {
+        const auto wall = host_time_us();
+        if (g_pacer.anchor_wall == 0u) {
+            g_pacer.anchor_wall = wall;
+            g_pacer.anchor_guest = g_virtual_time_us;
+        }
+        const auto guest_elapsed = g_virtual_time_us - g_pacer.anchor_guest;
+        const auto wall_elapsed = wall - g_pacer.anchor_wall;
+        if (guest_elapsed > wall_elapsed + 1000u) {
+            const auto ahead = guest_elapsed - wall_elapsed;
+            host_sleep_us(ahead);
+            g_pacer.slept_us += ahead;
+        } else if (wall_elapsed > guest_elapsed + 100'000u) {
+            g_pacer.anchor_wall = wall;
+            g_pacer.anchor_guest = g_virtual_time_us;
+        }
+    } else {
+        g_pacer.anchor_wall = 0u;
+    }
+    // Governing needs a real-time pacing source (audio or the limiter); an
+    // unthrottled diagnostic run has no notion of "below real time".
+    if (!g_pacer.govern || !window_enabled() || (!audio_enabled() && !g_pacer.limit)) return;
+    const auto wall = host_time_us();
+    const auto idle = audio_blocked_us() + g_pacer.slept_us;
+    if (g_pacer.sample_wall == 0u) {
+        g_pacer.sample_wall = wall;
+        g_pacer.sample_guest = g_virtual_time_us;
+        g_pacer.sample_idle = idle;
+        g_pacer.sample_frames = g_pacer.frames;
+        return;
+    }
+    if (wall - g_pacer.sample_wall < 1'000'000u) return;
+    // Loading screens present few frames and stall guest time for reasons
+    // unrelated to rendering speed; only judge seconds of actual play.
+    const double sample_seconds = static_cast<double>(wall - g_pacer.sample_wall) / 1e6;
+    const bool playing = static_cast<double>(g_pacer.frames - g_pacer.sample_frames) >=
+                         0.5 * static_cast<double>(g_active_rate.game_fps) * sample_seconds;
+    const bool at_target = g_active_rate.game_fps == g_frame_rate.game_fps;
+    const auto fallback = plan_frame_rate(30u);
+    if (!playing) {
+        g_pacer.sample_wall = wall;
+        g_pacer.sample_guest = g_virtual_time_us;
+        g_pacer.sample_idle = idle;
+        g_pacer.sample_frames = g_pacer.frames;
+        return;
+    }
+    const auto decision = g_pacer.governor.update(
+        static_cast<double>(wall - g_pacer.sample_wall) / 1e6,
+        static_cast<double>(g_virtual_time_us - g_pacer.sample_guest) / 1e6,
+        static_cast<double>(idle - g_pacer.sample_idle) / 1e6, at_target,
+        static_cast<double>(g_frame_rate.game_fps) / static_cast<double>(fallback.game_fps));
+    g_pacer.sample_wall = wall;
+    g_pacer.sample_guest = g_virtual_time_us;
+    g_pacer.sample_idle = idle;
+    g_pacer.sample_frames = g_pacer.frames;
+    if (decision == FrameRateGovernor::Decision::Fallback) {
+        ++g_pacer.fallbacks;
+        switch_frame_rate(memory, fallback, "PC below real time; retrying the target in " +
+                          std::to_string(static_cast<int>(g_pacer.governor.backoff_seconds())) + " s");
+    } else if (decision == FrameRateGovernor::Decision::Restore) {
+        ++g_pacer.restores;
+        switch_frame_rate(memory, g_frame_rate, "headroom for the target restored");
+    }
+}
+
+bool option_disabled(const char *name) {
+    const char *value = std::getenv(name);
+    return value != nullptr && (std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 ||
+                                std::strcmp(value, "off") == 0);
+}
+
+void install_frame_rate(Runtime &runtime) {
+    std::uint32_t target = 0u;
+    if (const char *text = std::getenv("PSPRECOMP_MOTORSTORM_FPS");
+        text != nullptr && *text != char{} && std::strcmp(text, "original") != 0)
+        target = static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10));
+    g_frame_rate = plan_frame_rate(target);
+    g_active_rate = g_frame_rate;
+    g_timestep_initialized = false;
+    g_vblank_base_us = g_vblank_base_count = 0u;
+    g_pacer = {};
+    g_pacer.limit = std::getenv("PSPRECOMP_MOTORSTORM_UNTHROTTLED") == nullptr;
+    g_pacer.govern = g_frame_rate.unlocked && g_frame_rate.game_fps > 30.5f &&
+                     !option_disabled("PSPRECOMP_MOTORSTORM_DYNAMIC_FPS");
+    if (!g_frame_rate.unlocked) {
+        hle_line("frame rate: original game pacing");
+        return;
+    }
+    runtime.register_function(kSetFrameRateAddress, &set_frame_rate, "motorstorm_set_frame_rate");
+    hle_line("frame rate: target=" + std::to_string(target) + " game_fps=" +
+             std::to_string(g_frame_rate.game_fps) + " interval=" + std::to_string(g_frame_rate.interval) +
+             " vblank_us=" + std::to_string(g_frame_rate.vblank_us) +
+             " dynamic=" + std::to_string(g_pacer.govern));
+}
+} // namespace
+
 void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOptions &options) {
     g_options = options;
     g_installed = true;
@@ -1124,6 +1340,8 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
         hle_line("execution clock: interval=" + std::to_string(tick_interval) +
                  " dispatches tick_us=" + std::to_string(g_tick_microseconds));
     }
+
+    install_frame_rate(runtime);
 
     // -----------------------------------------------------------------------
     // Kernel_Library
@@ -1719,7 +1937,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
             // Watch self-test (PSPRECOMP_MOTORSTORM_PROBE=1): write a canary to
             // the scene-object pointer so a write watch on it can be shown to
             // work before trusting a "no writes" result.
-            if (std::getenv("PSPRECOMP_MOTORSTORM_PROBE") != nullptr) {
+            if (MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_PROBE")) {
                 static bool probed = false;
                 if (!probed) {
                     probed = true;
@@ -3041,7 +3259,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
                                             " sync=" + hex32(ctx.gpr[7]));
             }
             trace_game_state(rt);
-            if (std::getenv("PSPRECOMP_MOTORSTORM_TRACE_DISPLAY") != nullptr) {
+            if (MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_TRACE_DISPLAY")) {
                 if (g_display.set_frame_buf_count <= 4u || g_display.set_frame_buf_count % 60u == 0u) {
                     std::ostringstream out;
                     out << "guest_us=" << g_virtual_time_us << " frame=" << g_display.set_frame_buf_count
@@ -3059,7 +3277,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
                 const char *value = std::getenv("PSPRECOMP_MOTORSTORM_FRAME_DUMP_FLIP_AFTER_GE");
                 return value != nullptr ? std::strtoull(value, nullptr, 0) : 0u;
             }();
-            if (std::getenv("PSPRECOMP_MOTORSTORM_FRAME_DUMP_FLIP") != nullptr &&
+            if (MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_FRAME_DUMP_FLIP") &&
                 g_ge_submissions >= flip_dump_after) {
                 static int flip_dumps = 0;
                 if (flip_dumps < 8) {
@@ -3101,9 +3319,15 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
             ctx.set_gpr(2, 0u);
         });
     register_import(runtime, "sceDisplay", 0xDBA6C4C4u, "sceDisplayGetFramePerSec",
-        [](Runtime &, AllegrexContext &ctx) { ctx.fpr[0] = 59.9400599f; });
+        [](Runtime &, AllegrexContext &ctx) { ctx.fpr[0] = g_active_rate.refresh_hz; });
     register_import(runtime, "sceDisplay", 0x9C6EAAD7u, "sceDisplayGetVcount",
-        [](Runtime &, AllegrexContext &ctx) { ctx.set_gpr(2, static_cast<std::uint32_t>(g_virtual_time_us / 16667u)); });
+        [](Runtime &rt, AllegrexContext &ctx) {
+            // The flip routine reads its minimum vblank interval right after
+            // this call; an unlocked rate replaces whatever the scene chose.
+            if (g_frame_rate.unlocked && ctx.gpr[31] == kFlipVcountReturn)
+                rt.memory().store32(kFrameIntervalAddress, g_active_rate.interval);
+            ctx.set_gpr(2, static_cast<std::uint32_t>(vblank_count(g_virtual_time_us)));
+        });
     const auto wait_vblank = [](Runtime &rt, AllegrexContext &ctx, bool callbacks) {
         if (window_close_requested()) {
             ctx.set_gpr(2, 0u);
@@ -3115,7 +3339,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
         // Notifications reenter this import. Retain the original target so a
         // callback that crosses it does not introduce another frame's wait.
         if (!callbacks || thread->callback_wait_kind != CallbackWaitKind::Vblank)
-            thread->vblank_deadline_us = (g_virtual_time_us / 16667u + 1u) * 16667u;
+            thread->vblank_deadline_us = next_vblank_us(g_virtual_time_us);
         thread->callback_wait_kind = callbacks ? CallbackWaitKind::Vblank : CallbackWaitKind::None;
         thread->callback_wait_pc = ctx.pc;
         if (callbacks && service_owned_callback(rt, ctx, ctx.pc)) return;
@@ -3254,7 +3478,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
             if (g_ge_sync_calls++ < 8u)
                 log_line(category::kGe, "sceGeDrawSync mode=" + hex32(ctx.gpr[4]) +
                                             " -> 0 (immediate)");
-            if (std::getenv("PSPRECOMP_MOTORSTORM_DUMP_GE") != nullptr && !g_ge_list_records.empty()) {
+            if (MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_DUMP_GE") && !g_ge_list_records.empty()) {
                 std::ofstream out("out/motorstorm/ge_lists.txt", std::ios::app);
                 for (const auto &record : g_ge_list_records) {
                     const std::uint32_t begin = record.list;
@@ -3275,7 +3499,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
                 const char *value = std::getenv("PSPRECOMP_MOTORSTORM_SOFTGE_START_AFTER");
                 return value != nullptr ? std::strtoull(value, nullptr, 0) : 0u;
             }();
-            const bool rasterize = (std::getenv("PSPRECOMP_MOTORSTORM_SOFTGE") != nullptr || gpu_requested()) &&
+            const bool rasterize = (MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_SOFTGE") || gpu_requested()) &&
                 g_ge_submissions >= start_after;
             for (const auto &record : g_ge_list_records) {
                 const auto interrupts = motorstorm::software_ge_execute_list(rt.memory(), record.list, record.stall, rasterize, record.submission);
@@ -3310,8 +3534,8 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
             // frames by reusing the same numbered slots, so an intermittent
             // visual fault can be captured without unbounded disk use.
             static const bool dump_rolling =
-                std::getenv("PSPRECOMP_MOTORSTORM_FRAME_DUMP_ROLLING") != nullptr;
-            if (std::getenv("PSPRECOMP_MOTORSTORM_FRAME_DUMP") != nullptr &&
+                MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_FRAME_DUMP_ROLLING");
+            if (MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_FRAME_DUMP") &&
                 (dump_rolling || g_ge_frame_dumps < dump_count_limit) &&
                 g_ge_submissions >= next_frame_dump_submission) {
                 // The window advances only after a successful dump (the first
@@ -3332,6 +3556,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
                     return;
                 }
                 ++g_ge_frame_dumps;
+                gpu_settle(rt.memory());  // dumps read guest VRAM
                 const std::uint64_t dump_slot = dump_rolling && dump_count_limit != 0u
                     ? ((g_ge_frame_dumps - 1u) % dump_count_limit) + 1u
                     : g_ge_frame_dumps;
@@ -3419,6 +3644,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
                            g_display.stride != 0u ? g_display.stride : 512u, g_display.format,
                            g_display.width != 0u ? g_display.width : 480u,
                            g_display.height != 0u ? g_display.height : 272u);
+            pace_frame(rt.memory());
             // Optional race benchmark: close the guest-time window and stop.
             if (perf::bench_frame(g_virtual_time_us, g_display.set_frame_buf_count,
                                   g_ge_submissions))
@@ -3542,7 +3768,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
                 ctx.set_gpr(2, 0x800001FEu); return;
             }
             g_ctrl_requested_cycle = ctx.gpr[4];
-            if (std::getenv("PSPRECOMP_MOTORSTORM_TRACE_CTRL") != nullptr)
+            if (MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_TRACE_CTRL"))
                 log_line("CTRL", "SetSamplingCycle requested=" + std::to_string(ctx.gpr[4]));
             ctx.set_gpr(2, previous);
         });
@@ -3551,7 +3777,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
             const auto previous = g_ctrl_requested_mode;
             if (ctx.gpr[4] > 1u) { ctx.set_gpr(2, 0x80000107u); return; }
             g_ctrl_requested_mode = ctx.gpr[4];
-            if (std::getenv("PSPRECOMP_MOTORSTORM_TRACE_CTRL") != nullptr)
+            if (MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_TRACE_CTRL"))
                 log_line("CTRL", "SetSamplingMode requested=" + std::to_string(ctx.gpr[4]));
             ctx.set_gpr(2, previous);
         });
@@ -3593,7 +3819,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
                 rt.memory().store8(address + 8u, analog_x);
                 rt.memory().store8(address + 9u, analog_y);
             }
-            if (std::getenv("PSPRECOMP_MOTORSTORM_TRACE_CTRL") != nullptr) {
+            if (MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_TRACE_CTRL")) {
                 static std::uint64_t samples = 0u;
                 static std::uint32_t previous_buttons = 0xFFFFFFFFu;
                 static std::uint32_t previous_axes = 0xFFFFFFFFu;
@@ -4154,7 +4380,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
     };
     audio_config.sink = [](void *, const psprecomp::Runtime &rt, std::uint32_t buffer,
                            std::uint32_t sample_count) {
-        if (std::getenv("PSPRECOMP_MOTORSTORM_TRACE_MUSIC")) {
+        if (MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_TRACE_MUSIC")) {
             if (g_virtual_time_us >= g_music_next_trace) {
                 g_music_next_trace = g_virtual_time_us + 1'000'000;
                 const auto &m = rt.memory();
@@ -4221,6 +4447,9 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
     hle_line("HLE installation complete: scheduler, filesystem, display/GE/ctrl, savedata, SAS, AudioOutput2");
 }
 
+std::uint64_t guest_time_us() { return g_virtual_time_us; }
+bool frame_rate_unlocked() { return g_frame_rate.unlocked; }
+
 void report_summary() {
     window_shutdown();
     audio_shutdown();
@@ -4286,7 +4515,7 @@ void report_summary() {
                 << " hardware_transform_draws=" << gpu.hardware_transform_draws << " vertices=" << gpu.vertices
                 << " submissions=" << gpu.submissions << " texture_uploads=" << gpu.texture_uploads
                 << " feedback_syncs=" << gpu.feedback_syncs << " feedback_draws=" << gpu.feedback_draws << " software_draws=" << gpu.software_draws
-                << " presents=" << gpu.presents;
+                << " presents=" << gpu.presents << " skipped_presents=" << gpu.skipped_presents;
             out << " output=" << gpu.resolution_scale*480 << 'x' << gpu.resolution_scale*272
                 << " raster=" << gpu.raster_scale*480 << 'x' << gpu.raster_scale*272 << " AA=" << gpu.antialiasing;
             log_line(category::kGe, out.str());
