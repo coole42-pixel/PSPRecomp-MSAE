@@ -9,6 +9,7 @@ profiles/<id>/
   CMakeLists.txt
   README.md
   config/          Profile configuration and analysis inputs
+  docs/            Maintained public setup, implementation and validation notes
   data/            Redistributable profile data generated from compatible sources
   generated/       Checked-in AOT C++ corpus for the supported executable
   host/            HLE, bootstrap, renderer/audio/input integration and patches

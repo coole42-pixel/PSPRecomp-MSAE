@@ -2,7 +2,7 @@
 
 PSPRecomp is a static recompilation framework for PSP software. It reads an Allegrex/MIPS executable, analyzes guest code, emits C++ translation units, and runs them through a native host runtime instead of shipping a PSP interpreter or JIT.
 
-The repository is split between a reusable framework and game-specific profiles. The first working profile is GTA: Vice City Stories (`profiles/vcs`).
+The repository is split between a reusable framework and game-specific profiles: GTA: Vice City Stories (`profiles/vcs`) and MotorStorm: Arctic Edge (`profiles/motorstorm`).
 
 ## Repository layout
 
@@ -14,6 +14,7 @@ tests/               Framework regression tests
 configs/             Generic examples and PSP NID data
 profiles/            Game-specific hosts, generated code, configuration and tests
   vcs/               GTA: Vice City Stories profile
+  motorstorm/        MotorStorm: Arctic Edge profile
 ```
 
 Game-specific addresses, HLE behavior, native fast paths, renderer integration and generated AOT code belong under a profile. The framework should remain usable without any profile selected.
@@ -34,6 +35,17 @@ ctest --test-dir out/framework -C Release --output-on-failure
 
 This builds `psprecomp_core`, `psp_analyze`, `psp_recomp`, `dump_function` and the framework tests.
 
+## Automatic generation
+
+```text
+psp_recomp game.bin --auto generated --jobs 0
+```
+
+Automatic generation prints stage timings, block progress and completed unit files.
+`--jobs 0` (the default) uses hardware concurrency; `--jobs 1` uses the serial path.
+See [`docs/AOT_PERFORMANCE.md`](docs/AOT_PERFORMANCE.md) for the pipeline, output
+guarantees, regression validation and measured benchmarks.
+
 ## Build a profile
 
 Profiles are selected with `PSPRECOMP_PROFILE`:
@@ -44,6 +56,9 @@ cmake --build out/vcs --config Release
 ```
 
 Windows users working on the VCS profile can use the maintained scripts in `profiles/vcs/scripts`.
+
+For MotorStorm, select `-DPSPRECOMP_PROFILE=motorstorm` and follow the build,
+game-file setup and launch instructions in [`profiles/motorstorm/README.md`](profiles/motorstorm/README.md).
 
 ## Create another profile
 

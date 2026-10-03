@@ -1,0 +1,13 @@
+{
+  "mode": "automatic_global_cfg",
+  "emission": "single_copy_basic_blocks",
+  "partitioning": "fixed_executable_address_span",
+  "discovered_function_seeds": 18166,
+  "unique_emitted_instructions": 533203,
+  "unique_registered_block_entries": 127354,
+  "translation_units": 641,
+  "rewritten_translation_units": 641,
+  "registry_rewritten": true,
+  "import_wrappers": 343,
+  "unit_span_bytes": 4096
+}
