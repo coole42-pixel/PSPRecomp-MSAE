@@ -5,7 +5,9 @@
 // renderer embeds the bytecode, so no shader compiler runs at startup.
 // X4000: fxc's false "uninitialized variable" for functions with early
 // returns. X3556: signed modulus is needed for negative wrap coordinates.
-#pragma warning(disable : 3556 4000)
+// X3579: groupshared declared for the compute entry points is ignored (with a
+// warning) when the same file is compiled for the graphics stages.
+#pragma warning(disable : 3556 3579 4000)
 cbuffer DrawState : register(b0) {
     uint4 commands[64];
     float4 clipRows[4];
@@ -13,10 +15,10 @@ cbuffer DrawState : register(b0) {
     uint4 surface; // width, height, color stride, depth stride
     uint4 mode; // format, hardware transform, clip/isPoint flags, valid depth
     uint4 feedback; // use, base index, texture stride, packed format
-    uint4 render; // raster scale in half units (2 = 1x, 3 = 1.5x), output scale, AA mode, flags (bit0 enhanced filtering, bit1 32-bit colour, bit2 tag HUD pixels in the depth word)
+    uint4 render; // raster scale in half units (2 = 1x, 3 = 1.5x), output scale, AA mode, flags (bit0 enhanced filtering, bit1 32-bit colour, bit2 tag HUD pixels in the depth word, bit3 soft particle with its fade range in bits 8-23, bits 24-27 the camera id written into the depth word)
     uint4 replace; // texture pack: active, covered PSP width, covered rows
     float4 uvRange; // enhanced filtering: texel range of the draw (min uv, max uv); 0 = unknown
-    float4 wide; // inverse horizontal aspect scale, HUD centre, active, unused
+    float4 wide; // inverse horizontal aspect scale, HUD centre, active, 1 = the game already renders the wider 3D view
 };
 uint C(uint i) { return commands[i >> 2][i & 3]; }
 // Native <-> raster mapping (see raster_extent in motorstorm_gpu.cpp).
@@ -109,11 +111,11 @@ Varying VS(Input i) {
     float4 clip = mode.y ? float4(dot(clipRows[0],p),dot(clipRows[1],p),dot(clipRows[2],p),dot(clipRows[3],p)) : p;
     float w = mode.y ? clip.w : 1;
     // Widen the horizontal frustum before clipping; vertical FOV stays put.
-    if(wide.z!=0 && mode.y) clip.x*=wide.x;
+    if(wide.z!=0 && mode.y && wide.w==0) clip.x*=wide.x;
     float2 xy = mode.y ? clip.xy * viewportScale.xy + viewportCenter.xy * w : i.position.xy;
     if(wide.z!=0) {
         if(!mode.y) xy.x=wide.y+(xy.x-wide.y)*wide.x;
-        else xy.x+=(wide.y-viewportCenter.x)*(1-wide.x)*w;
+        else if(wide.w==0) xy.x+=(wide.y-viewportCenter.x)*(1-wide.x)*w;
     }
     bool isPoint = (mode.z&2)!=0;
     if(isPoint) xy=(floor(xy/w)+0.5)*w;
@@ -327,6 +329,21 @@ void PS(Varying i, bool front : SV_IsFrontFace) {
         if(stencil) colorTarget[index] = packFrame((oldColor&0xffffff) | ((stencilOp(C(0xdd)>>8,oldStencil)<<24)&~alphaMask) | (oldColor&alphaMask));
         return;
     }
+    // Soft particles: a billboard that cuts into the scene fades out over the
+    // depth-buffer distance in render.w bits 8-23 (0 depth is far when the game
+    // draws with its reversed depth, 65535 when it draws forward).
+    if(!clearing && mode.w && (render.w&8)!=0 && (C(0x21)&1) && (C(0x23)&1) && C(0xe7)!=0) {
+        uint depthFunction=C(0xde)&7;
+        if(depthFunction>=4) {
+            int scene=int(depthTarget[depthIndex]&0xFFFF);
+            float behind=depthFunction>=6 ? float(int(z)-scene) : float(scene-int(z));
+            float fade=saturate(behind/float(max((render.w>>8)&0xFFFF,1u)));
+            uint sourceFactor=C(0xdf)&15;
+            s.a=uint(float(s.a)*fade+0.5);
+            if(!(sourceFactor==2 || sourceFactor==3 || sourceFactor==6 || sourceFactor==7))
+                s.rgb=uint3(float3(s.rgb)*fade+0.5);
+        }
+    }
     if(!clearing && (C(0x21)&1)) {
         uint3 a=s.rgb*factor(C(0xdf)&15,true,s,uint4(d.rgb,oldStencil),C(0xe0))/255;
         uint3 b=d.rgb*factor((C(0xdf)>>4)&15,false,s,uint4(d.rgb,oldStencil),C(0xe1))/255;
@@ -335,9 +352,20 @@ void PS(Varying i, bool front : SV_IsFrontFace) {
         else if(f==3) s.rgb=min(s.rgb,d.rgb); else if(f==4) s.rgb=max(s.rgb,d.rgb);
         else if(f==5) s.rgb=max(s.rgb,d.rgb)-min(s.rgb,d.rgb); else s.rgb=min(255,a+b);
     }
-    if(mode.w && (clearing ? (C(0xd3)&1024)!=0 : (C(0x23)&1) && C(0xe7)==0)) depthTarget[depthIndex]=z;
-    // Through-mode draws (no hardware transform) are the HUD in a race.
-    if(!clearing && mode.w && mode.y==0 && (render.w&4)!=0) depthTarget[depthIndex] |= kHudTag;
+    // A HUD tag survives later depth writes within the frame (HUD draws overlap); only the
+    // frame's depth clear removes it.
+    if(mode.w && (clearing ? (C(0xd3)&1024)!=0 : (C(0x23)&1) && C(0xe7)==0)) {
+        uint written=z;
+        if(!clearing && (render.w&4)!=0) written|=depthTarget[depthIndex]&kHudTag;
+        depthTarget[depthIndex]=written;
+    }
+    // Through-mode draws (no hardware transform) are the HUD in a race. Only pixels the
+    // draw visibly changes count (whatever its blend mode): the transparent corners of a
+    // HUD quad stay part of the scene.
+    if(!clearing && mode.w && mode.y==0 && (render.w&4)!=0) {
+        int3 change=abs(int3(s.rgb)-int3(d.rgb));
+        if(max(change.x,max(change.y,change.z))>=8) depthTarget[depthIndex] |= kHudTag;
+    }
     if(clearing) { if(!(C(0xd3)&256)) s.rgb=d.rgb; if(!(C(0xd3)&512)) s.a=d.a; }
     else if(stencil) s.a=stencilOp(C(0xdd)>>16,oldStencil);
     uint mask=(C(0xe8)&0xffffff)|alphaMask;
@@ -517,7 +545,7 @@ void MipCS(uint3 id : SV_DispatchThreadID) {
 // kept as half-float RGB (two words per pixel):
 //   PostResolveCS  the presented image (AA resolve, FXAA) -> buffer A
 //   DebandCS       removes the steps of 16-bit gradients, A -> B (32-bit colour)
-//   PostPS         CAS sharpening, colour correction, AgX, LUT, dither -> display
+//   PostPS         CAS sharpening, colour correction, dither -> display
 // Settings arrive in commands[] (unused by presentation); see PostSlot in C++.
 float postF(uint i) { return asfloat(C(i)); }
 uint2 postExtent() { return surface.xy*render.y; }
@@ -552,16 +580,18 @@ void DepthResolveCS(uint3 id : SV_DispatchThreadID) {
     uint2 p=min(uint2((float2(id.xy)+0.5)*r),limit);
     computeOutput[id.y*extent.x+id.x]=presentColor[p.y*surface.w+p.x];
 }
-// HUD coverage of an output pixel from the depth snapshot (in feedbackImage,
-// t2): the tag of this pixel or any of its 8 neighbours, so the one-pixel
-// fringe that edge filtering blends around HUD shapes stays ungraded too.
+// HUD coverage of an output pixel from the depth snapshot: the tag of this
+// pixel or any of its 8 neighbours, so the one-pixel fringe that edge
+// filtering blends around HUD shapes stays ungraded too.
+// The depth snapshot (t5) and the other per-frame post inputs.
+StructuredBuffer<uint> depthSnapshot : register(t5);
 float hudMask(int2 p) {
     if((C(0)&64)==0) return 0;
     uint2 e=postExtent();
     float m=0;
     [unroll] for(int dy=-1; dy<=1; ++dy) [unroll] for(int dx=-1; dx<=1; ++dx) {
         int2 q=clamp(p+int2(dx,dy),0,int2(e)-1);
-        m=max(m,float((feedbackImage[q.y*e.x+q.x]>>16)&1));
+        m=max(m,float((depthSnapshot[q.y*e.x+q.x]>>16)&1));
     }
     return m;
 }
@@ -571,7 +601,10 @@ float random(uint2 p, uint salt) { return pcg(p.x^pcg(p.y^pcg(salt)))*(1.0/42949
 void PostResolveCS(uint3 id : SV_DispatchThreadID) {
     uint2 e=postExtent();
     if(any(id.xy>=e)) return;
-    storeHalf(id.y*e.x+id.x,displayShade((float2(id.xy)+0.5)/e),hudMask(int2(id.xy)));
+    float hud=hudMask(int2(id.xy));
+    float2 uv=(float2(id.xy)+0.5)/e;
+    float3 c=displayShade(uv);
+    storeHalf(id.y*e.x+id.x,c,hud);
 }
 // Debanding (after the mpv deband filter): average four points at a random
 // distance and angle. Where every sample is within the threshold of this
@@ -585,10 +618,10 @@ void DebandCS(uint3 id : SV_DispatchThreadID) {
     int2 p=int2(id.xy);
     float3 c=loadHalf(p);
     float3 original=c;
-    float threshold=postF(13), range=postF(14);
+    float threshold=postF(9), range=postF(10);
     [unroll] for(uint it=1; it<=2; ++it) {
-        float reach=random(id.xy,C(15)*4+it*2)*range*it*0.5;
-        float angle=random(id.xy,C(15)*4+it*2+1)*6.2831853;
+        float reach=random(id.xy,C(11)*4+it*2)*range*it*0.5;
+        float angle=random(id.xy,C(11)*4+it*2+1)*6.2831853;
         int2 o=int2(round(float2(cos(angle),sin(angle))*reach));
         float3 s0=loadHalf(p+o), s1=loadHalf(p-o), s2=loadHalf(p+int2(-o.y,o.x)), s3=loadHalf(p+int2(o.y,-o.x));
         float3 average=(s0+s1+s2+s3)*0.25;
@@ -612,17 +645,10 @@ float3 casSharpen(int2 p, float sharpness) {
     float3 w=amplitude*(-1/lerp(8.0,5.0,saturate(sharpness)));
     return saturate((b*w+d*w+f*w+h*w+e)/(1+4*w));
 }
-// sRGB transfer functions (the BT.709 OETF variant of the AgX reference).
+// sRGB transfer functions.
 float3 toLinear(float3 c) { return c<0.04045 ? c/12.92 : pow(max((c+0.055)/1.055,0),2.4); }
 float3 fromLinear(float3 c) { return c<0.0031308 ? c*12.92 : 1.055*pow(max(c,0),1/2.4)-0.055; }
 float lumaLinear(float3 c) { return dot(c,float3(0.2126,0.7152,0.0722)); }
-// The PSP image is display-referred: expand it to scene-referred light so
-// AgX has highlights to roll off. Inverse Reinhard on the largest channel
-// (keeps hue): white becomes `peak`, mid grey barely moves.
-float3 expandSdr(float3 c, float peak) {
-    float m=saturate(max(max(c.r,c.g),c.b));
-    return c*(1/(1-m*(1-1/peak)));
-}
 // Colour correction in linear light: exposure and white balance (multipliers
 // prepared on the CPU), contrast around 18% grey, saturation.
 float3 colorCorrect(float3 c) {
@@ -631,157 +657,11 @@ float3 colorCorrect(float3 c) {
     float y=lumaLinear(c);
     return max(y+(c-y)*postF(5),0);
 }
-// AgX tone mapping, from https://github.com/bWFuanVzYWth/AgX (MIT, linlin):
-// the analytical form of the AgX sigmoid, no LUT. HLSL float3x3 rows are the
-// GLSL mat3 columns, so mul(v,M) here is M*v there.
-float3 agxCurve(float3 v) {
-    const float threshold=0.6060606060606061;
-    const float aUp=69.86278913545539, aDown=59.507875;
-    const float bUp=13.0/4.0, bDown=3.0/1.0;
-    const float cUp=-4.0/13.0, cDown=-1.0/3.0;
-    float3 mask=step(v,threshold);
-    float3 a=aUp+(aDown-aUp)*mask, b=bUp+(bDown-bUp)*mask, c=cUp+(cDown-cUp)*mask;
-    return 0.5+(-2.0*threshold+2.0*v)*pow(1.0+a*pow(abs(v-threshold),b),c);
-}
-float3 agx(float3 linearColor, uint look) {
-    const float minEv=-12.473931188332413, maxEv=4.026068811667588, range=maxEv-minEv;
-    // Keep synthetic SDR expansion/exposure below the hard log-domain clamp.
-    // Preserve hue while smoothly rolling the brightest input channel off.
-    float ceiling=exp2(maxEv), knee=ceiling*0.5;
-    float maximum=max(max(linearColor.r,linearColor.g),linearColor.b);
-    if(maximum>knee) {
-        float bounded=knee+(maximum-knee)/(1+(maximum-knee)/knee);
-        linearColor*=bounded/maximum;
-    }
-    const float3x3 inset=float3x3(0.8424010709504686,0.04240107095046854,0.04240107095046854,
-                                  0.07843650156180276,0.8784365015618028,0.07843650156180276,
-                                  0.0791624274877287,0.0791624274877287,0.8791624274877287);
-    const float3x3 outset=float3x3(1.1969986613119143,-0.053001338688085674,-0.053001338688085674,
-                                   -0.09804562695225345,1.1519543730477466,-0.09804562695225345,
-                                   -0.09895303435966087,-0.09895303435966087,1.151046965640339);
-    float3 c=mul(max(linearColor,1e-10),inset);
-    c=agxCurve(saturate(log2(c)*(1.0/range)-minEv/range));
-    // Looks (Blender's ASC CDL values), applied to the sigmoid output.
-    if(look!=0) {
-        float3 slope=look==2 ? float3(1.0,0.9,0.5) : 1.0;
-        float power=look==2 ? 0.8 : 1.35, saturation=look==2 ? 0.8 : 1.4;
-        c=pow(max(c*slope,0),power);
-        float y=lumaLinear(c);
-        c=y+saturation*(c-y);
-    }
-    return saturate(mul(c,outset));  // display encoded
-}
-// 3D LUT: lutSize^3 entries of 10:10:10 RGB, red fastest (the .cube order).
-uint lutSize() { return C(11); }
-float3 lutEntry(uint3 i) {
-    uint n=lutSize(), v=feedbackImage[(i.z*n+i.y)*n+i.x];
-    return float3(v&1023,(v>>10)&1023,(v>>20)&1023)/1023.0;
-}
-float3 applyLut(float3 c) {
-    uint n=lutSize();
-    float3 x=saturate(c)*(n-1);
-    uint3 i=min(uint3(x),n-2);
-    float3 f=x-i;
-    float3 c00=lerp(lutEntry(i),lutEntry(i+uint3(1,0,0)),f.x);
-    float3 c10=lerp(lutEntry(i+uint3(0,1,0)),lutEntry(i+uint3(1,1,0)),f.x);
-    float3 c01=lerp(lutEntry(i+uint3(0,0,1)),lutEntry(i+uint3(1,0,1)),f.x);
-    float3 c11=lerp(lutEntry(i+uint3(0,1,1)),lutEntry(i+1),f.x);
-    return lerp(lerp(c00,c10,f.y),lerp(c01,c11,f.y),f.z);
-}
-// Bloom (after the dual-filter method of Marius Bjorge, ARM, SIGGRAPH 2015, and
-// the soft-knee threshold used by common engines): the bright part of the scene
-// light is pulled into a half-float pyramid (level 0 at half the output size,
-// five levels), blurred while going down and back up, and added to the scene
-// light before tone mapping. Pyramid pixels are two words like the post
-// buffers: R|G halves, then B. Slots: C(0) bit 128 on, postF(17) strength,
-// postF(18) threshold in scene light units (after the SDR expansion).
-StructuredBuffer<uint> bloomImage : register(t4);
-uint2 bloomDims(uint2 extent, uint level) { uint s=2u<<level; return max((extent+(s-1))/s,1u); }
-float3 loadLevel(StructuredBuffer<uint> data, int2 p, uint2 dims) {
-    p=clamp(p,0,int2(dims)-1);
-    uint i=p.y*dims.x+p.x, a=data[2*i], b=data[2*i+1];
-    return float3(f16tof32(a),f16tof32(a>>16),f16tof32(b));
-}
-void storeLevel(uint i, float3 c) {
-    computeOutput[2*i]=f32tof16(c.r)|(f32tof16(c.g)<<16);
-    computeOutput[2*i+1]=f32tof16(c.b);
-}
-float3 bilinearLevel(StructuredBuffer<uint> data, float2 u, uint2 dims) {
-    float2 x=u-0.5; int2 i=int2(floor(x)); float2 f=x-i;
-    return lerp(lerp(loadLevel(data,i,dims),loadLevel(data,i+int2(1,0),dims),f.x),
-                lerp(loadLevel(data,i+int2(0,1),dims),loadLevel(data,i+int2(1,1),dims),f.x),f.y);
-}
-// Scene light of one post pixel above the knee, colour kept; the HUD is excluded.
-float3 bloomSource(int2 p) {
-    if(loadHud(p)>0.5) return 0;
-    float3 light=expandSdr(toLinear(saturate(loadHalf(p))),postF(9))*postF(16);
-    float l=lumaLinear(light), knee=postF(18), soft=0.5*knee;
-    float q=clamp(l-knee+soft,0,2*soft); q=q*q/(4*soft+1e-5);
-    return light*(max(q,l-knee)/max(l,1e-5));
-}
-// Level 0: threshold plus a 2x2 box; each sample is weighted by 1/(1+luma) so a
-// lone very bright pixel cannot make the glow flicker (the "shimmer" filter).
-[numthreads(8,8,1)]
-void BloomExtractCS(uint3 id : SV_DispatchThreadID) {
-    uint2 extent=postExtent(), d=bloomDims(extent,0);
-    if(any(id.xy>=d)) return;
-    float3 sum=0; float weights=0;
-    [unroll] for(int dy=0; dy<2; ++dy) [unroll] for(int dx=0; dx<2; ++dx) {
-        float3 c=bloomSource(int2(id.xy*2)+int2(dx,dy));
-        float w=1.0/(1.0+lumaLinear(c));
-        sum+=c*w; weights+=w;
-    }
-    storeLevel(id.y*d.x+id.x,sum/weights);
-}
-// The average of the four texels around a texel-edge coordinate (a bilinear tap).
-float3 boxLevel(int2 q, uint2 dims) {
-    return 0.25*(loadLevel(presentColor,q+int2(-1,-1),dims)+loadLevel(presentColor,q+int2(0,-1),dims)+
-                 loadLevel(presentColor,q+int2(-1,0),dims)+loadLevel(presentColor,q,dims));
-}
-// Downsample one level (mode.xy = source size, mode.zw = destination size):
-// the centre box weighted 4, four diagonal boxes weighted 1.
-[numthreads(8,8,1)]
-void BloomDownCS(uint3 id : SV_DispatchThreadID) {
-    uint2 source=mode.xy, d=mode.zw;
-    if(any(id.xy>=d)) return;
-    int2 q=int2(id.xy*2+1);
-    float3 c=4*boxLevel(q,source)+boxLevel(q+int2(-1,-1),source)+boxLevel(q+int2(1,-1),source)+
-             boxLevel(q+int2(-1,1),source)+boxLevel(q+int2(1,1),source);
-    storeLevel(id.y*d.x+id.x,c*0.125);
-}
-// Upsample into the finer level (mode.xy = coarse size, mode.zw = fine size): a
-// 3x3 tent filter over the coarse level, averaged with the level's own content.
-[numthreads(8,8,1)]
-void BloomUpCS(uint3 id : SV_DispatchThreadID) {
-    uint2 coarse=mode.xy, d=mode.zw;
-    if(any(id.xy>=d)) return;
-    float2 u=(float2(id.xy)+0.5)*0.5;
-    float3 tent=bilinearLevel(presentColor,u,coarse)*4+
-        (bilinearLevel(presentColor,u+float2(-1,0),coarse)+bilinearLevel(presentColor,u+float2(1,0),coarse)+
-         bilinearLevel(presentColor,u+float2(0,-1),coarse)+bilinearLevel(presentColor,u+float2(0,1),coarse))*2+
-        bilinearLevel(presentColor,u+float2(-1,-1),coarse)+bilinearLevel(presentColor,u+float2(1,-1),coarse)+
-        bilinearLevel(presentColor,u+float2(-1,1),coarse)+bilinearLevel(presentColor,u+float2(1,1),coarse);
-    uint i=id.y*d.x+id.x, a=computeOutput[2*i], b=computeOutput[2*i+1];
-    float3 own=float3(f16tof32(a),f16tof32(a>>16),f16tof32(b));
-    storeLevel(i,0.5*own+0.5*(tent*(1.0/16)));
-}
-float3 bloomAt(int2 p) {
-    uint2 extent=postExtent();
-    return bilinearLevel(bloomImage,(float2(p)+0.5)*0.5,bloomDims(extent,0));
-}
 float3 postColor(int2 p) {
     uint flags=C(0);
     float3 original=saturate(loadHalf(p));
     float3 c=(flags&2)!=0 ? casSharpen(p,postF(2)) : original;
-    if((flags&(4|8))!=0) {
-        float3 light=toLinear(c);
-        // AgX: expand, then the scene gain that keeps PSP mid grey in place.
-        if((flags&8)!=0) light=expandSdr(light,postF(9))*postF(16);
-        if((flags&128)!=0) light+=postF(17)*bloomAt(p);
-        if((flags&4)!=0) light=colorCorrect(light);
-        c=(flags&8)!=0 ? agx(light,C(10)) : saturate(fromLinear(light));
-    }
-    if((flags&16)!=0) c=lerp(c,applyLut(c),postF(12));
+    if((flags&4)!=0) c=saturate(fromLinear(colorCorrect(toLinear(c))));
     // Fade in/out at race start and end.
     c=lerp(original,c,postF(1));
     // The HUD keeps the game's own colours.
@@ -791,7 +671,7 @@ float3 postDither(float3 c, uint2 q) {
     // Triangular dither to the 8-bit display, so the half-float chain adds
     // no banding of its own.
     if((C(0)&32)!=0) {
-        c+=postF(1)*(random(q,C(15)*2)+random(q,C(15)*2+1)-1)/255.0;
+        c+=postF(1)*(random(q,C(11)*2)+random(q,C(11)*2+1)-1)/255.0;
     }
     return saturate(c);
 }

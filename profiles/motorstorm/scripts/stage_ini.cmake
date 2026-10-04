@@ -5,3 +5,11 @@ configure_file("${SOURCE}" "${DESTINATION}/MotorStormNative.default.ini" COPYONL
 if(NOT EXISTS "${DESTINATION}/MotorStormNative.ini")
     configure_file("${SOURCE}" "${DESTINATION}/MotorStormNative.ini" COPYONLY)
 endif()
+
+# Stage optional presets beside the executable without replacing an edited preset.
+get_filename_component(config_dir "${SOURCE}" DIRECTORY)
+foreach(preset IN ITEMS MotorStormNativeClean.ini MotorStormFullDebug.ini diagnostics-full.ini)
+    if(EXISTS "${config_dir}/${preset}" AND NOT EXISTS "${DESTINATION}/${preset}")
+        configure_file("${config_dir}/${preset}" "${DESTINATION}/${preset}" COPYONLY)
+    endif()
+endforeach()

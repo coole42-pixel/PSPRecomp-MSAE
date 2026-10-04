@@ -31,7 +31,7 @@ struct GeSummary {
     std::uint64_t pixels_colored{};   // drawn with a non-black, non-transparent colour
     std::uint64_t vertex_decodes{}, vertex_cache_hits{};
     std::uint64_t textured_draws{};
-    std::uint64_t block_transfers{}, transferred_bytes{};
+    std::uint64_t block_transfers{}, transferred_bytes{}, transfer_syncs{}, clut_syncs{};
 };
 
 void reset_software_ge() noexcept;
@@ -55,6 +55,18 @@ struct GeInterrupt {
 std::vector<GeInterrupt> software_ge_execute_list(psprecomp::GuestMemory &memory,
     std::uint32_t address, std::uint32_t stall, bool rasterize = true,
     std::uint64_t submission = 0u);
+
+// A list executed in segments as its stall address advances, the way the
+// PSP's GE renders while the CPU is still writing the rest of the list.
+// `last` closes the list (as software_ge_execute_list does at its end).
+struct GeListProgress {
+    std::uint32_t cursor{}, previous_word{};
+    bool signal_pause{}, started{}, finished{}, ended{};
+    std::vector<GeInterrupt> interrupts;
+};
+void software_ge_execute_segment(psprecomp::GuestMemory &memory, std::uint32_t address, std::uint32_t stall,
+                                 bool rasterize, std::uint64_t submission, GeListProgress &progress,
+                                 bool last);
 
 // Offline texture-pack extraction. Decodes texture bytes through the same
 // texel path the GPU texture cache uses at runtime, so extracted textures get

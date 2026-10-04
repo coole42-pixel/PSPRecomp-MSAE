@@ -453,7 +453,8 @@ int run(const BootstrapPaths &paths) {
         }
         run_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - run_start).count();
     }
-    perf::report(run_seconds);
+    if (const auto profile = perf::report(run_seconds); !profile.empty())
+        log_line("PROFILE", profile);
     if (const char *dump_path = std::getenv("PSPRECOMP_MOTORSTORM_MEMORY_DUMP")) {
         std::vector<std::uint8_t> bytes(runtime.memory().size());
         runtime.memory().copy_out(psprecomp::GuestMemory::kPhysicalBase,bytes);

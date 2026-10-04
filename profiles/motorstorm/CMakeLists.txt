@@ -10,6 +10,7 @@ set(MOTORSTORM_PROFILE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 # PSPRECOMP_LTO.
 option(PSPRECOMP_MOTORSTORM_AOT_LTO
     "Include generated MotorStorm AOT units in MSVC whole-program optimization" OFF)
+option(PSPRECOMP_MOTORSTORM_HOST_SYMBOLS "Build MotorStormNative host sources with /Zi and a PDB for profiling" OFF)
 set(PSPRECOMP_MOTORSTORM_INLINE_LEVEL "0" CACHE STRING
     "MSVC /Ob level for generated MotorStorm AOT units (0, 1, 2 or 3); /Ob1 and /Ob2 measured slower")
 set_property(CACHE PSPRECOMP_MOTORSTORM_INLINE_LEVEL PROPERTY STRINGS 0 1 2 3)
@@ -116,7 +117,7 @@ foreach(shader IN ITEMS VS:vs_5_1 PS:ps_5_1 PointGS:gs_5_1 PresentVS:vs_5_1 Pres
                         ExpandCS:cs_5_1 ResolveCS:cs_5_1 CaptureCS:cs_5_1 DecodeCS:cs_5_1 MipCS:cs_5_1
                         PostResolveCS:cs_5_1 DebandCS:cs_5_1 PostPS:ps_5_1 PostCaptureCS:cs_5_1
                         PostColorCS:cs_5_1 PostPresentPS:ps_5_1 PostColorCaptureCS:cs_5_1
-                        DepthResolveCS:cs_5_1 BloomExtractCS:cs_5_1 BloomDownCS:cs_5_1 BloomUpCS:cs_5_1)
+                        DepthResolveCS:cs_5_1)
     string(REPLACE ":" ";" shader_parts "${shader}")
     list(GET shader_parts 0 entry)
     list(GET shader_parts 1 profile)
@@ -175,9 +176,17 @@ if(MSVC)
     # override the per-source /Ob0 set on the generated corpus.  The /MP cap
     # above still applies project-wide, but /MP never conflicts with /Ob.
     target_compile_options(MotorStormNative PRIVATE ${MOTORSTORM_MSVC_MP_FLAG})
+    # PSPRECOMP_MOTORSTORM_HOST_SYMBOLS adds full debug info for the host
+    # sources and a PDB (publics only for the generated corpus) so
+    # tools/sampler can attribute samples; code generation is unchanged.
+    set(MOTORSTORM_HOST_MSVC_OPTIONS "$<$<CONFIG:Release>:/Ob3>;$<$<CONFIG:RelWithDebInfo>:/Ob3>")
+    if(PSPRECOMP_MOTORSTORM_HOST_SYMBOLS)
+        string(APPEND MOTORSTORM_HOST_MSVC_OPTIONS ";/Zi")
+        target_link_options(MotorStormNative PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+    endif()
     set_source_files_properties(${MOTORSTORM_HOST_SOURCES}
         DIRECTORY "${MOTORSTORM_PROFILE_DIR}" PROPERTIES COMPILE_OPTIONS
-        "$<$<CONFIG:Release>:/Ob3>;$<$<CONFIG:RelWithDebInfo>:/Ob3>")
+        "${MOTORSTORM_HOST_MSVC_OPTIONS}")
     target_link_options(MotorStormNative PRIVATE /STACK:67108864)
     if(PSPRECOMP_LTO)
         target_link_options(MotorStormNative PRIVATE /LTCG:STATUS /INCREMENTAL:NO)
@@ -239,6 +248,9 @@ if(PSPRECOMP_BUILD_PROFILE_TESTS)
     target_include_directories(motorstorm_config_tests PRIVATE "${MOTORSTORM_PROFILE_DIR}/host")
     target_compile_definitions(motorstorm_config_tests PRIVATE
         MOTORSTORM_CONFIG_TEMPLATE="${MOTORSTORM_PROFILE_DIR}/config/motorstorm.ini")
+    target_compile_definitions(motorstorm_config_tests PRIVATE
+        MOTORSTORM_CLEAN_CONFIG="${MOTORSTORM_PROFILE_DIR}/config/MotorStormNativeClean.ini"
+        MOTORSTORM_DEBUG_CONFIG="${MOTORSTORM_PROFILE_DIR}/config/MotorStormFullDebug.ini")
     motorstorm_set_runtime_output(motorstorm_config_tests)
     add_test(NAME motorstorm_config_tests COMMAND motorstorm_config_tests)
     add_executable(motorstorm_texture_tests tests/motorstorm_texture_tests.cpp host/motorstorm_textures.cpp)

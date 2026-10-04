@@ -153,29 +153,18 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
             else if (key == "color_depth") {
                 if (choice != "16" && choice != "32") invalid("must be 16 or 32");
                 config.post_color_depth = choice == "16" ? 16u : 32u;
-            } else if (key == "tonemapping") {
-                if (choice != "agx" && choice != "none") invalid("must be agx or none");
-                config.post_tonemap = choice;
-            } else if (key == "agx_look") {
-                if (choice != "none" && choice != "punchy" && choice != "golden")
-                    invalid("must be none, punchy or golden");
-                config.post_agx_look = choice;
-            } else if (key == "hdr_peak") config.post_hdr_peak = real(1.0, 16.0);
+            }
             else if (key == "color_correction") config.post_color_correction = boolean();
             else if (key == "exposure") config.post_exposure = real(-3.0, 3.0);
             else if (key == "contrast") config.post_contrast = real(0.5, 2.0);
             else if (key == "saturation") config.post_saturation = real(0.0, 2.0);
             else if (key == "temperature") config.post_temperature = real(-1.0, 1.0);
             else if (key == "tint") config.post_tint = real(-1.0, 1.0);
-            else if (key == "lut") config.post_lut = boolean();
-            else if (key == "lut_file") config.post_lut_file = (path.parent_path() / value).lexically_normal();
-            else if (key == "lut_strength") config.post_lut_strength = real(0.0, 1.0);
             else if (key == "sharpening") config.post_sharpen = boolean();
             else if (key == "sharpening_strength") config.post_sharpen_strength = real(0.0, 1.0);
             else if (key == "hud_ungraded") config.post_hud_ungraded = boolean();
-            else if (key == "bloom") config.post_bloom = boolean();
-            else if (key == "bloom_strength") config.post_bloom_strength = real(0.0, 1.0);
-            else if (key == "bloom_threshold") config.post_bloom_threshold = real(0.5, 16.0);
+            else if (key == "soft_particles") config.post_soft_particles = boolean();
+            else if (key == "soft_particle_softness") config.post_soft_particle_softness = real(10.0, 20000.0);
         }
         static const std::map<std::string, std::set<std::string>> known{
             {"", {"eboot", "disc_root", "log_file", "trace_imports", "trace_filesystem", "verbose"}},
@@ -187,13 +176,13 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
             {"window", {"enabled", "fullscreen", "scale", "fullscreen_mode", "fullscreen_refresh"}},
             {"audio", {"enabled", "api"}},
             {"textures", {"dump", "replace", "dump_dir", "replace_dir", "budget_mb"}},
-            {"enhancements", {"enabled", "color_depth", "tonemapping", "agx_look", "hdr_peak", "color_correction",
-                              "exposure", "contrast", "saturation", "temperature", "tint", "lut", "lut_file",
-                              "lut_strength", "sharpening", "sharpening_strength", "hud_ungraded", "bloom",
-                              "bloom_strength", "bloom_threshold"}},
+            {"enhancements", {"enabled", "color_depth", "color_correction", "exposure", "contrast", "saturation",
+                              "temperature", "tint", "sharpening", "sharpening_strength", "hud_ungraded",
+                              "soft_particles", "soft_particle_softness"}},
             {"debug", {"profile", "trace_controller", "trace_music", "trace_atrac", "trace_display",
                        "d3d12_debug", "pc_sample", "frame_dump", "stop_after_ge", "frame_dump_every",
-                       "frame_dump_count", "frame_dump_dir"}},
+                       "frame_dump_count", "frame_dump_dir", "memory_dump", "audio_capture",
+                       "trace_state", "trace_switch", "trace_flags", "trace_callback_owner", "trace_preempt", "stack_scan", "frame_dump_both", "frame_dump_rolling"}},
         };
         const auto found = known.find(section);
         if (found == known.end() || !found->second.contains(key)) {
@@ -216,6 +205,14 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
                 {"d3d12_debug", "PSPRECOMP_MOTORSTORM_D3D12_DEBUG"},
                 {"pc_sample", "PSPRECOMP_MOTORSTORM_PC_SAMPLE"},
                 {"frame_dump", "PSPRECOMP_MOTORSTORM_FRAME_DUMP"},
+                {"frame_dump_both", "PSPRECOMP_MOTORSTORM_FRAME_DUMP_BOTH"},
+                {"frame_dump_rolling", "PSPRECOMP_MOTORSTORM_FRAME_DUMP_ROLLING"},
+                {"trace_state", "PSPRECOMP_MOTORSTORM_TRACE_STATE"},
+                {"trace_switch", "PSPRECOMP_MOTORSTORM_TRACE_SWITCH"},
+                {"trace_flags", "PSPRECOMP_MOTORSTORM_TRACE_FLAGS"},
+                {"trace_callback_owner", "PSPRECOMP_MOTORSTORM_TRACE_CALLBACK_OWNER"},
+                {"trace_preempt", "PSPRECOMP_MOTORSTORM_TRACE_PREEMPT"},
+                {"stack_scan", "PSPRECOMP_MOTORSTORM_STACK_SCAN"},
             };
             for (const auto &[option, environment] : switches) {
                 if (key != option) continue;
@@ -232,9 +229,15 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
             };
             for (const auto &[option, environment] : numbers)
                 if (key == option) config.debug_environment.emplace_back(environment, std::to_string(number(1u, UINT64_MAX)));
-            if (key == "frame_dump_dir")
-                config.debug_environment.emplace_back("PSPRECOMP_MOTORSTORM_FRAME_DUMP_DIR",
-                    (path.parent_path() / value).lexically_normal().string());
+            const std::pair<const char *, const char *> paths[]{
+                {"frame_dump_dir", "PSPRECOMP_MOTORSTORM_FRAME_DUMP_DIR"},
+                {"memory_dump", "PSPRECOMP_MOTORSTORM_MEMORY_DUMP"},
+                {"audio_capture", "PSPRECOMP_MOTORSTORM_AUDIO_CAPTURE"},
+            };
+            for (const auto &[option, environment] : paths)
+                if (key == option)
+                    config.debug_environment.emplace_back(environment,
+                        (path.parent_path() / value).lexically_normal().string());
         }
     }
     return config;
@@ -263,25 +266,17 @@ void apply_native_config(const NativeConfig &config) {
     set_default("PSPRECOMP_MOTORSTORM_TEXTURE_BUDGET_MB", std::to_string(config.texture_budget_mb));
     set_default("PSPRECOMP_MOTORSTORM_POST", config.post ? "1" : "0");
     set_default("PSPRECOMP_MOTORSTORM_POST_COLOR_DEPTH", std::to_string(config.post_color_depth));
-    set_default("PSPRECOMP_MOTORSTORM_POST_TONEMAP", config.post_tonemap);
-    set_default("PSPRECOMP_MOTORSTORM_POST_AGX_LOOK", config.post_agx_look);
-    set_default("PSPRECOMP_MOTORSTORM_POST_HDR_PEAK", config.post_hdr_peak);
     set_default("PSPRECOMP_MOTORSTORM_POST_COLOR_CORRECTION", config.post_color_correction ? "1" : "0");
     set_default("PSPRECOMP_MOTORSTORM_POST_EXPOSURE", config.post_exposure);
     set_default("PSPRECOMP_MOTORSTORM_POST_CONTRAST", config.post_contrast);
     set_default("PSPRECOMP_MOTORSTORM_POST_SATURATION", config.post_saturation);
     set_default("PSPRECOMP_MOTORSTORM_POST_TEMPERATURE", config.post_temperature);
     set_default("PSPRECOMP_MOTORSTORM_POST_TINT", config.post_tint);
-    set_default("PSPRECOMP_MOTORSTORM_POST_LUT", config.post_lut ? "1" : "0");
-    if (!config.post_lut_file.empty())
-        set_default("PSPRECOMP_MOTORSTORM_POST_LUT_FILE", config.post_lut_file.string());
-    set_default("PSPRECOMP_MOTORSTORM_POST_LUT_STRENGTH", config.post_lut_strength);
     set_default("PSPRECOMP_MOTORSTORM_POST_SHARPEN", config.post_sharpen ? "1" : "0");
     set_default("PSPRECOMP_MOTORSTORM_POST_SHARPEN_STRENGTH", config.post_sharpen_strength);
     set_default("PSPRECOMP_MOTORSTORM_POST_HUD_UNGRADED", config.post_hud_ungraded ? "1" : "0");
-    set_default("PSPRECOMP_MOTORSTORM_POST_BLOOM", config.post_bloom ? "1" : "0");
-    set_default("PSPRECOMP_MOTORSTORM_POST_BLOOM_STRENGTH", config.post_bloom_strength);
-    set_default("PSPRECOMP_MOTORSTORM_POST_BLOOM_THRESHOLD", config.post_bloom_threshold);
+    set_default("PSPRECOMP_MOTORSTORM_POST_SOFT_PARTICLES", config.post_soft_particles ? "1" : "0");
+    set_default("PSPRECOMP_MOTORSTORM_POST_SOFT_PARTICLE_SOFTNESS", config.post_soft_particle_softness);
     set_default("PSPRECOMP_MOTORSTORM_WINDOW", config.window ? "1" : "0");
     set_default("PSPRECOMP_MOTORSTORM_FULLSCREEN", config.fullscreen ? "1" : "0");
     set_default("PSPRECOMP_MOTORSTORM_WINDOW_SCALE", std::to_string(config.window_scale));

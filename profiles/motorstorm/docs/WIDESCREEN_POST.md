@@ -22,23 +22,11 @@ remain unchanged. Consequently an ultrawide view distributes the same number
 of horizontal samples over a wider view. The software reference renderer
 keeps PSP rendering and presentation.
 
-The post fixes are:
-
-- Golden calibration includes its saturation, outset matrix and channel
-  clamp, matching GPU luminance rather than stopping after the look's power.
-- Synthetic HDR input receives a smooth shoulder above half of AgX's upper
-  scene range. High peak/exposure settings approach that range rather than
-  hard-clipping at its log-domain limit. Default mid grey and bright snow
-  calibration are retained.
-- Debanding and dithering use the same transition fade as the other effects.
-  Zero fade reproduces the original image exactly.
-
-Validation uses the actual GPU shading through `PostCaptureCS`, which shares
-`postShade` with `PostPS`. Diagnostic calls allocate private scratch buffers
-and do not change runtime settings. Tests cover all three AgX looks at peaks
-1, 2, 6 and 16, CPU/GPU grey-ramp agreement, un-clipped neutral highlights,
-all-effects and deband-only zero-fade identity, and active effects changing
-pixels. Widescreen GPU fixtures cover 16:9, 21:9 and 32:9, preserved object
+The remaining post chain performs debanding, CAS sharpening, linear-light colour
+correction and display dithering. Every pass respects the transition fade; a zero
+fade reproduces the original image exactly. HUD pixels retain their original colour
+and sharpness. The GPU fixtures compare asynchronous and reference shading.
+Widescreen GPU fixtures cover 16:9, 21:9 and 32:9, preserved object
 proportions, additional visible geometry, HUD positions/scissors, full-frame
 overlays, menus and the PSP opt-out. Existing resolution/AA and guest pixel
 tests remain in the GPU suite.

@@ -70,8 +70,10 @@ struct Scope {
     }
 };
 
-inline void report(double wall_seconds) noexcept {
-    if (!enabled()) return;
+// Prints the breakdown to stderr and returns it (empty when profiling is off)
+// so the caller can also write it to the log.
+inline std::string report(double wall_seconds) {
+    if (!enabled()) return {};
     const auto ms = [](std::uint64_t ns) { return static_cast<double>(ns) / 1.0e6; };
     const auto &t = ticks();
     const double sections = ms(t[kGeDecode]) + ms(t[kGeSubmit]) + ms(t[kGpuSync]) + ms(t[kPresent]) +
@@ -88,6 +90,7 @@ inline void report(double wall_seconds) noexcept {
     std::fwrite(line, 1, std::strlen(line), stderr);
     std::fputc('\n', stderr);
     std::fflush(stderr);
+    return std::string(line + std::strlen("[PROFILE] "));
 }
 
 // ---------------------------------------------------------------------------

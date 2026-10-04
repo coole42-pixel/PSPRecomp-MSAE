@@ -291,3 +291,56 @@ Frame equality: set `PSPRECOMP_TIME_TICK_DISPATCHES=0`,
 `PSPRECOMP_MOTORSTORM_FRAME_DUMP_EVERY=250`, `PSPRECOMP_MOTORSTORM_FRAME_DUMP_COUNT=3`,
 `PSPRECOMP_MOTORSTORM_FRAME_DUMP_BOTH=1` and a per-binary
 `PSPRECOMP_MOTORSTORM_FRAME_DUMP_DIR`, run the benchmark, and compare file hashes.
+
+## Round 3 (2026-10-04): GE thread (Anguta Glacier at 60 fps)
+
+Anguta Glacier (Festival, Arctic Trucks, 4x resolution, FXAA, enhancements on,
+60 fps) ran at **0.79x real time (47 fps)**: about 21 ms per frame on the one
+emulation thread, so the game slowed down and the audio device ran dry ~7,700
+times per minute (crackling). A symbol build (`-DPSPRECOMP_MOTORSTORM_HOST_SYMBOLS=ON`,
+host sources at `/Zi` plus a PDB with publics for the corpus) under
+`tools/sampler` showed 61 % of the thread inside GE list execution (draw
+submission 23.5 %, readback publishing and GPU fence waits 17 %, vertex decode
+16 %).
+
+A per-frame timeline showed why that could overlap: the game enqueues its list
+at the start of the frame and releases it with two `sceGeListUpdateStallAddr`
+calls by about +3 ms, then spends ~9 ms more on the CPU before
+`sceGeDrawSync`. The emulator executed the whole list only at DrawSync.
+
+**Change:** a GE thread executes each list in segments as the stall address
+advances (`software_ge_execute_segment`, a resumable `execute_list`), exactly as
+the PSP's GE renders while the CPU continues. `sceGeDrawSync` queues the rest,
+waits, raises the callbacks from the executed interrupts and presents, as
+before. Commands before the stall are final, so the GE never sees later CPU
+writes. A CPU access to VRAM waits for the thread before publishing readbacks
+(`gpu_set_publish_guard`). `PSPRECOMP_MOTORSTORM_GE_THREAD=0` restores the
+original single-thread ordering.
+
+Deferring execution past DrawSync was tried first and rejected: the game
+rewrites the same display list immediately after DrawSync (the GE walked
+half-written commands), and write-protecting the pages the list reads stalled
+within 0.1 ms of every DrawSync.
+
+| Anguta Glacier, 60 s race window | guest/wall | fps | frame p50 | audio device dry |
+| --- | ---: | ---: | ---: | ---: |
+| Before | 0.79 | 47.4 | 21.6 ms | 7,856 |
+| GE thread | **1.00** | **60.0** | 16.2 ms | 97 |
+
+Also in this round:
+
+- GE block transfers whose source is a target drawn in the current list (the
+  game copies a 17x17 block of the frame every frame, a sun visibility test)
+  are snapshotted on the GPU at their place in the command stream and written
+  to guest memory at the next publish, instead of flushing and waiting for the
+  whole frame mid-list (`gpu_transfer_from_target`). Transfer syncs: 3,280 → 2.
+- The 30 fps fallback governor counted texture uploads and texture-pack
+  streaming as loading screens, so on tracks that stream continuously it
+  ignored most race samples and fell back half a minute late. Only bursts count
+  now (`loading_activity`), and the log reports the governor's samples.
+- The log records readback publishes per trigger (draw, sync, list end, CPU
+  VRAM access, list start) with their GPU waits, and the `[PROFILE]` breakdown.
+
+Correctness: all 10 test suites pass (including `motorstorm_gpu_tests` pixel
+comparisons); boot, menus, vehicle select and the race were checked from frame
+captures with the GE thread active.

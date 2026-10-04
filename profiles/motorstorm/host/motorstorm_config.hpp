@@ -30,14 +30,10 @@ struct NativeConfig {
     std::uint32_t texture_budget_mb{1024};
     // [enhancements]: race-only image effects (see motorstorm_post.hpp). Kept
     // as the INI text; reals are validated here and parsed by the renderer.
-    bool post{true}, post_color_correction{true}, post_lut{true}, post_sharpen{true}, post_hud_ungraded{true},
-        post_bloom{};
+    bool post{}, post_color_correction{true}, post_sharpen{true}, post_hud_ungraded{true}, post_soft_particles{};
     std::uint32_t post_color_depth{32};
-    std::string post_tonemap{"agx"}, post_agx_look{"punchy"};
-    std::string post_hdr_peak{"6.0"}, post_exposure{"0.0"}, post_contrast{"1.0"}, post_saturation{"1.0"},
-        post_temperature{"0.0"}, post_tint{"0.0"}, post_lut_strength{"1.0"}, post_sharpen_strength{"0.2"}, post_bloom_strength{"0.15"},
-        post_bloom_threshold{"3.0"};
-    std::filesystem::path post_lut_file;
+    std::string post_exposure{"0.0"}, post_contrast{"1.0"}, post_saturation{"1.0"},
+        post_temperature{"0.0"}, post_tint{"0.0"}, post_sharpen_strength{"0.2"}, post_soft_particle_softness{"600"};
     bool trace_imports{}, trace_filesystem{}, verbose{};
     std::vector<std::pair<std::string, std::string>> debug_environment;
     // Unknown or misplaced keys; they are reported in the log, never fatal.

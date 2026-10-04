@@ -333,6 +333,7 @@ void replacement_alpha(psprecomp::GuestMemory &memory) {
     std::puts("Enhanced replacement colour/alpha exact for opaque, translucent and RGB-only pack images");
 }
 
+
 void post_pixels() {
     motorstorm::GpuImage input{256, 8, std::vector<std::uint8_t>(256 * 8 * 4)};
     for (unsigned y = 0; y < input.height; ++y)
@@ -341,27 +342,7 @@ void post_pixels() {
             p[0] = p[1] = p[2] = static_cast<std::uint8_t>(x); p[3] = 255;
         }
     motorstorm::PostSettings settings;
-    settings.extended_color = settings.color_correction = settings.lut = settings.sharpening = false;
-    for (unsigned look = 0; look < 3; ++look)
-        for (float peak : {1.0f, 2.0f, 6.0f, 16.0f}) {
-            settings.agx_look = look; settings.hdr_peak = peak;
-            const auto output = motorstorm::gpu_debug_post(input, settings);
-            const float gain = motorstorm::agx_mid_grey_gain(peak, look);
-            for (unsigned x = 0; x < 256; ++x) {
-                const auto *p = output.rgba.data() + x * 4;
-                const float y = (0.2126f*p[0] + 0.7152f*p[1] + 0.0722f*p[2]) / 255;
-                if (std::fabs(y - motorstorm::agx_display(x / 255.0f, peak, gain, look)) > 2.0f / 255)
-                    throw std::runtime_error("AgX CPU calibration differs from GPU post pixels");
-            }
-            const auto *grey = output.rgba.data() + 117 * 4;
-            const float y = (0.2126f*grey[0] + 0.7152f*grey[1] + 0.0722f*grey[2]) / 255;
-            if (std::fabs(y - 117.0f / 255) > 2.0f / 255)
-                throw std::runtime_error("Every AgX look must preserve GPU mid grey");
-            if (look < 2 && output.rgba[255 * 4] == 255)
-                throw std::runtime_error("Synthetic HDR white must not hard-clip in AgX");
-        }
-    settings = motorstorm::PostSettings{};
-    // This patterned gradient exercises debanding, CAS, grade, LUT and dither.
+    // This patterned gradient exercises debanding, CAS, grade and dither.
     for (unsigned y = 0; y < input.height; ++y)
         for (unsigned x = 0; x < input.width; ++x) {
             auto *p = input.rgba.data() + (y * input.width + x) * 4;
@@ -371,7 +352,7 @@ void post_pixels() {
         throw std::runtime_error("Zero fade must preserve the original pixels, including debanding and dither");
     if (motorstorm::gpu_debug_post(input, settings, 1.0f).rgba == input.rgba)
         throw std::runtime_error("Post effects must actually change the GPU image");
-    settings.agx = settings.color_correction = settings.lut = settings.sharpening = false;
+    settings.color_correction = settings.sharpening = false;
     if (motorstorm::gpu_debug_post(input, settings, 0.0f).rgba != input.rgba ||
         motorstorm::gpu_debug_post(input, settings, 1.0f).rgba == input.rgba)
         throw std::runtime_error("Debanding must fade independently of the other effects");
@@ -384,11 +365,8 @@ void post_pixels() {
         pattern.rgba[p+2] = static_cast<std::uint8_t>((p*47+33)%256);
         pattern.rgba[p+3] = 255;
     }
-    for (unsigned look = 0; look < 3; ++look)
-        for (float fade : {0.0f,0.1f,0.5f,1.0f}) {
+    for (float fade : {0.0f,0.1f,0.5f,1.0f}) {
             settings = motorstorm::PostSettings{};
-            settings.agx_look = look;
-            settings.hdr_peak = look == 2 ? 16.0f : 6.0f;
             settings.exposure = 0.3f; settings.contrast = 1.2f;
             settings.temperature = 0.25f; settings.tint = -0.1f;
             settings.saturation = 1.1f;
@@ -397,7 +375,7 @@ void post_pixels() {
             if (async.rgba != reference.rgba)
                 throw std::runtime_error("Async float32 post output must equal reference shader pixels");
         }
-    std::puts("Async float32 post colour matches reference pixels for all looks, grades and fades");
+    std::puts("Async float32 post colour matches reference pixels for all grades and fades");
     // HUD mask: pixels tagged in the depth snapshot keep the game's colours;
     // everything beyond the mask and the sharpening footprint is graded exactly as before.
     for (unsigned y = 0; y < input.height; ++y)
@@ -406,6 +384,7 @@ void post_pixels() {
             p[0] = p[1] = p[2] = static_cast<std::uint8_t>(120 + (x + y) % 3);
         }
     settings = motorstorm::PostSettings{};
+    settings.exposure = 0.75f;
     std::vector<std::uint32_t> tags(input.width * input.height, 777u), untagged = tags;
     for (unsigned y = 2; y <= 5; ++y)
         for (unsigned x = 100; x <= 140; ++x)
@@ -436,64 +415,22 @@ void post_pixels() {
     if (graded_in_hud < 100)
         throw std::runtime_error("The HUD mask test needs a grade that actually changes those pixels");
     std::puts("HUD mask: tagged pixels keep game colours, distant pixels graded exactly as before");
-    // Bloom: a bright square glows into its surroundings; nothing changes where
-    // there is no highlight or far from it; the HUD never blooms; fade 0 is exact.
-    {
-        constexpr unsigned kW = 192, kH = 24;
-        motorstorm::GpuImage scene{kW, kH, std::vector<std::uint8_t>(kW * kH * 4)};
-        std::vector<std::uint32_t> square_tags(kW * kH, 0u);
-        for (unsigned y = 0; y < kH; ++y)
-            for (unsigned x = 0; x < kW; ++x) {
-                auto *p = scene.rgba.data() + (y * kW + x) * 4;
-                const bool bright = x >= 10 && x < 16 && y >= 9 && y < 15;
-                p[0] = p[1] = p[2] = bright ? 255 : 40;
-                p[3] = 255;
-                if (bright) square_tags[y * kW + x] = 0x10000u;
-            }
-        motorstorm::PostSettings off, on;
-        on.bloom = true; on.bloom_strength = 0.5f; on.bloom_threshold = 1.0f;
-        const auto lum = [](const motorstorm::GpuImage &image, unsigned x, unsigned y) {
-            const auto *p = image.rgba.data() + (y * image.width + x) * 4;
-            return static_cast<int>(p[0]) + p[1] + p[2];
-        };
-        const auto plain = motorstorm::gpu_debug_post(scene, off, 1.0f);
-        const auto glow = motorstorm::gpu_debug_post(scene, on, 1.0f);
-        if (lum(glow, 19, 12) < lum(plain, 19, 12) + 6 || lum(glow, 12, 5) < lum(plain, 12, 5) + 6)
-            throw std::runtime_error("Bloom must brighten the surroundings of a highlight");
-        if (lum(glow, 180, 12) != lum(plain, 180, 12) || lum(glow, 180, 2) != lum(plain, 180, 2))
-            throw std::runtime_error("Bloom must not reach far from its highlight");
-        if (motorstorm::gpu_debug_post(scene, on, 1.0f, true).rgba != glow.rgba)
-            throw std::runtime_error("Bloom must match between the async and reference post paths");
-        if (motorstorm::gpu_debug_post(scene, on, 0.0f).rgba != scene.rgba)
-            throw std::runtime_error("Zero fade must preserve the original pixels with bloom on");
-        motorstorm::GpuImage dark = scene;
-        for (std::size_t p = 0; p < dark.rgba.size(); p += 4) dark.rgba[p] = dark.rgba[p + 1] = dark.rgba[p + 2] = 40;
-        if (motorstorm::gpu_debug_post(dark, on, 1.0f).rgba != motorstorm::gpu_debug_post(dark, off, 1.0f).rgba)
-            throw std::runtime_error("Bloom must change nothing without a highlight above the threshold");
-        const auto hud_glow = motorstorm::gpu_debug_post(scene, on, 1.0f, false, &square_tags);
-        const auto hud_plain = motorstorm::gpu_debug_post(scene, off, 1.0f, false, &square_tags);
-        if (hud_glow.rgba != hud_plain.rgba)
-            throw std::runtime_error("The HUD must not bloom");
-        on.agx = false;
-        if (on.bloom_active() || motorstorm::gpu_debug_post(scene, on, 1.0f).rgba != motorstorm::gpu_debug_post(scene, [&] { auto s = off; s.agx = false; return s; }(), 1.0f).rgba)
-            throw std::runtime_error("Bloom needs AgX tone mapping and must switch itself off without it");
-        std::puts("Bloom: glow around highlights only, async == reference, fade-exact, HUD excluded");
-    }
-    std::puts("GPU post pixels: all AgX looks/peaks calibrated, highlight shoulder and complete fade verified");
+    std::puts("GPU post pixels: remaining effects, HUD protection and complete fade verified");
 }
 
 void widescreen_pixels(psprecomp::GuestMemory &memory) {
     motorstorm::gpu_shutdown();
     _putenv_s("PSPRECOMP_MOTORSTORM_WIDESCREEN", "auto");
     const auto run = [&](unsigned width, unsigned height, bool racing, bool hardware,
-                         float left, float top, float right, float bottom, bool partial_scissor = false) {
+                         float left, float top, float right, float bottom, bool partial_scissor = false,
+                         unsigned rows = 272) {
         motorstorm::gpu_set_output_size(width, height);
         motorstorm::gpu_set_racing(racing);
-        memory.zero(kColor, 512u * 272u * 4);
+        memory.zero(kColor, 512u * rows * 4);
         motorstorm::gpu_initialize();
         motorstorm::GpuDraw draw;
         draw.framebuffer = kColor; draw.stride = 512; draw.format = 3;
-        draw.right = 480; draw.bottom = 272;
+        draw.right = 480; draw.bottom = static_cast<int>(rows);
         draw.hardware_transform = hardware;
         draw.model_to_clip = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
         draw.scale = {240, -136, 1, 0}; draw.center = {240, 136, 0, 0};
@@ -538,6 +475,38 @@ void widescreen_pixels(psprecomp::GuestMemory &memory) {
         if (count(run(size[0],size[1],false,true,1.1f,-0.1f,1.2f,0.1f)) != 0)
             throw std::runtime_error("Menus must retain their native frustum on wider monitors");
     }
+    // The race framebuffer is 512x296: its taller scissor must widen exactly like
+    // the 272-row menu target (it once silently did not).
+    for (const auto size : {std::array{1920u,1080u}, std::array{3440u,1440u}}) {
+        const float aspect = motorstorm::widescreen_scale(size[0], size[1]);
+        const unsigned area = count(run(size[0],size[1],true,true,-0.25f,-0.1f,0.25f,0.1f,false,296));
+        if (std::fabs(static_cast<float>(area) * aspect - 120.0f * 28.0f) > 120.0f)
+            throw std::runtime_error("Widescreen world geometry changed its proportions on the 296-row race target");
+        if (aspect > 1.2f && count(run(size[0],size[1],true,true,1.1f,-0.1f,1.2f,0.1f,false,296)) == 0)
+            throw std::runtime_error("Ultrawide must reveal geometry beyond the PSP frustum on the 296-row race target");
+        if (aspect > 1.2f && count(run(size[0],size[1],true,false,0,0,480,272,false,296)) != 480u*272u)
+            throw std::runtime_error("Full-screen overlays must cover the expanded 296-row race target");
+    }
+    // When the game itself renders the wider view (its camera aspect was raised),
+    // the shader must not widen 3D geometry again, while the HUD keeps its
+    // centred safe area. The same model-space quad then covers its native area.
+    motorstorm::gpu_set_guest_widescreen(true);
+    for (const unsigned rows : {272u, 296u}) {
+        const auto size = std::array{3440u, 1440u};
+        const float aspect = motorstorm::widescreen_scale(size[0], size[1]);
+        const unsigned area = count(run(size[0],size[1],true,true,-0.25f,-0.1f,0.25f,0.1f,false,rows));
+        if (std::fabs(static_cast<float>(area) - 120.0f * 28.0f) > 120.0f)
+            throw std::runtime_error("With a widened game camera the shader must leave 3D geometry unscaled");
+        if (count(run(size[0],size[1],true,true,1.1f,-0.1f,1.2f,0.1f,false,rows)) != 0)
+            throw std::runtime_error("With a widened game camera the shader must not widen the frustum itself");
+        const auto hud = run(size[0],size[1],true,false,20,20,100,60,true,rows);
+        const int expected_left = static_cast<int>(std::ceil(motorstorm::widescreen_hud_x(20,aspect)-0.5f));
+        const int expected_right = static_cast<int>(std::ceil(motorstorm::widescreen_hud_x(100,aspect)-0.5f));
+        for (int x = 0; x < 480; ++x)
+            if ((hud.rgba[(30*480+x)*4] != 0) != (x >= expected_left && x < expected_right))
+                throw std::runtime_error("The HUD safe area must stay centred with a widened game camera");
+    }
+    motorstorm::gpu_set_guest_widescreen(false);
     motorstorm::gpu_shutdown();
     _putenv_s("PSPRECOMP_MOTORSTORM_WIDESCREEN", "psp");
     if (count(run(3840,1080,true,true,1.1f,-0.1f,1.2f,0.1f)) != 0)
@@ -553,7 +522,7 @@ void widescreen_pixels(psprecomp::GuestMemory &memory) {
 // the game's own view of the depth buffer must stay exactly what it was.
 void hud_tag_pixels(psprecomp::GuestMemory &memory) {
     constexpr std::uint32_t kStride = 512, kRows = 296;  // the race framebuffer is 512x296
-    const auto run = [&](bool racing, const char *hud_ungraded) {
+    const auto run = [&](bool racing, const char *hud_ungraded, bool overlay = false, bool transparent = false) {
         motorstorm::gpu_shutdown();
         _putenv_s("PSPRECOMP_MOTORSTORM_POST_HUD_UNGRADED", hud_ungraded);
         motorstorm::gpu_set_output_size(480, 272);
@@ -567,18 +536,26 @@ void hud_tag_pixels(psprecomp::GuestMemory &memory) {
         draw.right = kStride; draw.bottom = kRows;
         draw.model_to_clip = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
         draw.scale = {240, -136, 1, 0}; draw.center = {240, 136, 1000, 0};
-        const auto v = [](float x, float y) { return motorstorm::GpuVertex{x, y, 0, 0xFFFFFFFFu}; };
-        const auto quad = [&](float l, float t, float r, float b) {
+        const auto quad = [&](float l, float t, float r, float b, std::uint32_t color = 0xFFFFFFFFu) {
+            const auto v = [&](float x, float y) { return motorstorm::GpuVertex{x, y, 0, color}; };
             return std::array{v(l,t), v(r,t), v(l,b), v(l,b), v(r,t), v(r,b)};
         };
         // The 3D scene: depth test (always) and depth write on, depth 1000.
         draw.hardware_transform = true;
         draw.commands[0x23] = 1; draw.commands[0xDE] = 1;
-        motorstorm::gpu_submit(memory, draw, quad(-0.5f, -0.5f, 0.0f, 0.5f), nullptr);
+        // Dark grey, so a white HUD pixel drawn over it visibly changes it.
+        motorstorm::gpu_submit(memory, draw, quad(-0.5f, -0.5f, 0.0f, 0.5f, 0xFF404040u), nullptr);
         // The HUD: through mode in screen coordinates, depth test off.
         draw.hardware_transform = false;
         draw.commands[0x23] = 0;
-        motorstorm::gpu_submit(memory, draw, quad(200, 100, 320, 160), nullptr);
+        // A full-picture overlay (tint, fade) is not HUD artwork and must not be tagged,
+        // or the whole frame would escape the grade (as it once did in real races).
+        auto hud = overlay ? quad(0, 0, 512, 296) : quad(200, 100, 320, 160);
+        if (transparent) {
+            for (auto &v : hud) v.color = 0x00FFFFFFu;  // fully transparent HUD pixels, source-alpha blended
+            draw.commands[0x21] = 1; draw.commands[0xDF] = 0x32;
+        }
+        motorstorm::gpu_submit(memory, draw, hud, nullptr);
         motorstorm::gpu_sync(memory);
         return motorstorm::gpu_debug_depth_words(memory, kColor, kStride, 3, 480, 272);
     };
@@ -590,6 +567,12 @@ void hud_tag_pixels(psprecomp::GuestMemory &memory) {
         (at(tagged, 150, 130) >> 16) != 0u || (at(tagged, 150, 130) & 0xFFFF) != 1000u ||
         at(tagged, 400, 50) != 40000u)
         throw std::runtime_error("Through-mode pixels must carry the HUD tag; 3D and untouched pixels must not");
+    for (const auto word : run(true, "1", true))
+        if (word >> 16)
+            throw std::runtime_error("A full-picture overlay must not be tagged as HUD");
+    for (const auto word : run(true, "1", false, true))
+        if (word >> 16)
+            throw std::runtime_error("The transparent part of a HUD quad must not be tagged");
     // A tagged pixel does not alter the guest-visible depth (the readback keeps 16 bits).
     if (memory.load16(kDepth + (130 * kStride + 250) * 2) != 40000 ||
         memory.load16(kDepth + (130 * kStride + 150) * 2) != 1000)
@@ -605,6 +588,80 @@ void hud_tag_pixels(psprecomp::GuestMemory &memory) {
     motorstorm::gpu_set_racing(false);
     std::puts("HUD tag: through-mode pixels tagged in the depth snapshot only while racing, guest depth untouched");
 }
+
+
+// Soft particles: a camera-facing blended draw fades out where it meets the scene;
+// a ground decal (geometry spanning a range of view depths) keeps its full strength;
+// and nothing changes while the option is off or outside a race.
+void soft_particle_pixels(psprecomp::GuestMemory &memory) {
+    constexpr std::uint32_t kStride = 512, kRows = 296;
+    const auto run = [&](bool racing, const char *enabled, std::array<std::array<float, 4>, 3> *out_alpha = nullptr) {
+        motorstorm::gpu_shutdown();
+        _putenv_s("PSPRECOMP_MOTORSTORM_POST_SOFT_PARTICLES", enabled);
+        _putenv_s("PSPRECOMP_MOTORSTORM_POST_SOFT_PARTICLE_SOFTNESS", "500");
+        motorstorm::gpu_set_output_size(480, 272);
+        motorstorm::gpu_set_racing(racing);
+        memory.zero(kColor, kStride * kRows * 4);
+        for (std::uint32_t i = 0; i < kStride * kRows; ++i) memory.store16(kDepth + i * 2, 0);
+        motorstorm::gpu_initialize();
+        motorstorm::GpuDraw draw;
+        draw.framebuffer = kColor; draw.stride = kStride; draw.format = 3;
+        draw.depthbuffer = kDepth; draw.depth_stride = kStride;
+        draw.right = kStride; draw.bottom = kRows;
+        draw.model_to_clip = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        draw.scale = {240, -136, 1, 0}; draw.center = {240, 136, 1000, 0};
+        draw.hardware_transform = true;
+        const auto vertex = [](float screen_x, float screen_y, float z, std::uint32_t color) {
+            return motorstorm::GpuVertex{(screen_x - 240.0f) / 240.0f, (screen_y - 136.0f) / -136.0f, z, color};
+        };
+        const auto quad = [&](float l, float t, float r, float b, float z, std::uint32_t color = 0xFFFFFFFFu) {
+            return std::vector{vertex(l,t,z,color), vertex(r,t,z,color), vertex(l,b,z,color), vertex(l,b,z,color),
+                               vertex(r,t,z,color), vertex(r,b,z,color)};
+        };
+        // The scene: black, depth word 5000 everywhere (depth test always, depth write on).
+        draw.commands[0x23] = 1; draw.commands[0xDE] = 1;
+        motorstorm::gpu_submit(memory, draw, quad(0, 0, 480, 272, 4000.0f, 0xFF000000u), nullptr);
+        // Particles: blended with source alpha, depth test less-or-equal, depth write off.
+        draw.commands[0x21] = 1; draw.commands[0xDF] = 0x32; draw.commands[0xDE] = 5; draw.commands[0xE7] = 1;
+        auto near_surface = quad(100, 100, 200, 150, 3900.0f);  // 100 in front of the scene: fade 0.2
+        const auto far_in_front = quad(250, 100, 350, 150, 3000.0f);  // 1000 in front: full strength
+        near_surface.insert(near_surface.end(), far_in_front.begin(), far_in_front.end());
+        motorstorm::gpu_submit(memory, draw, near_surface, nullptr);
+        // A ground decal: the same depth next to the surface, but its depth varies with y.
+        draw.model_to_view_z = {0, -5, 0, 10};
+        motorstorm::gpu_submit(memory, draw, quad(100, 200, 200, 250, 3900.0f), nullptr);
+        motorstorm::gpu_sync(memory);
+        const auto image = motorstorm::gpu_capture(memory, kColor, kStride, 3, 480, 272);
+        const auto channel = [&](unsigned x, unsigned y) { return static_cast<int>(image.rgba[(y * 480 + x) * 4]); };
+        if (out_alpha) (*out_alpha)[0] = {static_cast<float>(channel(150, 125)), static_cast<float>(channel(300, 125)),
+                                           static_cast<float>(channel(150, 225)), 0.0f};
+        return image;
+    };
+    std::array<std::array<float, 4>, 3> soft{};
+    run(true, "1", &soft);
+    if (soft[0][1] < 250.0f)
+        throw std::runtime_error("A particle well in front of the scene must keep its full strength");
+    if (soft[0][0] < 35.0f || soft[0][0] > 75.0f)
+        throw std::runtime_error("A particle just in front of the scene must fade (about 0.2 of full); got " +
+                                 std::to_string(soft[0][0]) + " near, " + std::to_string(soft[0][1]) + " far, " +
+                                 std::to_string(soft[0][2]) + " decal");
+    if (soft[0][2] < 250.0f)
+        throw std::runtime_error("A ground decal (spanning view depths) must not be softened");
+    std::array<std::array<float, 4>, 3> plain{};
+    run(true, "0", &plain);
+    if (plain[0][0] < 250.0f || plain[0][1] < 250.0f || plain[0][2] < 250.0f)
+        throw std::runtime_error("Soft particles must change nothing while the option is off");
+    std::array<std::array<float, 4>, 3> menu{};
+    run(false, "1", &menu);
+    if (menu[0][0] < 250.0f)
+        throw std::runtime_error("Soft particles must change nothing outside a race");
+    motorstorm::gpu_shutdown();
+    _putenv_s("PSPRECOMP_MOTORSTORM_POST_SOFT_PARTICLES", "");
+    _putenv_s("PSPRECOMP_MOTORSTORM_POST_SOFT_PARTICLE_SOFTNESS", "");
+    motorstorm::gpu_set_racing(false);
+    std::puts("Soft particles: billboards fade at the scene, ground decals and menus untouched");
+}
+
 
 int main() {
     try {
@@ -651,6 +708,7 @@ int main() {
         post_pixels();
         widescreen_pixels(memory);
         hud_tag_pixels(memory);
+        soft_particle_pixels(memory);
         indexed_vertex_cache(memory);
         replacement_alpha(memory);
         motorstorm::reset_software_ge();

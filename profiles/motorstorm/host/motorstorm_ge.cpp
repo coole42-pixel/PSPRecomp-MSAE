@@ -1856,8 +1856,6 @@ void submit_gpu_primitive(GuestMemory &memory, std::uint32_t type, const std::ve
 }
 
 void execute_block_transfer(GuestMemory &memory) {
-    gpu_sync(memory);
-    g_list_texture_keys.clear();
     const auto &c=g_state.commands;
     const auto source=(c[0xB2]&0xFFFFF0u)|((c[0xB3]&0xFF0000u)<<8);
     const auto destination=(c[0xB4]&0xFFFFF0u)|((c[0xB5]&0xFF0000u)<<8);
@@ -1867,9 +1865,27 @@ void execute_block_transfer(GuestMemory &memory) {
     const auto destination_x=c[0xEC]&0x3FFu,destination_y=(c[0xEC]>>10)&0x3FFu;
     const auto width=(c[0xEE]&0x3FFu)+1,height=((c[0xEE]>>10)&0x3FFu)+1;
     const auto bpp=(c[0xEA]&1u)?4u:2u;
+    // Wait for the GPU only when a render target is involved: most transfers
+    // move texture data between RAM and VRAM, and syncing on each of them
+    // flushed and waited for the whole frame's GPU work mid-list.
+    const auto span=[&](std::uint32_t base,std::uint32_t stride,std::uint32_t x,std::uint32_t y) {
+        return std::pair<std::uint32_t,std::uint32_t>{base+(y*stride+x)*bpp,((height-1)*stride+width)*bpp};
+    };
+    const auto [source_start,source_bytes]=span(source,source_stride,source_x,source_y);
+    const auto [destination_start,destination_bytes]=span(destination,destination_stride,destination_x,destination_y);
+    g_list_texture_keys.clear();
+    ++g_summary.block_transfers;
+    if(gpu_transfer_from_target(source,source_stride,source_x,source_y,destination,destination_stride,
+                                destination_x,destination_y,width,height,bpp)) {
+        g_summary.transferred_bytes+=static_cast<std::uint64_t>(width)*height*bpp;
+        return;
+    }
+    if(gpu_touches_surface(source_start,source_bytes) || gpu_touches_surface(destination_start,destination_bytes)) {
+        gpu_sync(memory);
+        ++g_summary.transfer_syncs;
+    }
     std::array<std::uint8_t,4096> row{};
     const auto bytes=width*bpp;
-    ++g_summary.block_transfers;
     for (std::uint32_t y=0;y<height;++y) {
         const auto src=source+((source_y+y)*source_stride+source_x)*bpp;
         const auto dst=destination+((destination_y+y)*destination_stride+destination_x)*bpp;
@@ -1881,7 +1897,8 @@ void execute_block_transfer(GuestMemory &memory) {
 }
 
 void execute_list(GuestMemory &memory, std::uint32_t address, std::uint32_t stall, bool rasterize,
-                  std::vector<GeInterrupt> &interrupts, std::uint64_t submission) {
+                  std::vector<GeInterrupt> &interrupts, std::uint64_t submission,
+                  GeListProgress *progress = nullptr) {
     struct CommandCount {
         std::uint64_t start{g_summary.commands};
         ~CommandCount() {
@@ -1903,6 +1920,26 @@ void execute_list(GuestMemory &memory, std::uint32_t address, std::uint32_t stal
     std::size_t depth = 0u;
     std::uint32_t previous_word = 0u;
     bool signal_pause = false;
+    // Resuming after a stall: continue where the previous segment stopped. The
+    // walk only stops at the stall in the top-level linear run (no CALL frames).
+    bool stalled = false;
+    if (progress) {
+        cursor = progress->cursor;
+        previous_word = progress->previous_word;
+        signal_pause = progress->signal_pause;
+    }
+    struct Resume {
+        GeListProgress *progress;
+        const std::uint32_t &cursor, &previous_word;
+        const bool &signal_pause, &stalled;
+        ~Resume() {
+            if (!progress) return;
+            progress->cursor = cursor;
+            progress->previous_word = previous_word;
+            progress->signal_pause = signal_pause;
+            progress->finished = !stalled;
+        }
+    } resume{progress, cursor, previous_word, signal_pause, stalled};
     const auto relative_address = [](std::uint32_t data) {
         return (g_state.offset_address + ((g_state.base_high << 24u) | (data & 0xFFFFFFu))) & 0x0FFFFFFFu;
     };
@@ -1931,8 +1968,10 @@ void execute_list(GuestMemory &memory, std::uint32_t address, std::uint32_t stal
     std::uint32_t consecutive_unknown = 0u;
     std::uint32_t step = 0u;
     for (; step < kMaxCommandsPerList; ++step) {
-        if (bounded && GuestMemory::canonical(cursor) == GuestMemory::canonical(stall))
+        if (bounded && GuestMemory::canonical(cursor) == GuestMemory::canonical(stall)) {
+            stalled = true;
             break;
+        }
         if (!memory.contains(cursor, 4u))
             break;
         const std::uint32_t word = memory.aot_load32(cursor);
@@ -2274,7 +2313,7 @@ void execute_list(GuestMemory &memory, std::uint32_t address, std::uint32_t stal
             break;
         case 0xC4u: { // LOADCLUT, 32-byte blocks
             g_state.clut_loaded_bytes = std::min(1024u, (data & 63u) * 32u);
-            gpu_sync_texture(memory,g_state.texture_clut_address,g_state.clut_loaded_bytes);
+            if(gpu_sync_texture(memory,g_state.texture_clut_address,g_state.clut_loaded_bytes)) ++g_summary.clut_syncs;
             for (std::uint32_t i = 0u; i < g_state.clut_loaded_bytes; ++i) {
                 const auto at = g_state.texture_clut_address + i;
                 g_state.clut[i] = memory.contains(at, 1u) ? memory.aot_load8(at) : 0u;
@@ -2588,9 +2627,8 @@ std::vector<std::uint32_t> ge_decode_texture(const GeTextureSource &source, std:
     return texels;
 }
 
-std::vector<GeInterrupt> software_ge_execute_list(GuestMemory &memory, std::uint32_t address,
-                                                  std::uint32_t stall, bool rasterize,
-                                                  std::uint64_t submission) {
+namespace {
+void begin_list(GuestMemory &memory, bool rasterize) {
     ++g_summary.lists_executed;
     if(rasterize) { gpu_initialize(); gpu_settle(memory); }
     g_list_texture_keys.clear();
@@ -2610,10 +2648,33 @@ std::vector<GeInterrupt> software_ge_execute_list(GuestMemory &memory, std::uint
             g_gpu_textures.erase(victim);
         }
     }
+}
+} // namespace
+
+std::vector<GeInterrupt> software_ge_execute_list(GuestMemory &memory, std::uint32_t address,
+                                                  std::uint32_t stall, bool rasterize,
+                                                  std::uint64_t submission) {
+    begin_list(memory, rasterize);
     std::vector<GeInterrupt> interrupts;
     execute_list(memory, address, stall, rasterize, interrupts, submission);
     gpu_end_list(memory);
     return interrupts;
+}
+
+void software_ge_execute_segment(GuestMemory &memory, std::uint32_t address, std::uint32_t stall,
+                                 bool rasterize, std::uint64_t submission, GeListProgress &progress,
+                                 bool last) {
+    if (!progress.started) {
+        begin_list(memory, rasterize);
+        progress.started = true;
+        progress.cursor = address;
+    }
+    if (!progress.finished)
+        execute_list(memory, address, stall, rasterize, progress.interrupts, submission, &progress);
+    if (last && !progress.ended) {
+        gpu_end_list(memory);
+        progress.ended = true;
+    }
 }
 
 } // namespace motorstorm

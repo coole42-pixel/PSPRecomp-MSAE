@@ -3,7 +3,9 @@
 #include "motorstorm_bootstrap.hpp"
 #include "motorstorm_audio.hpp"
 #include "motorstorm_ge.hpp"
+#include "motorstorm_arena.hpp"
 #include "motorstorm_gpu.hpp"
+#include "motorstorm_presentation.hpp"
 #include "motorstorm_window.hpp"
 #include "motorstorm_media.hpp"
 #include "motorstorm_atrac.hpp"
@@ -17,8 +19,14 @@
 #include "psprecomp/hle_savedata.hpp"
 #include "psprecomp/hle_sas.hpp"
 #include "psprecomp/runtime.hpp"
+#include <memory>
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <exception>
+#include <mutex>
+#include <thread>
 #include <array>
 #include <bit>
 #include <chrono>
@@ -242,7 +250,7 @@ std::int32_t g_next_callback_uid = 0x300;
 std::unordered_map<std::int32_t, std::vector<CallbackFrame>> g_callback_frames;
 std::unordered_map<std::int32_t, BlockRecord> g_blocks;
 std::int32_t g_next_block_uid = 0x400;
-std::uint32_t g_arena_next{};
+ArenaState g_arena;  // guest memory arena (see motorstorm_arena.hpp)
 std::uint32_t g_stack_next_top{};
 std::uint64_t g_virtual_time_us{};
 FrameRatePlan g_frame_rate;
@@ -309,14 +317,133 @@ std::uint32_t g_ge_stall_updates = 0;
 std::uint32_t g_ge_sync_calls = 0;
 bool g_ge_first_submission_logged = false;
 std::uint32_t g_ge_frame_dumps = 0;
+// One submitted GE list. The GE thread shares `progress` while it executes
+// the list in segments.
 struct GeListRecord {
     std::uint32_t id{};
     std::uint32_t list{};
     std::uint32_t stall{};
     std::uint32_t callback_id{};
     std::uint64_t submission{};
+    std::shared_ptr<GeListProgress> progress{std::make_shared<GeListProgress>()};
 };
 std::vector<GeListRecord> g_ge_list_records;
+
+// GE thread. Like the PSP's GE, a list renders while the CPU is still running:
+// each sceGeListUpdateStallAddr queues the commands it releases, and
+// sceGeDrawSync queues the rest, waits, and raises the GE callbacks. Commands
+// before the stall address are final, so the GE never sees later CPU writes.
+// The CPU also waits for the thread before a VRAM access publishes GPU
+// readbacks (gpu_set_publish_guard) and at shutdown.
+class GeThread {
+public:
+    struct Segment {
+        std::shared_ptr<GeListProgress> progress;
+        std::uint32_t list{}, stall{};
+        std::uint64_t submission{};
+        bool rasterize{}, last{};
+    };
+    ~GeThread() { stop(); }
+    void submit(Runtime &runtime, Segment segment) {
+        std::lock_guard lock(mutex_);
+        if (!thread_.joinable()) {
+            runtime_ = &runtime;
+            thread_ = std::thread([this] { run(); });
+        }
+        queue_.push_back(std::move(segment));
+        changed_.notify_all();
+    }
+    // Waits until every queued segment has run; rethrows a failure.
+    void wait() {
+        if (on_thread()) return;
+        std::unique_lock lock(mutex_);
+        changed_.wait(lock, [this] { return queue_.empty() && !busy_; });
+        if (error_) std::rethrow_exception(std::exchange(error_, nullptr));
+    }
+    bool on_thread() const noexcept { return std::this_thread::get_id() == id_.load(); }
+    void stop() {
+        {
+            std::unique_lock lock(mutex_);
+            if (!thread_.joinable()) return;
+            changed_.wait(lock, [this] { return queue_.empty() && !busy_; });
+            quit_ = true;
+            changed_.notify_all();
+        }
+        thread_.join();
+        quit_ = false;
+    }
+
+private:
+    void run() {
+        id_.store(std::this_thread::get_id());
+        for (;;) {
+            Segment segment;
+            bool failed{};
+            {
+                std::unique_lock lock(mutex_);
+                changed_.wait(lock, [this] { return !queue_.empty() || quit_; });
+                if (queue_.empty()) return;
+                segment = std::move(queue_.front());
+                queue_.pop_front();
+                busy_ = true;
+                failed = error_ != nullptr;
+            }
+            if (!failed) {
+                try {
+                    motorstorm::software_ge_execute_segment(runtime_->memory(), segment.list, segment.stall,
+                                                            segment.rasterize, segment.submission,
+                                                            *segment.progress, segment.last);
+                } catch (...) {
+                    std::lock_guard lock(mutex_);
+                    error_ = std::current_exception();
+                }
+            }
+            std::lock_guard lock(mutex_);
+            busy_ = false;
+            changed_.notify_all();
+        }
+    }
+    Runtime *runtime_{};
+    std::thread thread_;
+    std::atomic<std::thread::id> id_{};
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::deque<Segment> queue_;
+    bool busy_{}, quit_{};
+    std::exception_ptr error_;
+};
+GeThread g_ge_thread;
+void wait_for_ge_thread() { g_ge_thread.wait(); }
+// PSPRECOMP_MOTORSTORM_GE_THREAD=0 runs every list on the CPU thread at
+// sceGeDrawSync (the original ordering).
+bool ge_thread_enabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("PSPRECOMP_MOTORSTORM_GE_THREAD");
+        return !(value && (std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0));
+    }();
+    return enabled;
+}
+// Lists are rasterized once a renderer is active (SOFTGE_START_AFTER delays it).
+bool ge_rasterize() {
+    static const std::uint64_t start_after = [] {
+        const char *value = std::getenv("PSPRECOMP_MOTORSTORM_SOFTGE_START_AFTER");
+        return value != nullptr ? std::strtoull(value, nullptr, 0) : 0u;
+    }();
+    return (MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_SOFTGE") || gpu_requested()) &&
+           g_ge_submissions >= start_after;
+}
+// Queue the commands up to the record's stall on the GE thread. A stall at the
+// list start is not a bound (the walk would run on into unwritten memory).
+void update_racing_scene(Runtime &runtime);
+void queue_ge_segment(Runtime &runtime, const GeListRecord &record, bool last) {
+    if (!last && (record.stall == 0u || psprecomp::GuestMemory::canonical(record.stall) <=
+                                            psprecomp::GuestMemory::canonical(record.list)))
+        return;
+    if (!record.progress->started)
+        update_racing_scene(runtime);
+    g_ge_thread.submit(runtime, GeThread::Segment{record.progress, record.list, record.stall, record.submission,
+                                                  ge_rasterize(), last});
+}
 
 // Read-only, profile-gated scene diagnostics. These addresses are observations
 // from the guest scene runner, not state changes or gameplay bypasses.
@@ -354,7 +481,62 @@ void trace_game_state(const Runtime &runtime) {
 // object (0x08A76FDC, see trace_game_state) is 0x08A76044 during the race
 // countdown and 0x08A76064 while racing; the pause menu (0x08A76074), loading
 // screens, menus and movies are other scenes and keep the original image.
-void update_racing_scene(const Runtime &runtime) {
+// Widescreen at the source (see find_camera_aspects): while racing, the game's
+// camera objects get the window's aspect ratio so it renders and culls a true
+// wider view. The shader-side widening of 3D geometry is the fallback and
+// steps aside while a camera is patched. Originals are restored afterwards.
+struct WideCamera { std::uint32_t address{}, original{}, written{}; };
+void update_widescreen_camera(Runtime &runtime, bool racing) {
+    static std::vector<WideCamera> cameras;
+    static unsigned wait = 0u;
+    auto &memory = runtime.memory();
+    const auto restore = [&] {
+        for (const auto &camera : cameras)
+            if (memory.contains(camera.address, 4u) && memory.load32(camera.address) == camera.written)
+                memory.store32(camera.address, camera.original);
+        cameras.clear();
+        gpu_set_guest_widescreen(false);
+    };
+    if (!racing || !gpu_widescreen_enabled()) {
+        if (!cameras.empty()) restore();
+        wait = 0u;
+        return;
+    }
+    // A camera that is neither untouched nor ours has been freed or reused.
+    std::erase_if(cameras, [&](const WideCamera &camera) {
+        if (!memory.contains(camera.address, 4u)) return true;
+        const auto value = memory.load32(camera.address);
+        return value != camera.original && value != camera.written;
+    });
+    if (cameras.empty() && wait++ % 60u == 30u) {
+        constexpr std::uint32_t kFirst = 0x08800000u, kLast = 0x0A000000u;
+        constexpr std::uint32_t kStep = 1u << 20;
+        std::vector<std::uint8_t> chunk(kStep + 32u);  // the overlap catches a camera on a boundary
+        for (std::uint32_t base = kFirst; base < kLast; base += kStep) {
+            if (!memory.contains(base, chunk.size())) continue;
+            memory.copy_out(base, chunk);
+            for (const auto offset : find_camera_aspects(chunk.data(), chunk.size()))
+                if (offset < kStep) cameras.push_back({base + offset, memory.load32(base + offset), 0u});
+        }
+        if (!cameras.empty())
+            log_line(category::kGe, "widescreen: " + std::to_string(cameras.size()) + " game camera(s) found");
+    }
+    std::uint32_t width{}, height{};
+    gpu_output_size(width, height);
+    bool widened = false;
+    for (auto &camera : cameras) {
+        float original;
+        std::memcpy(&original, &camera.original, 4);
+        const float target = camera_target_aspect(original, width, height);
+        std::uint32_t bits;
+        std::memcpy(&bits, &target, 4);
+        camera.written = bits;
+        if (memory.load32(camera.address) != bits) memory.store32(camera.address, bits);
+        widened = widened || target > original;
+    }
+    gpu_set_guest_widescreen(widened);
+}
+void update_racing_scene(Runtime &runtime) {
     const auto &memory = runtime.memory();
     const auto scene = memory.contains(0x08A76FDCu, 4u) ? memory.load32(0x08A76FDCu) : 0u;
     const bool racing = scene == 0x08A76044u || scene == 0x08A76064u;
@@ -365,6 +547,7 @@ void update_racing_scene(const Runtime &runtime) {
         previous = racing;
     }
     gpu_set_racing(racing);
+    update_widescreen_camera(runtime, racing);
 }
 
 // Scheduler counters for the end-of-run census.
@@ -868,13 +1051,24 @@ void starvation_tick(Runtime &runtime, AllegrexContext &ctx) {
 // ---------------------------------------------------------------------------
 
 [[nodiscard]] std::uint32_t arena_allocate(std::uint32_t size, std::uint32_t alignment) {
+    return arena_take(g_arena, size, alignment, kUserRamTop - kModuleThreadStackSize);
+}
+
+// Gives a block back, zeroed as fresh arena memory is.
+void arena_release(Runtime &runtime, std::uint32_t address, std::uint32_t size) {
     if (size == 0u) size = 16u;
-    if (alignment < 4u) alignment = 4u;
-    const std::uint32_t base = (g_arena_next + alignment - 1u) & ~(alignment - 1u);
-    if (base < g_arena_next) return 0u;
-    if (static_cast<std::uint64_t>(base) + size > kUserRamTop - kModuleThreadStackSize) return 0u;
-    g_arena_next = base + size;
-    return base;
+    if (address == 0u || address >= g_arena.next) return;
+    size = std::min(size, g_arena.next - address);
+    runtime.memory().zero(address, size);
+    arena_give_back(g_arena, address, size);
+}
+// Frees a recorded block (any allocation API); false when the id is unknown.
+bool free_block(Runtime &runtime, std::int32_t uid) {
+    const auto found = g_blocks.find(uid);
+    if (found == g_blocks.end()) return false;
+    arena_release(runtime, found->second.address, found->second.size);
+    g_blocks.erase(found);
+    return true;
 }
 
 [[nodiscard]] bool allocate_thread_stack(std::uint32_t size, std::uint32_t &bottom, std::uint32_t &top) {
@@ -883,7 +1077,7 @@ void starvation_tick(Runtime &runtime, AllegrexContext &ctx) {
     top = g_stack_next_top & ~0xFFu;
     if (top < aligned) return false;
     bottom = top - aligned;
-    if (bottom < g_arena_next) return false;
+    if (bottom < g_arena.next) return false;
     g_stack_next_top = bottom;
     return true;
 }
@@ -1118,7 +1312,8 @@ void switch_frame_rate(GuestMemory &memory, const FrameRatePlan &next, const std
         else if (saved > 0.0f)
             store_float(memory, kTimestepSavedStep, saved * (previous_fps / next.game_fps));
     }
-    hle_line("frame rate: now " + std::to_string(next.game_fps) + " fps (" + reason + ")");
+    hle_line("frame rate: now " + std::to_string(next.game_fps) + " fps at guest " +
+             std::to_string(g_virtual_time_us / 1000000u) + " s (" + reason + ")");
 }
 
 struct Pacer {
@@ -1128,6 +1323,8 @@ struct Pacer {
     // Loading work seen at the previous sample (see loading_activity).
     std::uint64_t sample_uploads{}, sample_replacements{}, sample_pack_loads{};
     std::uint64_t fallbacks{}, restores{};
+    // Governor samples: total, ignored as loading work, and below real time.
+    std::uint64_t samples{}, disturbed{}, slow{};
     FrameRateGovernor governor;
 };
 Pacer g_pacer;
@@ -1150,9 +1347,18 @@ bool loading_activity(double seconds) {
     const auto gpu = gpu_report();
     const auto pack = textures::stats();
     const auto uploads = gpu.texture_uploads - gpu.streamed_texture_updates;
-    const bool busy = gpu.replacement_uploads != g_pacer.sample_replacements ||
-                      pack.loaded != g_pacer.sample_pack_loads ||
-                      static_cast<double>(uploads - std::min(uploads, g_pacer.sample_uploads)) > 96.0 * seconds;
+    // Only a burst counts as loading. Races keep uploading textures: texture
+    // packs stream replacements in the background, and on heavy tracks such as
+    // Anguta Glacier the game itself uploads 100-250 textures per second all
+    // race long. Lower thresholds marked most race samples as loading, which
+    // delayed the 30 fps fallback by half a minute while the game ran slowly.
+    const auto delta = [](std::uint64_t now, std::uint64_t before) {
+        return static_cast<double>(now - std::min(now, before));
+    };
+    const double burst = 16.0 * seconds;
+    const bool busy = delta(gpu.replacement_uploads, g_pacer.sample_replacements) > burst ||
+                      delta(pack.loaded, g_pacer.sample_pack_loads) > burst ||
+                      delta(uploads, g_pacer.sample_uploads) > 600.0 * seconds;
     g_pacer.sample_uploads = uploads;
     g_pacer.sample_replacements = gpu.replacement_uploads;
     g_pacer.sample_pack_loads = pack.loaded;
@@ -1216,6 +1422,10 @@ void pace_frame(GuestMemory &memory) {
         restart();
         return;
     }
+    ++g_pacer.samples;
+    if (loading) ++g_pacer.disturbed;
+    if (static_cast<double>(g_virtual_time_us - g_pacer.sample_guest) / 1e6 < FrameRateGovernor::kSlowRatio * sample_seconds)
+        ++g_pacer.slow;
     const auto decision = g_pacer.governor.update(
         sample_seconds, static_cast<double>(g_virtual_time_us - g_pacer.sample_guest) / 1e6,
         static_cast<double>(idle - g_pacer.sample_idle) / 1e6, at_target,
@@ -1264,9 +1474,10 @@ void install_frame_rate(Runtime &runtime) {
 } // namespace
 
 void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOptions &options) {
+    gpu_set_publish_guard(wait_for_ge_thread);
     g_options = options;
     g_installed = true;
-    g_arena_next = (user_arena_start + 0xFFu) & ~0xFFu;
+    g_arena.next = (user_arena_start + 0xFFu) & ~0xFFu;
     g_stack_next_top = kUserRamTop - kModuleThreadStackSize;
     psprecomp::reset_sas_hle_state();
     psprecomp::reset_audio_output2_state();
@@ -1281,6 +1492,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
     g_callbacks.clear();
     g_callback_frames.clear();
     g_blocks.clear();
+    g_arena.free.clear();
     g_files.clear();
     g_import_calls.clear();
     g_reported_missing.clear();
@@ -1437,9 +1649,9 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
             ctx.set_gpr(2, static_cast<std::uint32_t>(uid));
         });
     register_import(runtime, "SysMemUserForUser", 0xB6D61D02u, "sceKernelFreePartitionMemory",
-        [](Runtime &, AllegrexContext &ctx) {
+        [](Runtime &rt, AllegrexContext &ctx) {
             const auto uid = static_cast<std::int32_t>(ctx.gpr[4]);
-            ctx.set_gpr(2, g_blocks.erase(uid) == 1u ? 0u : 0x800200CBu);
+            ctx.set_gpr(2, free_block(rt, uid) ? 0u : 0x800200CBu);
         });
     register_import(runtime, "SysMemUserForUser", 0x9D9A5BA1u, "sceKernelGetBlockHeadAddr",
         [](Runtime &, AllegrexContext &ctx) {
@@ -1448,11 +1660,11 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
         });
     register_import(runtime, "SysMemUserForUser", 0xA291F107u, "sceKernelMaxFreeMemSize",
         [](Runtime &, AllegrexContext &ctx) {
-            ctx.set_gpr(2, kUserRamTop - kModuleThreadStackSize - g_arena_next);
+            ctx.set_gpr(2, arena_free_largest(g_arena, kUserRamTop - kModuleThreadStackSize));
         });
     register_import(runtime, "SysMemUserForUser", 0xF919F628u, "sceKernelTotalFreeMemSize",
         [](Runtime &, AllegrexContext &ctx) {
-            ctx.set_gpr(2, kUserRamTop - kModuleThreadStackSize - g_arena_next);
+            ctx.set_gpr(2, arena_free_total(g_arena, kUserRamTop - kModuleThreadStackSize));
         });
     register_import(runtime, "SysMemUserForUser", 0x13A5ABEFu, "sceKernelPrintf",
         [](Runtime &rt, AllegrexContext &ctx) {
@@ -1500,9 +1712,9 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
             ctx.set_gpr(2, 0u);
         });
     register_import(runtime, "SysMemUserForUser", 0x50F61D8Au, "sceKernelFreeMemoryBlock",
-        [](Runtime &, AllegrexContext &ctx) {
+        [](Runtime &rt, AllegrexContext &ctx) {
             const auto uid = static_cast<std::int32_t>(ctx.gpr[4]);
-            ctx.set_gpr(2, g_blocks.erase(uid) == 1u ? 0u : static_cast<std::uint32_t>(-1));
+            ctx.set_gpr(2, free_block(rt, uid) ? 0u : static_cast<std::uint32_t>(-1));
         });
 
     // -----------------------------------------------------------------------
@@ -2626,8 +2838,8 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
     register_import(runtime, "ThreadManForUser", 0xF6414A71u, "sceKernelFreeFpl",
         [](Runtime &, AllegrexContext &ctx) { ctx.set_gpr(2, 0u); });
     register_import(runtime, "ThreadManForUser", 0xED1410E0u, "sceKernelDeleteFpl",
-        [](Runtime &, AllegrexContext &ctx) {
-            ctx.set_gpr(2, g_blocks.erase(static_cast<std::int32_t>(ctx.gpr[4])) == 1u ? 0u : 0x80020198u);
+        [](Runtime &rt, AllegrexContext &ctx) {
+            ctx.set_gpr(2, free_block(rt, static_cast<std::int32_t>(ctx.gpr[4])) ? 0u : 0x80020198u);
         });
     register_import(runtime, "ThreadManForUser", 0x56C039B5u, "sceKernelCreateVpl",
         [](Runtime &rt, AllegrexContext &ctx) {
@@ -2658,8 +2870,8 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
             ctx.set_gpr(2, 0u);
         });
     register_import(runtime, "ThreadManForUser", 0x89B3D48Cu, "sceKernelDeleteVpl",
-        [](Runtime &, AllegrexContext &ctx) {
-            ctx.set_gpr(2, g_blocks.erase(static_cast<std::int32_t>(ctx.gpr[4])) == 1u ? 0u : 0x80020198u);
+        [](Runtime &rt, AllegrexContext &ctx) {
+            ctx.set_gpr(2, free_block(rt, static_cast<std::int32_t>(ctx.gpr[4])) ? 0u : 0x80020198u);
         });
     register_import(runtime, "ThreadManForUser", 0xB736E9FFu, "sceKernelFreeVpl",
         [](Runtime &, AllegrexContext &ctx) { ctx.set_gpr(2, 0u); });
@@ -3508,14 +3720,17 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
             ctx.set_gpr(2, 0u);
         });
     register_import(runtime, "sceGe_user", 0xE0D68148u, "sceGeListUpdateStallAddr",
-        [](Runtime &, AllegrexContext &ctx) {
+        [](Runtime &rt, AllegrexContext &ctx) {
             if (g_ge_stall_updates++ < 8u) {
                 log_line(category::kGe, "sceGeListUpdateStallAddr list=" + hex32(ctx.gpr[4]) +
                                             " stall=" + hex32(ctx.gpr[5]));
             }
             const std::uint32_t list_id = ctx.gpr[4];
             for (auto &record : g_ge_list_records) {
-                if (record.id == list_id) record.stall = ctx.gpr[5];
+                if (record.id != list_id) continue;
+                record.stall = ctx.gpr[5];
+                if (ge_thread_enabled() && ge_rasterize())
+                    queue_ge_segment(rt, record, false);
             }
             ctx.set_gpr(2, 0u);
         });
@@ -3548,15 +3763,22 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
                     out << "\nend-list\n";
                 }
             }
-            static const std::uint64_t start_after = [] {
-                const char *value = std::getenv("PSPRECOMP_MOTORSTORM_SOFTGE_START_AFTER");
-                return value != nullptr ? std::strtoull(value, nullptr, 0) : 0u;
-            }();
-            const bool rasterize = (MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_SOFTGE") || gpu_requested()) &&
-                g_ge_submissions >= start_after;
+            const bool rasterize = ge_rasterize();
+            const bool threaded = rasterize && ge_thread_enabled();
+            if (threaded) {
+                for (const auto &record : g_ge_list_records)
+                    queue_ge_segment(rt, record, true);
+                g_ge_thread.wait();
+            }
             for (const auto &record : g_ge_list_records) {
-                update_racing_scene(rt);
-                const auto interrupts = motorstorm::software_ge_execute_list(rt.memory(), record.list, record.stall, rasterize, record.submission);
+                std::vector<GeInterrupt> interrupts;
+                if (threaded) {
+                    interrupts = std::move(record.progress->interrupts);
+                } else {
+                    update_racing_scene(rt);
+                    interrupts = motorstorm::software_ge_execute_list(rt.memory(), record.list, record.stall,
+                                                                      rasterize, record.submission);
+                }
                 const auto found = g_ge_callback_table.find(record.callback_id);
                 if (found == g_ge_callback_table.end()) continue;
                 for (const auto &event : interrupts) {
@@ -3685,8 +3907,11 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
                         const char *dump_root=std::getenv("PSPRECOMP_MOTORSTORM_FRAME_DUMP_DIR");
                         const auto root=dump_root?std::filesystem::path(dump_root):std::filesystem::path("out/motorstorm");
                         const auto path=root/("frame_"+std::to_string(dump_slot)+"_gpu.ppm");
+                        // Pack RGBA to RGB first: one write instead of one per pixel.
+                        std::vector<std::uint8_t> rgb(image.rgba.size()/4*3);
+                        for(std::size_t i=0,o=0;i<image.rgba.size();i+=4,o+=3) std::memcpy(rgb.data()+o,image.rgba.data()+i,3);
                         std::ofstream ppm(path,std::ios::binary); ppm<<"P6\n"<<image.width<<' '<<image.height<<"\n255\n";
-                        for(std::size_t i=0;i<image.rgba.size();i+=4) ppm.write(reinterpret_cast<const char *>(image.rgba.data()+i),3);
+                        ppm.write(reinterpret_cast<const char *>(rgb.data()),static_cast<std::streamsize>(rgb.size()));
                         log_line(category::kGe,"GPU output dump written: "+path.string());
                     }
                 }
@@ -4505,9 +4730,18 @@ std::uint64_t guest_time_us() { return g_virtual_time_us; }
 bool frame_rate_unlocked() { return g_frame_rate.unlocked; }
 
 void report_summary() {
+    try {
+        g_ge_thread.stop();
+    } catch (const std::exception &error) {
+        error_line(std::string("GE thread: ") + error.what());
+    }
     window_shutdown();
     audio_shutdown();
     if (window_close_requested()) hle_line("native window closed by the user");
+    if (g_pacer.samples != 0u)
+        hle_line("frame-rate governor: samples=" + std::to_string(g_pacer.samples) +
+                 " below_real_time=" + std::to_string(g_pacer.slow) + " loading=" + std::to_string(g_pacer.disturbed) +
+                 " fallbacks=" + std::to_string(g_pacer.fallbacks) + " restores=" + std::to_string(g_pacer.restores));
     {
         std::vector<std::pair<std::string, std::uint64_t>> imports(g_import_calls.begin(),
                                                                    g_import_calls.end());
@@ -4568,6 +4802,13 @@ void report_summary() {
             out << "D3D12 adapter=\"" << gpu.adapter << "\" draws=" << gpu.draws
                 << " hardware_transform_draws=" << gpu.hardware_transform_draws << " vertices=" << gpu.vertices
                 << " submissions=" << gpu.submissions << " texture_uploads=" << gpu.texture_uploads
+                << " publishes(draw/sync/end/cpu/start/other)=" << gpu.publishes[0] << '/' << gpu.publishes[1] << '/'
+                << gpu.publishes[2] << '/' << gpu.publishes[3] << '/' << gpu.publishes[4] << '/' << gpu.publishes[5]
+                << " publish_waits=" << gpu.publish_waits[0] << '/' << gpu.publish_waits[1] << '/' << gpu.publish_waits[2]
+                << '/' << gpu.publish_waits[3] << '/' << gpu.publish_waits[4] << '/' << gpu.publish_waits[5]
+                << " publish_wait_ms=" << gpu.publish_wait_ns[0] / 1000000u << '/' << gpu.publish_wait_ns[1] / 1000000u
+                << '/' << gpu.publish_wait_ns[2] / 1000000u << '/' << gpu.publish_wait_ns[3] / 1000000u << '/'
+                << gpu.publish_wait_ns[4] / 1000000u << '/' << gpu.publish_wait_ns[5] / 1000000u
                 << " feedback_syncs=" << gpu.feedback_syncs << " feedback_draws=" << gpu.feedback_draws << " software_draws=" << gpu.software_draws
                 << " presents=" << gpu.presents << " skipped_presents=" << gpu.skipped_presents
                 << " superseded_presents=" << gpu.superseded_presents
@@ -4579,8 +4820,7 @@ void report_summary() {
                 out << " post_gpu_frames=" << gpu.post_gpu_frames
                     << " post_resolve_ms=" << gpu.post_gpu_ns[0]*scale
                     << " post_deband_ms=" << gpu.post_gpu_ns[1]*scale
-                    << " post_bloom_ms=" << gpu.post_gpu_ns[2]*scale
-                    << " post_color_ms=" << gpu.post_gpu_ns[3]*scale
+                    << " post_color_ms=" << gpu.post_gpu_ns[2]*scale
                     << " post_max_ms=" << gpu.post_gpu_max_ns*1.0e-6;
             }
             out << " output=" << gpu.resolution_scale*480 << 'x' << gpu.resolution_scale*272
@@ -4607,7 +4847,8 @@ void report_summary() {
             << " pixels=" << summary.pixels_drawn << " colored=" << summary.pixels_colored
             << " textured_draws=" << summary.textured_draws
             << " vertex_decodes=" << summary.vertex_decodes << " vertex_cache_hits=" << summary.vertex_cache_hits
-            << " transfers=" << summary.block_transfers << " transferred_bytes=" << summary.transferred_bytes;
+            << " transfers=" << summary.block_transfers << " transfer_syncs=" << summary.transfer_syncs << " clut_syncs=" << summary.clut_syncs
+            << " transferred_bytes=" << summary.transferred_bytes;
         log_line(category::kGe, out.str());
     }
     {

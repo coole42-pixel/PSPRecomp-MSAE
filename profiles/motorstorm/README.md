@@ -51,8 +51,8 @@ See [SSAA performance and audio recovery](docs/PERFORMANCE_AUDIO_SSAA.md) for
 the current quality-preserving optimization, frame comparisons and audio checks.
 See [widescreen and post effects](docs/WIDESCREEN_POST.md) for the implementation
 and validation of the aspect and image-effect fixes.
-See [HUD mask, depth snapshot and bloom](docs/POST_HUD_DEPTH_BLOOM.md) for the race HUD exemption,
-the depth snapshot and the optional bloom pass.
+See [remaining post effects and debug presets](docs/POST_EFFECTS.md) for the
+supported enhancements and the cleaned native/full-debug configurations.
 
 The launcher selects hardware D3D12 rendering. It requires a D3D12 GPU with rasterizer ordered views. Use `-Renderer software` for the software reference or `-Renderer auto` to allow a reported software fallback. `-Bringup` enables historical scene skips for diagnostics; normal play leaves it off.
 
@@ -60,7 +60,7 @@ The launcher selects hardware D3D12 rendering. It requires a D3D12 GPU with rast
 
 `[graphics] fps` in the INI (or `run.ps1 -Fps`) sets the frame rate. The default is 60. `original` keeps the retail 30 fps pacing (20 fps in heavier scenes). Values from 30 to 240 replace the game's vblank interval and its timestep (the setter at `0x0891BF0C`), so the simulation runs at real speed. Movies stay at their own 29.97 fps. 30 and 60 keep the PSP's 60 Hz vblank; any other value runs the virtual display at that rate. If the PC cannot simulate that many frames per second, the game runs in slow motion. `tools/bench-race.ps1` and `tools/validate-renderer.ps1` default to `-Fps original` so their results stay comparable with the 30 fps baselines.
 
-`dynamic_fps = true` (the default) drops to the original 30 fps pacing while the PC cannot hold the target, instead of slow motion and audio gaps, and returns to the target when it can. With audio disabled, a wall-clock limiter keeps the game at real speed. See [docs/PERFORMANCE_60FPS.md](docs/PERFORMANCE_60FPS.md) for the presentation and readback changes and measurements.
+`dynamic_fps = true` (the default) drops to the original 30 fps pacing while the PC cannot hold the target, instead of slow motion and audio gaps, and returns to the target when it can. With audio disabled, a wall-clock limiter keeps the game at real speed. See [docs/PERFORMANCE_60FPS.md](docs/PERFORMANCE_60FPS.md) for the presentation and readback changes and measurements. GE lists render on their own thread while the game keeps running, as on the PSP (`PSPRECOMP_MOTORSTORM_GE_THREAD=0` disables it); see [docs/PERFORMANCE_RACE_BENCH.md](docs/PERFORMANCE_RACE_BENCH.md).
 
 Texture packs: `tools/extract-textures.ps1` extracts every texture from the disc files (no game run) as `<hash>_<w>x<h>.png`. Upscaled copies (or BC7 DDS from `tools/pack-textures.ps1`) placed in `textures/replace` beside the executable replace them in game, at any resolution, loaded in the background. See [docs/TEXTURE_PACKS.md](docs/TEXTURE_PACKS.md).
 

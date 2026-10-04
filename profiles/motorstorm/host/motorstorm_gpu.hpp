@@ -61,9 +61,12 @@ struct GpuReport {
     std::uint64_t draws{}, hardware_transform_draws{}, vertices{}, submissions{}, texture_uploads{},
         feedback_syncs{}, feedback_draws{}, software_draws{}, presents{}, skipped_presents{}, superseded_presents{},
         replaced_draws{}, replacement_uploads{}, replacements_evicted{}, streamed_texture_updates{};
-    // Optional asynchronous GPU timestamp totals: resolve, deband, bloom, colour.
+    // Optional asynchronous GPU timestamp totals: resolve, deband, colour.
     std::uint64_t post_gpu_frames{}, post_gpu_max_ns{};
-    std::array<std::uint64_t, 4> post_gpu_ns{};
+    // Readback publishes by trigger: draw, sync, list end, CPU VRAM access,
+    // list start, other. Count, of which waited on the GPU, and wait time.
+    std::array<std::uint64_t, 6> publishes{}, publish_waits{}, publish_wait_ns{};
+    std::array<std::uint64_t, 3> post_gpu_ns{};
     bool active{};
     std::uint32_t resolution_scale{1}, raster_half{2}, antialiasing{};  // raster scale in half units
 };
@@ -96,7 +99,20 @@ void gpu_sync(psprecomp::GuestMemory &);
 void gpu_end_list(psprecomp::GuestMemory &);
 void gpu_settle(psprecomp::GuestMemory &);
 void gpu_set_deferred_readback(bool enabled) noexcept;
-void gpu_sync_texture(psprecomp::GuestMemory &, std::uint32_t address, std::uint32_t bytes);
+// Returns true when the bytes overlapped a drawn target and forced a sync.
+bool gpu_sync_texture(psprecomp::GuestMemory &, std::uint32_t address, std::uint32_t bytes);
+// A GE block transfer whose source lies in a target drawn by the current list:
+// the GPU snapshots the rows and they reach guest memory at the next publish,
+// so the list continues without waiting. False: the caller must sync and copy.
+bool gpu_transfer_from_target(std::uint32_t source, std::uint32_t source_stride, std::uint32_t source_x,
+                              std::uint32_t source_y, std::uint32_t destination, std::uint32_t destination_stride,
+                              std::uint32_t destination_x, std::uint32_t destination_y, std::uint32_t width,
+                              std::uint32_t height, std::uint32_t bpp);
+// Called before a CPU access to VRAM publishes GPU readbacks: the HLE waits
+// there for its GE thread, which owns the renderer while it runs lists.
+void gpu_set_publish_guard(void (*guard)()) noexcept;
+// Any render target (drawn, pending readback or cached) overlaps these guest bytes.
+bool gpu_touches_surface(std::uint32_t address, std::uint32_t bytes) noexcept;
 bool gpu_feedback_available(std::uint32_t address, std::uint32_t stride, std::uint32_t format) noexcept;
 void gpu_note_software_draw() noexcept;
 GpuReport gpu_report();
@@ -120,6 +136,13 @@ void gpu_set_output_size(std::uint32_t width, std::uint32_t height) noexcept;
 // The game is racing (countdown or race): the [enhancements] effects apply to
 // the frames drawn and presented from now on. Set by the HLE at every flip.
 void gpu_set_racing(bool racing) noexcept;
+// [graphics] widescreen = auto on the D3D12 renderer.
+bool gpu_widescreen_enabled() noexcept;
+// The presentation window's client size (what widescreen adapts to).
+void gpu_output_size(std::uint32_t &width, std::uint32_t &height) noexcept;
+// The game itself renders the wider view (its camera aspect was raised), so 3D
+// geometry must not be widened again in the vertex shader. HUD handling is unchanged.
+void gpu_set_guest_widescreen(bool active) noexcept;
 bool gpu_present(psprecomp::GuestMemory &, void *window, std::uint32_t framebuffer,
                  std::uint32_t stride, std::uint32_t format, std::uint32_t width, std::uint32_t height);
 } // namespace motorstorm
