@@ -24,9 +24,18 @@ struct PostSettings {
     float lut_strength{1.0f};
     bool sharpening{true};
     float sharpening_strength{0.2f};
+    // Keep the race HUD (through-mode draws) out of the colour grade: it is
+    // tagged while drawing and left as the game drew it. Needs no other effect.
+    bool hud_ungraded{true};
+    // Bloom from the bright part of the expanded scene light, added before tone
+    // mapping. It works on the AgX scene light, so it needs tonemapping = agx.
+    bool bloom{false};
+    float bloom_strength{0.15f};   // 0..1
+    float bloom_threshold{3.0f};   // scene light units after the SDR expansion
+    [[nodiscard]] bool bloom_active() const noexcept { return enabled && bloom && agx; }
     // True when any effect is on (the master switch included).
     [[nodiscard]] bool active() const noexcept {
-        return enabled && (extended_color || agx || color_correction || lut || sharpening);
+        return enabled && (extended_color || agx || color_correction || lut || sharpening || bloom_active());
     }
 };
 // Reads the PSPRECOMP_MOTORSTORM_POST_* options (filled from the INI by

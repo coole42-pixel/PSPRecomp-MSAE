@@ -13,7 +13,7 @@ struct NativeConfig {
     bool loaded{};
     std::string eboot, disc_root, log_file;
     std::uint64_t max_dispatches{4'000'000'000ull};
-    std::string renderer{"d3d12"}, antialiasing{"ssaa4x"};
+    std::string renderer{"d3d12"}, antialiasing{"fxaa"};
     std::uint32_t resolution{4}, window_scale{2};
     std::uint32_t fps{60};  // 0 = the game's original 30 fps pacing
     bool window{true}, fullscreen{}, audio{true};
@@ -30,11 +30,13 @@ struct NativeConfig {
     std::uint32_t texture_budget_mb{1024};
     // [enhancements]: race-only image effects (see motorstorm_post.hpp). Kept
     // as the INI text; reals are validated here and parsed by the renderer.
-    bool post{true}, post_color_correction{true}, post_lut{true}, post_sharpen{true};
+    bool post{true}, post_color_correction{true}, post_lut{true}, post_sharpen{true}, post_hud_ungraded{true},
+        post_bloom{};
     std::uint32_t post_color_depth{32};
     std::string post_tonemap{"agx"}, post_agx_look{"punchy"};
     std::string post_hdr_peak{"6.0"}, post_exposure{"0.0"}, post_contrast{"1.0"}, post_saturation{"1.0"},
-        post_temperature{"0.0"}, post_tint{"0.0"}, post_lut_strength{"1.0"}, post_sharpen_strength{"0.2"};
+        post_temperature{"0.0"}, post_tint{"0.0"}, post_lut_strength{"1.0"}, post_sharpen_strength{"0.2"}, post_bloom_strength{"0.15"},
+        post_bloom_threshold{"3.0"};
     std::filesystem::path post_lut_file;
     bool trace_imports{}, trace_filesystem{}, verbose{};
     std::vector<std::pair<std::string, std::string>> debug_environment;

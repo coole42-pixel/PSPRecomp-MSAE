@@ -398,6 +398,87 @@ void post_pixels() {
                 throw std::runtime_error("Async float32 post output must equal reference shader pixels");
         }
     std::puts("Async float32 post colour matches reference pixels for all looks, grades and fades");
+    // HUD mask: pixels tagged in the depth snapshot keep the game's colours;
+    // everything beyond the mask and the sharpening footprint is graded exactly as before.
+    for (unsigned y = 0; y < input.height; ++y)
+        for (unsigned x = 0; x < input.width; ++x) {
+            auto *p = input.rgba.data() + (y * input.width + x) * 4;
+            p[0] = p[1] = p[2] = static_cast<std::uint8_t>(120 + (x + y) % 3);
+        }
+    settings = motorstorm::PostSettings{};
+    std::vector<std::uint32_t> tags(input.width * input.height, 777u), untagged = tags;
+    for (unsigned y = 2; y <= 5; ++y)
+        for (unsigned x = 100; x <= 140; ++x)
+            tags[y * input.width + x] |= 0x10000u;
+    const auto graded = motorstorm::gpu_debug_post(input, settings, 1.0f);
+    if (motorstorm::gpu_debug_post(input, settings, 1.0f, false, &untagged).rgba != graded.rgba)
+        throw std::runtime_error("A depth snapshot without HUD tags must not change the post image");
+    const auto masked = motorstorm::gpu_debug_post(input, settings, 1.0f, false, &tags);
+    if (masked.rgba != motorstorm::gpu_debug_post(input, settings, 1.0f, true, &tags).rgba)
+        throw std::runtime_error("HUD mask must match between the async and reference post paths");
+    unsigned graded_in_hud = 0;
+    for (unsigned y = 0; y < input.height; ++y)
+        for (unsigned x = 0; x < input.width; ++x) {
+            const bool hud = y >= 2 && y <= 5 && x >= 100 && x <= 140;
+            // The mask, its one-pixel dilation and the sharpening footprint reach 3 pixels out.
+            const bool distant = (x <= 97 || x >= 143);
+            for (unsigned c = 0; c < 3; ++c) {
+                const int in = input.rgba[(y * input.width + x) * 4 + c];
+                const int g = graded.rgba[(y * input.width + x) * 4 + c];
+                const int m = masked.rgba[(y * input.width + x) * 4 + c];
+                if (hud && std::abs(m - in) > 1)  // only the final dither may touch the HUD
+                    throw std::runtime_error("HUD pixels must keep the game's colours");
+                if (hud && std::abs(g - in) > 1) ++graded_in_hud;
+                if (distant && m != g)
+                    throw std::runtime_error("The HUD mask must not change pixels away from the HUD");
+            }
+        }
+    if (graded_in_hud < 100)
+        throw std::runtime_error("The HUD mask test needs a grade that actually changes those pixels");
+    std::puts("HUD mask: tagged pixels keep game colours, distant pixels graded exactly as before");
+    // Bloom: a bright square glows into its surroundings; nothing changes where
+    // there is no highlight or far from it; the HUD never blooms; fade 0 is exact.
+    {
+        constexpr unsigned kW = 192, kH = 24;
+        motorstorm::GpuImage scene{kW, kH, std::vector<std::uint8_t>(kW * kH * 4)};
+        std::vector<std::uint32_t> square_tags(kW * kH, 0u);
+        for (unsigned y = 0; y < kH; ++y)
+            for (unsigned x = 0; x < kW; ++x) {
+                auto *p = scene.rgba.data() + (y * kW + x) * 4;
+                const bool bright = x >= 10 && x < 16 && y >= 9 && y < 15;
+                p[0] = p[1] = p[2] = bright ? 255 : 40;
+                p[3] = 255;
+                if (bright) square_tags[y * kW + x] = 0x10000u;
+            }
+        motorstorm::PostSettings off, on;
+        on.bloom = true; on.bloom_strength = 0.5f; on.bloom_threshold = 1.0f;
+        const auto lum = [](const motorstorm::GpuImage &image, unsigned x, unsigned y) {
+            const auto *p = image.rgba.data() + (y * image.width + x) * 4;
+            return static_cast<int>(p[0]) + p[1] + p[2];
+        };
+        const auto plain = motorstorm::gpu_debug_post(scene, off, 1.0f);
+        const auto glow = motorstorm::gpu_debug_post(scene, on, 1.0f);
+        if (lum(glow, 19, 12) < lum(plain, 19, 12) + 6 || lum(glow, 12, 5) < lum(plain, 12, 5) + 6)
+            throw std::runtime_error("Bloom must brighten the surroundings of a highlight");
+        if (lum(glow, 180, 12) != lum(plain, 180, 12) || lum(glow, 180, 2) != lum(plain, 180, 2))
+            throw std::runtime_error("Bloom must not reach far from its highlight");
+        if (motorstorm::gpu_debug_post(scene, on, 1.0f, true).rgba != glow.rgba)
+            throw std::runtime_error("Bloom must match between the async and reference post paths");
+        if (motorstorm::gpu_debug_post(scene, on, 0.0f).rgba != scene.rgba)
+            throw std::runtime_error("Zero fade must preserve the original pixels with bloom on");
+        motorstorm::GpuImage dark = scene;
+        for (std::size_t p = 0; p < dark.rgba.size(); p += 4) dark.rgba[p] = dark.rgba[p + 1] = dark.rgba[p + 2] = 40;
+        if (motorstorm::gpu_debug_post(dark, on, 1.0f).rgba != motorstorm::gpu_debug_post(dark, off, 1.0f).rgba)
+            throw std::runtime_error("Bloom must change nothing without a highlight above the threshold");
+        const auto hud_glow = motorstorm::gpu_debug_post(scene, on, 1.0f, false, &square_tags);
+        const auto hud_plain = motorstorm::gpu_debug_post(scene, off, 1.0f, false, &square_tags);
+        if (hud_glow.rgba != hud_plain.rgba)
+            throw std::runtime_error("The HUD must not bloom");
+        on.agx = false;
+        if (on.bloom_active() || motorstorm::gpu_debug_post(scene, on, 1.0f).rgba != motorstorm::gpu_debug_post(scene, [&] { auto s = off; s.agx = false; return s; }(), 1.0f).rgba)
+            throw std::runtime_error("Bloom needs AgX tone mapping and must switch itself off without it");
+        std::puts("Bloom: glow around highlights only, async == reference, fade-exact, HUD excluded");
+    }
     std::puts("GPU post pixels: all AgX looks/peaks calibrated, highlight shoulder and complete fade verified");
 }
 
@@ -468,6 +549,63 @@ void widescreen_pixels(psprecomp::GuestMemory &memory) {
     std::puts("GPU widescreen: 16:9 / 21:9 / 32:9 Hor+, HUD/scissors, overlays, menus and PSP opt-out passed");
 }
 
+// The race HUD (through-mode draws) is tagged in the depth words while racing;
+// the game's own view of the depth buffer must stay exactly what it was.
+void hud_tag_pixels(psprecomp::GuestMemory &memory) {
+    constexpr std::uint32_t kStride = 512, kRows = 296;  // the race framebuffer is 512x296
+    const auto run = [&](bool racing, const char *hud_ungraded) {
+        motorstorm::gpu_shutdown();
+        _putenv_s("PSPRECOMP_MOTORSTORM_POST_HUD_UNGRADED", hud_ungraded);
+        motorstorm::gpu_set_output_size(480, 272);
+        motorstorm::gpu_set_racing(racing);
+        memory.zero(kColor, kStride * kRows * 4);
+        for (std::uint32_t i = 0; i < kStride * kRows; ++i) memory.store16(kDepth + i * 2, 40000);
+        motorstorm::gpu_initialize();
+        motorstorm::GpuDraw draw;
+        draw.framebuffer = kColor; draw.stride = kStride; draw.format = 3;
+        draw.depthbuffer = kDepth; draw.depth_stride = kStride;
+        draw.right = kStride; draw.bottom = kRows;
+        draw.model_to_clip = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        draw.scale = {240, -136, 1, 0}; draw.center = {240, 136, 1000, 0};
+        const auto v = [](float x, float y) { return motorstorm::GpuVertex{x, y, 0, 0xFFFFFFFFu}; };
+        const auto quad = [&](float l, float t, float r, float b) {
+            return std::array{v(l,t), v(r,t), v(l,b), v(l,b), v(r,t), v(r,b)};
+        };
+        // The 3D scene: depth test (always) and depth write on, depth 1000.
+        draw.hardware_transform = true;
+        draw.commands[0x23] = 1; draw.commands[0xDE] = 1;
+        motorstorm::gpu_submit(memory, draw, quad(-0.5f, -0.5f, 0.0f, 0.5f), nullptr);
+        // The HUD: through mode in screen coordinates, depth test off.
+        draw.hardware_transform = false;
+        draw.commands[0x23] = 0;
+        motorstorm::gpu_submit(memory, draw, quad(200, 100, 320, 160), nullptr);
+        motorstorm::gpu_sync(memory);
+        return motorstorm::gpu_debug_depth_words(memory, kColor, kStride, 3, 480, 272);
+    };
+    const auto at = [](const std::vector<std::uint32_t> &words, unsigned x, unsigned y) { return words[y * 480 + x]; };
+    const auto tagged = run(true, "1");
+    if (tagged.size() != 480u * 272u)
+        throw std::runtime_error("The depth snapshot must cover the displayed target");
+    if (at(tagged, 250, 130) != (40000u | 0x10000u) || at(tagged, 220, 130) != (1000u | 0x10000u) ||
+        (at(tagged, 150, 130) >> 16) != 0u || (at(tagged, 150, 130) & 0xFFFF) != 1000u ||
+        at(tagged, 400, 50) != 40000u)
+        throw std::runtime_error("Through-mode pixels must carry the HUD tag; 3D and untouched pixels must not");
+    // A tagged pixel does not alter the guest-visible depth (the readback keeps 16 bits).
+    if (memory.load16(kDepth + (130 * kStride + 250) * 2) != 40000 ||
+        memory.load16(kDepth + (130 * kStride + 150) * 2) != 1000)
+        throw std::runtime_error("The HUD tag must never reach guest memory");
+    for (const auto &[racing, hud_ungraded] : {std::pair{false, "1"}, std::pair{true, "0"}}) {
+        const auto words = run(racing, hud_ungraded);
+        for (const auto word : words)
+            if (word >> 16)
+                throw std::runtime_error("HUD tags must be off outside races or with hud_ungraded = false");
+    }
+    motorstorm::gpu_shutdown();
+    _putenv_s("PSPRECOMP_MOTORSTORM_POST_HUD_UNGRADED", "");
+    motorstorm::gpu_set_racing(false);
+    std::puts("HUD tag: through-mode pixels tagged in the depth snapshot only while racing, guest depth untouched");
+}
+
 int main() {
     try {
         _putenv_s("PSPRECOMP_MOTORSTORM_RESOLUTION", "1");
@@ -512,6 +650,7 @@ int main() {
         motorstorm::reset_software_ge();
         post_pixels();
         widescreen_pixels(memory);
+        hud_tag_pixels(memory);
         indexed_vertex_cache(memory);
         replacement_alpha(memory);
         motorstorm::reset_software_ge();

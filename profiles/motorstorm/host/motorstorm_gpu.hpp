@@ -61,9 +61,9 @@ struct GpuReport {
     std::uint64_t draws{}, hardware_transform_draws{}, vertices{}, submissions{}, texture_uploads{},
         feedback_syncs{}, feedback_draws{}, software_draws{}, presents{}, skipped_presents{}, superseded_presents{},
         replaced_draws{}, replacement_uploads{}, replacements_evicted{}, streamed_texture_updates{};
-    // Optional asynchronous GPU timestamp totals: resolve, deband, colour.
+    // Optional asynchronous GPU timestamp totals: resolve, deband, bloom, colour.
     std::uint64_t post_gpu_frames{}, post_gpu_max_ns{};
-    std::array<std::uint64_t, 3> post_gpu_ns{};
+    std::array<std::uint64_t, 4> post_gpu_ns{};
     bool active{};
     std::uint32_t resolution_scale{1}, raster_half{2}, antialiasing{};  // raster scale in half units
 };
@@ -105,7 +105,16 @@ GpuImage gpu_capture(psprecomp::GuestMemory &, std::uint32_t framebuffer, std::u
                      std::uint32_t format, std::uint32_t width, std::uint32_t height);
 struct PostSettings;
 // Pixel readback of PostPS shading using private diagnostic scratch buffers.
-GpuImage gpu_debug_post(const GpuImage &, const PostSettings &, float fade = 1.0f, bool reference = false);
+// depth_words (optional, one per pixel, bit 16 = HUD tag) are the depth
+// snapshot the HUD mask comes from; null means no HUD tags.
+GpuImage gpu_debug_post(const GpuImage &, const PostSettings &, float fade = 1.0f, bool reference = false,
+                        const std::vector<std::uint32_t> *depth_words = nullptr);
+// The depth snapshot the present path would hand to the post chain for this
+// displayed target (16-bit depth, HUD tag in bit 16, output resolution), or
+// empty when the target has no resident depth buffer. Needs a completed GE list.
+std::vector<std::uint32_t> gpu_debug_depth_words(psprecomp::GuestMemory &, std::uint32_t framebuffer,
+                                                 std::uint32_t stride, std::uint32_t format, std::uint32_t width,
+                                                 std::uint32_t height);
 // UI thread publishes client dimensions without accessing renderer state.
 void gpu_set_output_size(std::uint32_t width, std::uint32_t height) noexcept;
 // The game is racing (countdown or race): the [enhancements] effects apply to

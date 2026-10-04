@@ -4579,7 +4579,8 @@ void report_summary() {
                 out << " post_gpu_frames=" << gpu.post_gpu_frames
                     << " post_resolve_ms=" << gpu.post_gpu_ns[0]*scale
                     << " post_deband_ms=" << gpu.post_gpu_ns[1]*scale
-                    << " post_color_ms=" << gpu.post_gpu_ns[2]*scale
+                    << " post_bloom_ms=" << gpu.post_gpu_ns[2]*scale
+                    << " post_color_ms=" << gpu.post_gpu_ns[3]*scale
                     << " post_max_ms=" << gpu.post_gpu_max_ns*1.0e-6;
             }
             out << " output=" << gpu.resolution_scale*480 << 'x' << gpu.resolution_scale*272

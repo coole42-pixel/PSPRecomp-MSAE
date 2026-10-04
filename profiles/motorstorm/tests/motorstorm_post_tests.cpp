@@ -24,7 +24,9 @@ const char *const kPostEnvironment[]{
     "PSPRECOMP_MOTORSTORM_POST_CONTRAST", "PSPRECOMP_MOTORSTORM_POST_SATURATION",
     "PSPRECOMP_MOTORSTORM_POST_TEMPERATURE", "PSPRECOMP_MOTORSTORM_POST_TINT", "PSPRECOMP_MOTORSTORM_POST_LUT",
     "PSPRECOMP_MOTORSTORM_POST_LUT_FILE", "PSPRECOMP_MOTORSTORM_POST_LUT_STRENGTH",
-    "PSPRECOMP_MOTORSTORM_POST_SHARPEN", "PSPRECOMP_MOTORSTORM_POST_SHARPEN_STRENGTH"};
+    "PSPRECOMP_MOTORSTORM_POST_SHARPEN", "PSPRECOMP_MOTORSTORM_POST_SHARPEN_STRENGTH",
+    "PSPRECOMP_MOTORSTORM_POST_HUD_UNGRADED", "PSPRECOMP_MOTORSTORM_POST_BLOOM",
+    "PSPRECOMP_MOTORSTORM_POST_BLOOM_STRENGTH", "PSPRECOMP_MOTORSTORM_POST_BLOOM_THRESHOLD"};
 void clear_post_environment() {
     for (const char *name : kPostEnvironment)
         _putenv_s(name, "");
@@ -41,13 +43,14 @@ int main() {
         check(shipped.warnings.empty(), "Shipped [enhancements] keys are known");
         check(shipped.post && shipped.post_color_depth == 32u && shipped.post_tonemap == "agx" &&
                   shipped.post_agx_look == "punchy" && shipped.post_color_correction && shipped.post_lut &&
-                  shipped.post_sharpen && shipped.post_lut_file.empty(),
+                  shipped.post_sharpen && shipped.post_hud_ungraded && !shipped.post_bloom && shipped.post_lut_file.empty(),
               "Shipped INI enables the race enhancements");
         clear_post_environment();
         motorstorm::apply_native_config(shipped);
         const auto defaults = motorstorm::post_settings_from_environment();
         check(defaults.active() && defaults.extended_color && defaults.agx && defaults.agx_look == 1u &&
-                  defaults.lut && defaults.sharpening && near(defaults.hdr_peak, 6.0f, 1e-6f) &&
+                  defaults.lut && defaults.sharpening && defaults.hud_ungraded && !defaults.bloom && !defaults.bloom_active() &&
+                  near(defaults.bloom_strength, 0.15f, 1e-6f) && near(defaults.bloom_threshold, 3.0f, 1e-6f) && near(defaults.hdr_peak, 6.0f, 1e-6f) &&
                   near(defaults.sharpening_strength, 0.2f, 1e-6f) && near(defaults.lut_strength, 1.0f, 1e-6f),
               "INI defaults reach the renderer settings");
 
@@ -58,19 +61,22 @@ int main() {
             file << "[enhancements]\nenabled=true\ncolor_depth=16\ntonemapping=none\nagx_look=golden\n"
                     "hdr_peak=2.5\ncolor_correction=false\nexposure=-0.5\ncontrast=1.2\nsaturation=0.8\n"
                     "temperature=0.3\ntint=-0.2\nlut=false\nlut_file=luts/a.cube\nlut_strength=0.5\n"
-                    "sharpening=false\nsharpening_strength=0.75 ; comment\n";
+                    "sharpening=false\nsharpening_strength=0.75 ; comment\nhud_ungraded=false\n"
+                    "bloom=true\nbloom_strength=0.4\nbloom_threshold=2.5\n";
         }
         const auto custom = motorstorm::load_native_config(path);
         check(custom.warnings.empty() && custom.post_color_depth == 16u && custom.post_tonemap == "none" &&
                   custom.post_agx_look == "golden" && !custom.post_color_correction && !custom.post_lut &&
-                  !custom.post_sharpen && custom.post_sharpen_strength == "0.75" &&
+                  !custom.post_sharpen && !custom.post_hud_ungraded && custom.post_bloom && custom.post_bloom_strength == "0.4" &&
+                  custom.post_bloom_threshold == "2.5" && custom.post_sharpen_strength == "0.75" &&
                   custom.post_lut_file == (directory / "luts" / "a.cube").lexically_normal(),
               "Every [enhancements] option loads");
         clear_post_environment();
         motorstorm::apply_native_config(custom);
         const auto settings = motorstorm::post_settings_from_environment();
         check(!settings.extended_color && !settings.agx && settings.agx_look == 2u && !settings.color_correction &&
-                  !settings.lut && !settings.sharpening && near(settings.exposure, -0.5f, 1e-6f) &&
+                  !settings.lut && !settings.sharpening && !settings.hud_ungraded && settings.bloom &&
+                  near(settings.bloom_strength, 0.4f, 1e-6f) && near(settings.bloom_threshold, 2.5f, 1e-6f) && near(settings.exposure, -0.5f, 1e-6f) &&
                   near(settings.contrast, 1.2f, 1e-6f) && near(settings.saturation, 0.8f, 1e-6f) &&
                   near(settings.temperature, 0.3f, 1e-6f) && near(settings.tint, -0.2f, 1e-6f) &&
                   near(settings.hdr_peak, 2.5f, 1e-6f) && near(settings.sharpening_strength, 0.75f, 1e-6f) &&
@@ -84,7 +90,8 @@ int main() {
 
         for (const char *invalid : {"[enhancements]\ncolor_depth=24\n", "[enhancements]\ntonemapping=aces\n",
                                    "[enhancements]\nagx_look=vivid\n", "[enhancements]\nexposure=5\n",
-                                   "[enhancements]\nsharpening_strength=high\n", "[enhancements]\nlut=maybe\n"}) {
+                                   "[enhancements]\nsharpening_strength=high\n", "[enhancements]\nlut=maybe\n",
+                                   "[enhancements]\nbloom_strength=2\n", "[enhancements]\nbloom_threshold=0.1\n"}) {
             { std::ofstream file(path); file << invalid; }
             bool rejected = false;
             try { (void)motorstorm::load_native_config(path); }

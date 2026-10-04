@@ -115,7 +115,8 @@ set(MOTORSTORM_SHADER_HEADERS)
 foreach(shader IN ITEMS VS:vs_5_1 PS:ps_5_1 PointGS:gs_5_1 PresentVS:vs_5_1 PresentPS:ps_5_1
                         ExpandCS:cs_5_1 ResolveCS:cs_5_1 CaptureCS:cs_5_1 DecodeCS:cs_5_1 MipCS:cs_5_1
                         PostResolveCS:cs_5_1 DebandCS:cs_5_1 PostPS:ps_5_1 PostCaptureCS:cs_5_1
-                        PostColorCS:cs_5_1 PostPresentPS:ps_5_1 PostColorCaptureCS:cs_5_1)
+                        PostColorCS:cs_5_1 PostPresentPS:ps_5_1 PostColorCaptureCS:cs_5_1
+                        DepthResolveCS:cs_5_1 BloomExtractCS:cs_5_1 BloomDownCS:cs_5_1 BloomUpCS:cs_5_1)
     string(REPLACE ":" ";" shader_parts "${shader}")
     list(GET shader_parts 0 entry)
     list(GET shader_parts 1 profile)

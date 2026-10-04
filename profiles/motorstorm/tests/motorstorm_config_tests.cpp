@@ -34,9 +34,9 @@ struct EnvironmentScope {
 int main() {
     try {
         const auto shipped = motorstorm::load_native_config(MOTORSTORM_CONFIG_TEMPLATE);
-        check(shipped.loaded && shipped.resolution == 4u && shipped.antialiasing == "ssaa4x" &&
+        check(shipped.loaded && shipped.resolution == 4u && shipped.antialiasing == "fxaa" &&
               shipped.renderer == "d3d12" && shipped.window && shipped.audio && shipped.fps == 60u && shipped.widescreen == "auto",
-              "Shipped INI must enable native 4x / SSAA4x / 60 fps with window and audio");
+              "Shipped INI must enable native 4x / FXAA / 60 fps with window and audio");
         check(!shipped.fullscreen && !shipped.trace_imports && !shipped.trace_filesystem &&
               !shipped.verbose && shipped.debug_environment.empty(), "Debug examples remain commented out");
         const auto directory = std::filesystem::temp_directory_path() / "motorstorm_config_regressions";
@@ -71,7 +71,7 @@ int main() {
             _putenv_s("PSPRECOMP_MOTORSTORM_WIDESCREEN", "psp");
             motorstorm::apply_native_config(shipped);
             check(std::string(std::getenv("PSPRECOMP_MOTORSTORM_WIDESCREEN")) == "psp", "Explicit PSP aspect overrides auto");
-            check(std::string(std::getenv("PSPRECOMP_MOTORSTORM_AA")) == "ssaa4x" &&
+            check(std::string(std::getenv("PSPRECOMP_MOTORSTORM_AA")) == "fxaa" &&
                   std::getenv("PSPRECOMP_MOTORSTORM_PROFILE") == nullptr, "INI fills defaults without enabling debug switches");
             _putenv_s("PSPRECOMP_MOTORSTORM_PROFILE", "");
             motorstorm::apply_native_config(custom);
@@ -91,7 +91,7 @@ int main() {
             check(rejected, "Invalid INI values report the option's file and line");
         }
         const auto fallback = motorstorm::load_native_config(directory / "missing.ini");
-        check(!fallback.loaded && fallback.resolution == 4u && fallback.antialiasing == "ssaa4x" && fallback.fps == 60u,
+        check(!fallback.loaded && fallback.resolution == 4u && fallback.antialiasing == "fxaa" && fallback.fps == 60u,
               "Missing INI retains documented defaults");
         {
             const auto original = motorstorm::plan_frame_rate(0u);

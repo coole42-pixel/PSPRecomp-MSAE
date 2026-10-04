@@ -42,7 +42,8 @@ if ($LASTEXITCODE -ne 0) { throw 'MotorStorm CMake configuration failed.' }
 $targets = @('MotorStormNative', 'MotorStormTextureExtract')
 if ($Tests -or $GpuTests) {
     $targets += @('psprecomp_tests', 'psprecomp_codegen_tests', 'motorstorm_profile_tests',
-                  'motorstorm_config_tests', 'motorstorm_texture_tests', 'motorstorm_window_tests')
+                  'motorstorm_config_tests', 'motorstorm_texture_tests', 'motorstorm_post_tests',
+                  'motorstorm_window_tests')
 }
 if ($GpuTests) { $targets += 'motorstorm_gpu_tests' }
 & $cmakePath --build $buildPath --config Release --parallel 1 --target @targets
@@ -65,4 +66,4 @@ if ($Tests -or $GpuTests) {
 }
 Write-Host "Executable: $(Join-Path $outputDirectory 'MotorStormNative.exe')"
 Write-Host "Settings:   $(Join-Path $outputDirectory 'MotorStormNative.ini')"
-Write-Host 'Defaults: 4x internal resolution / SSAA4x / windowed. F11 or Alt+Enter toggles fullscreen.'
+Write-Host 'Defaults: 4x internal resolution / FXAA / windowed. F11 or Alt+Enter toggles fullscreen.'

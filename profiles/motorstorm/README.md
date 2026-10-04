@@ -27,7 +27,7 @@ renderer checks; hardware tests require a D3D12 ROV GPU. `-Jobs 1..16` controls
 compiler workers (default 4). `-BuildDirectory` selects another build tree.
 
 The executable reads `MotorStormNative.ini` beside it. Defaults are **4x internal
-resolution, SSAA4x, windowed presentation and audio enabled**. The INI explains
+resolution, FXAA, windowed presentation and audio enabled**. The INI explains
 every option and includes commented debug examples for tracing, timing, frame
 dumps and bounded runs. Both the executable and launcher honor edited settings;
 explicit launcher arguments or `PSPRECOMP_*` environment options override them.
@@ -51,6 +51,8 @@ See [SSAA performance and audio recovery](docs/PERFORMANCE_AUDIO_SSAA.md) for
 the current quality-preserving optimization, frame comparisons and audio checks.
 See [widescreen and post effects](docs/WIDESCREEN_POST.md) for the implementation
 and validation of the aspect and image-effect fixes.
+See [HUD mask, depth snapshot and bloom](docs/POST_HUD_DEPTH_BLOOM.md) for the race HUD exemption,
+the depth snapshot and the optional bloom pass.
 
 The launcher selects hardware D3D12 rendering. It requires a D3D12 GPU with rasterizer ordered views. Use `-Renderer software` for the software reference or `-Renderer auto` to allow a reported software fallback. `-Bringup` enables historical scene skips for diagnostics; normal play leaves it off.
 

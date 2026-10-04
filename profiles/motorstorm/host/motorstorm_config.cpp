@@ -172,6 +172,10 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
             else if (key == "lut_strength") config.post_lut_strength = real(0.0, 1.0);
             else if (key == "sharpening") config.post_sharpen = boolean();
             else if (key == "sharpening_strength") config.post_sharpen_strength = real(0.0, 1.0);
+            else if (key == "hud_ungraded") config.post_hud_ungraded = boolean();
+            else if (key == "bloom") config.post_bloom = boolean();
+            else if (key == "bloom_strength") config.post_bloom_strength = real(0.0, 1.0);
+            else if (key == "bloom_threshold") config.post_bloom_threshold = real(0.5, 16.0);
         }
         static const std::map<std::string, std::set<std::string>> known{
             {"", {"eboot", "disc_root", "log_file", "trace_imports", "trace_filesystem", "verbose"}},
@@ -185,7 +189,8 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
             {"textures", {"dump", "replace", "dump_dir", "replace_dir", "budget_mb"}},
             {"enhancements", {"enabled", "color_depth", "tonemapping", "agx_look", "hdr_peak", "color_correction",
                               "exposure", "contrast", "saturation", "temperature", "tint", "lut", "lut_file",
-                              "lut_strength", "sharpening", "sharpening_strength"}},
+                              "lut_strength", "sharpening", "sharpening_strength", "hud_ungraded", "bloom",
+                              "bloom_strength", "bloom_threshold"}},
             {"debug", {"profile", "trace_controller", "trace_music", "trace_atrac", "trace_display",
                        "d3d12_debug", "pc_sample", "frame_dump", "stop_after_ge", "frame_dump_every",
                        "frame_dump_count", "frame_dump_dir"}},
@@ -273,6 +278,10 @@ void apply_native_config(const NativeConfig &config) {
     set_default("PSPRECOMP_MOTORSTORM_POST_LUT_STRENGTH", config.post_lut_strength);
     set_default("PSPRECOMP_MOTORSTORM_POST_SHARPEN", config.post_sharpen ? "1" : "0");
     set_default("PSPRECOMP_MOTORSTORM_POST_SHARPEN_STRENGTH", config.post_sharpen_strength);
+    set_default("PSPRECOMP_MOTORSTORM_POST_HUD_UNGRADED", config.post_hud_ungraded ? "1" : "0");
+    set_default("PSPRECOMP_MOTORSTORM_POST_BLOOM", config.post_bloom ? "1" : "0");
+    set_default("PSPRECOMP_MOTORSTORM_POST_BLOOM_STRENGTH", config.post_bloom_strength);
+    set_default("PSPRECOMP_MOTORSTORM_POST_BLOOM_THRESHOLD", config.post_bloom_threshold);
     set_default("PSPRECOMP_MOTORSTORM_WINDOW", config.window ? "1" : "0");
     set_default("PSPRECOMP_MOTORSTORM_FULLSCREEN", config.fullscreen ? "1" : "0");
     set_default("PSPRECOMP_MOTORSTORM_WINDOW_SCALE", std::to_string(config.window_scale));

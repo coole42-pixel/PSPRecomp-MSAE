@@ -57,6 +57,10 @@ PostSettings post_settings_from_environment() {
     settings.sharpening = flag("PSPRECOMP_MOTORSTORM_POST_SHARPEN", settings.sharpening);
     settings.sharpening_strength =
         real("PSPRECOMP_MOTORSTORM_POST_SHARPEN_STRENGTH", settings.sharpening_strength, 0.0f, 1.0f);
+    settings.hud_ungraded = flag("PSPRECOMP_MOTORSTORM_POST_HUD_UNGRADED", settings.hud_ungraded);
+    settings.bloom = flag("PSPRECOMP_MOTORSTORM_POST_BLOOM", settings.bloom);
+    settings.bloom_strength = real("PSPRECOMP_MOTORSTORM_POST_BLOOM_STRENGTH", settings.bloom_strength, 0.0f, 1.0f);
+    settings.bloom_threshold = real("PSPRECOMP_MOTORSTORM_POST_BLOOM_THRESHOLD", settings.bloom_threshold, 0.5f, 16.0f);
     return settings;
 }
 
