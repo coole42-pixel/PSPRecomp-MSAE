@@ -2,9 +2,13 @@
 #include "motorstorm_bootstrap.hpp"
 #include "motorstorm_presentation.hpp"
 #include "motorstorm_perf.hpp"
+#include "motorstorm_post.hpp"
 #include "motorstorm_textures.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <bit>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <mutex>
@@ -15,6 +19,7 @@
 #include <deque>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <unordered_map>
@@ -42,6 +47,8 @@ std::uint64_t gpu_publish_epoch{};
 // pixels (the next list, transfers, software draws, captures). The GPU tail of
 // each frame then overlaps the guest CPU work for the next one.
 bool deferred_readback{};
+bool emulation_racing{};
+std::atomic<std::uint64_t> output_size{(480ull << 32) | 272u};
 #if defined(_WIN32)
 using Microsoft::WRL::ComPtr;
 // Shader bytecode compiled at build time by fxc from motorstorm_gpu.hlsl.
@@ -55,6 +62,13 @@ using Microsoft::WRL::ComPtr;
 #include "motorstorm_shader_CaptureCS.h"
 #include "motorstorm_shader_DecodeCS.h"
 #include "motorstorm_shader_MipCS.h"
+#include "motorstorm_shader_PostResolveCS.h"
+#include "motorstorm_shader_DebandCS.h"
+#include "motorstorm_shader_PostPS.h"
+#include "motorstorm_shader_PostCaptureCS.h"
+#include "motorstorm_shader_PostColorCS.h"
+#include "motorstorm_shader_PostPresentPS.h"
+#include "motorstorm_shader_PostColorCaptureCS.h"
 constexpr UINT64 kUploadBytes = 64ull * 1024 * 1024;
 constexpr UINT kDescriptors = 16384;
 void check(HRESULT hr, const char *operation) {
@@ -86,6 +100,7 @@ struct Surface {
     std::vector<std::uint8_t> guest_shadow;
     D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COPY_DEST};
     bool loaded{}, dirty{}, readback_pending{};
+    float aspect_scale{1.0f};
     UINT64 version{}, snapshot_version{~0ull};
     UINT64 snapshot_bytes{};
     UINT64 snapshot_guest_epoch{~0ull};
@@ -237,19 +252,44 @@ struct State {
         ComPtr<ID3D12CommandAllocator> allocator;
         ComPtr<ID3D12GraphicsCommandList> list;
         ComPtr<ID3D12Resource> image, constants;
+        ComPtr<ID3D12CommandAllocator> post_allocator;
+        ComPtr<ID3D12GraphicsCommandList> post_list;
+        ComPtr<ID3D12Resource> post_buffers[2], post_color;
+        UINT64 post_bytes{};
+        ComPtr<ID3D12QueryHeap> post_queries;
+        ComPtr<ID3D12Resource> post_timing;
+        bool timed_post{};
         UINT64 bytes{}, fence{}, copy_fence{};
         void *mapped{};
         FrameState state{FrameState::Free};
         std::uint32_t width{}, height{}, stride{}, format{};
+        bool racing{};  // the game was racing when this frame was drawn
+        float aspect_scale{1.0f};
     };
     int ready_frame{-1};
     static constexpr UINT kPresentFrames = 3;
     ComPtr<ID3D12CommandQueue> present_queue;
+    ComPtr<ID3D12CommandQueue> post_queue;
+    ComPtr<ID3D12Fence> post_fence;
+    UINT64 post_fence_value{}, post_frequency{};
     ComPtr<ID3D12Fence> present_fence;
     HANDLE present_event{};
     UINT64 present_fence_value{};
     PresentFrame present_frames[kPresentFrames];
     UINT present_frame{};
+    // Race-only image enhancements ([enhancements]). The emulation thread sets
+    // `racing` from the guest scene; the presenter fades the effects in and
+    // out and runs them in post_buffers (half-float RGB at output resolution).
+    PostSettings post;
+    bool widescreen{true};
+    bool racing{};
+    ComPtr<ID3D12PipelineState> post_resolve_pipeline, deband_pipeline, post_pipeline, post_capture_pipeline,
+        post_color_pipeline, post_present_pipeline, post_color_capture_pipeline;
+    ComPtr<ID3D12Resource> lut;  // packed 10:10:10 entries, GPU-local default heap
+    UINT lut_size{};
+    float post_fade{};
+    std::chrono::steady_clock::time_point post_clock{};
+    std::uint32_t post_frames{};
     void stop_presenter() {
         if (!presenter.joinable())
             return;
@@ -271,6 +311,9 @@ struct State {
                 SUCCEEDED(present_fence->SetEventOnCompletion(value, present_event)))
                 WaitForSingleObject(present_event, 5000);
         }
+        if (post_queue && post_fence && present_event && post_fence->GetCompletedValue() < post_fence_value &&
+            SUCCEEDED(post_fence->SetEventOnCompletion(post_fence_value, present_event)))
+            WaitForSingleObject(present_event, 5000);
         if (upload && mapped)
             upload->Unmap(0, nullptr);
         if (event)
@@ -294,8 +337,9 @@ struct Constants {
     // Enhanced filtering: texel range the draw's coordinates span (min u, min
     // v, max u, max v); all zero = unknown, no mip clamp.
     std::array<float, 4> uv_range{};
+    std::array<float, 4> wide{1.0f, 240.0f, 0.0f, 0.0f};
 };
-static_assert(sizeof(Constants) == 1232);
+static_assert(sizeof(Constants) == 1248);
 static_assert(sizeof(GpuVertex) == 36);
 ComPtr<ID3D12Resource> buffer(State &s, UINT64 bytes, D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES initial,
                               bool uav = false) {
@@ -316,6 +360,14 @@ ComPtr<ID3D12Resource> buffer(State &s, UINT64 bytes, D3D12_HEAP_TYPE type, D3D1
                                             IID_PPV_ARGS(&result)),
           "create buffer");
     return result;
+}
+void prepare_post_buffers(State &s, State::PresentFrame &frame, UINT width, UINT height) {
+    const UINT64 bytes = static_cast<UINT64>(width) * height * s.output_scale * s.output_scale * 8;
+    if (frame.post_bytes >= bytes) return;
+    for (auto &target : frame.post_buffers)
+        target = buffer(s, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+    frame.post_color = buffer(s, bytes / 2 * 3, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true);
+    frame.post_bytes = bytes;
 }
 void transition(State &s, Surface &surface, D3D12_RESOURCE_STATES next) {
     if (surface.state == next)
@@ -420,7 +472,9 @@ const Bytecode *compile(const char *entry, const char *) {
         MOTORSTORM_SHADER(VS),        MOTORSTORM_SHADER(PS),        MOTORSTORM_SHADER(PointGS),
         MOTORSTORM_SHADER(PresentVS), MOTORSTORM_SHADER(PresentPS), MOTORSTORM_SHADER(ExpandCS),
         MOTORSTORM_SHADER(ResolveCS), MOTORSTORM_SHADER(CaptureCS), MOTORSTORM_SHADER(DecodeCS),
-        MOTORSTORM_SHADER(MipCS)};
+        MOTORSTORM_SHADER(MipCS),     MOTORSTORM_SHADER(PostResolveCS), MOTORSTORM_SHADER(DebandCS),
+        MOTORSTORM_SHADER(PostPS), MOTORSTORM_SHADER(PostCaptureCS), MOTORSTORM_SHADER(PostColorCS),
+        MOTORSTORM_SHADER(PostPresentPS), MOTORSTORM_SHADER(PostColorCaptureCS)};
 #undef MOTORSTORM_SHADER
     for (const auto &shader : shaders)
         if (shader.entry == entry)
@@ -520,6 +574,12 @@ void create_pipeline(State &s) {
     pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     check(s.device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&s.present_pipeline)),
           "create present pipeline");
+    const auto post_ps = compile("PostPS", "ps_5_1");
+    pso.PS = {post_ps->GetBufferPointer(), post_ps->GetBufferSize()};
+    check(s.device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&s.post_pipeline)), "create post pipeline");
+    const auto post_present_ps = compile("PostPresentPS", "ps_5_1");
+    pso.PS = {post_present_ps->GetBufferPointer(), post_present_ps->GetBufferSize()};
+    check(s.device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&s.post_present_pipeline)), "create post present pipeline");
     auto create_compute = [&](const char *entry, ComPtr<ID3D12PipelineState> &pipeline) {
         const auto shader = compile(entry, "cs_5_1");
         D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
@@ -532,6 +592,11 @@ void create_pipeline(State &s) {
     create_compute("CaptureCS", s.capture_pipeline);
     create_compute("DecodeCS", s.decode_pipeline);
     create_compute("MipCS", s.mip_pipeline);
+    create_compute("PostResolveCS", s.post_resolve_pipeline);
+    create_compute("DebandCS", s.deband_pipeline);
+    create_compute("PostCaptureCS", s.post_capture_pipeline);
+    create_compute("PostColorCS", s.post_color_pipeline);
+    create_compute("PostColorCaptureCS", s.post_color_capture_pipeline);
 }
 void compute(State &s, ID3D12PipelineState *pipeline, const Constants &constants,
              D3D12_GPU_VIRTUAL_ADDRESS source, D3D12_GPU_VIRTUAL_ADDRESS destination, UINT width,
@@ -621,6 +686,7 @@ void load_surface(State &s, Surface &surface, const psprecomp::GuestMemory &memo
         compute(s, s.expand_pipeline.Get(), constants, s.upload->GetGPUVirtualAddress() + offset,
                 surface.image->GetGPUVirtualAddress(), surface.raster_stride(), surface.raster_height());
     }
+    surface.aspect_scale = 1.0f;  // CPU uploads, including movie frames.
     surface.loaded = true;
     ++surface.version;
     s.has_commands = true;
@@ -1204,6 +1270,70 @@ std::vector<std::uint32_t> gpu_debug_decode(const GpuTexture &texture, std::size
 #endif
     return result;
 }
+#if defined(_WIN32)
+namespace {
+// Reads [enhancements] and prepares the colour LUT. A .cube file that cannot
+// be read falls back to the built-in grade (logged), never ends the game.
+void setup_post(State &s) {
+    s.post = post_settings_from_environment();
+    s.racing = emulation_racing;
+    if (const char *mode = std::getenv("PSPRECOMP_MOTORSTORM_WIDESCREEN"))
+        s.widescreen = std::string_view(mode) == "auto";
+    log_line("GE", std::string("widescreen: ") + (s.widescreen ? "auto (Hor+, centred HUD)" : "psp"));
+    if (s.post.active() && s.post.lut) {
+        ColorLut lut;
+        if (!s.post.lut_file.empty()) {
+            try {
+                lut = load_cube_lut(s.post.lut_file);
+            } catch (const std::exception &error) {
+                log_line("GE", std::string("enhancements: ") + error.what() + "; using the built-in LUT");
+                s.post.lut_file.clear();
+            }
+        }
+        if (lut.size == 0u)
+            lut = build_photoreal_lut();
+        const auto packed = pack_lut(lut);
+        const UINT64 bytes = packed.size() * sizeof(std::uint32_t);
+        auto staging = buffer(s, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        s.lut = buffer(s, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+        void *mapped{};
+        D3D12_RANGE none{};
+        check(staging->Map(0, &none, &mapped), "map LUT");
+        std::memcpy(mapped, packed.data(), static_cast<std::size_t>(bytes));
+        staging->Unmap(0, nullptr);
+        // Upload once during initialization. Runtime LUT reads stay in VRAM;
+        // COMMON allows read promotion on either the compute or present queue.
+        begin(s);
+        s.list->CopyBufferRegion(s.lut.Get(), 0, staging.Get(), 0, bytes);
+        transition_image(s, s.lut.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        s.has_commands = true;
+        submit_chunk(s);
+        wait(s);  // initialization only; release staging after its GPU copy
+        s.lut_size = lut.size;
+    }
+    const auto &p = s.post;
+    std::ostringstream out;
+    out << "enhancements (racing only): " << (p.active() ? "on" : "off");
+    if (p.active()) {
+        out << " color_depth=" << (p.extended_color ? 32 : 16)
+            << " tonemapping=" << (p.agx ? (p.agx_look == 1 ? "agx/punchy" : p.agx_look == 2 ? "agx/golden" : "agx") : "none")
+            << " hdr_peak=" << p.hdr_peak << " color_correction=" << (p.color_correction ? "on" : "off")
+            << " lut=" << (p.lut ? (p.lut_file.empty() ? "built-in" : p.lut_file.filename().string()) : "off")
+            << " sharpening=" << (p.sharpening ? std::to_string(p.sharpening_strength) : std::string("off"));
+    }
+    log_line("GE", out.str());
+}
+} // namespace
+#endif
+void gpu_set_racing(bool racing) noexcept {
+    emulation_racing = racing;
+#if defined(_WIN32)
+    if (state)
+        state->racing = racing;
+#else
+    (void)racing;
+#endif
+}
 bool gpu_requested() noexcept {
     const char *backend = std::getenv("PSPRECOMP_MOTORSTORM_RENDERER");
     return backend && (std::strcmp(backend, "d3d12") == 0 || std::strcmp(backend, "auto") == 0);
@@ -1319,6 +1449,7 @@ bool gpu_initialize() {
         D3D12_RANGE none{};
         check(s.upload->Map(0, &none, reinterpret_cast<void **>(&s.mapped)), "map upload arena");
         create_pipeline(s);
+        setup_post(s);
         state = std::move(native);
         report.active = true;
         std::cerr << "[D3D12] hardware GE adapter=" << report.adapter
@@ -1377,6 +1508,27 @@ void gpu_submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<c
     if (valid_depth)
         get_surface(s, memory, draw.depthbuffer, draw.depth_stride, height, 2);
     auto &color = get_surface(s, memory, draw.framebuffer, draw.stride, height, bpp, draw.format);
+    // Widen display-sized VRAM targets; offscreen effects retain GE semantics.
+    const bool display_target = color.height == 272u && (draw.stride == 480u || draw.stride == 512u) &&
+                                color.address >= 0x04000000u && color.address < 0x04200000u;
+    const auto dimensions = output_size.load(std::memory_order_relaxed);
+    const float aspect = display_target && s.racing && s.widescreen
+                             ? widescreen_scale(static_cast<UINT>(dimensions >> 32), static_cast<UINT>(dimensions))
+                             : 1.0f;
+    color.aspect_scale = aspect;
+    bool full_screen = (draw.commands[0xD3] & 1u) != 0;
+    if (!draw.hardware_transform && !full_screen && aspect > 1.0f &&
+        (vertices.size() == 6 || (texture && texture->feedback_address))) {
+        float left = 1e10f, right = -1e10f, top = 1e10f, bottom = -1e10f;
+        for (const auto &v : vertices) {
+            left = std::min(left, v.x); right = std::max(right, v.x);
+            top = std::min(top, v.y); bottom = std::max(bottom, v.y);
+        }
+        // Full-frame overlays/feedback cover the widened scene too.
+        full_screen = (vertices.size() == 6 || (texture && texture->feedback_address)) &&
+                      left <= 0.0f && right >= 480.0f && top <= 0.0f && bottom >= 272.0f;
+    }
+    const bool widen = aspect > 1.0f && !full_screen;
     Surface *depth = &color;
     if (valid_depth) {
         depth = nullptr;
@@ -1412,19 +1564,11 @@ void gpu_submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<c
                             {draw.format, draw.hardware_transform ? 1u : 0u,
                              (draw.depth_clip ? 1u : 0u) | (draw.primitive == 0 ? 2u : 0u),
                              valid_depth ? 1u : 0u}};
-        constants.render = {s.raster_half, s.output_scale, s.antialiasing, s.enhanced_filtering ? 1u : 0u};
-        if (s.enhanced_filtering && texture && !texture->feedback_address && (draw.commands[0x1E] & 1u)) {
-            // Region of the texture this draw samples: limits generated-mip
-            // blending to it (texture atlases), see sampleEnhanced.
-            float lo_u = 3.0e38f, lo_v = 3.0e38f, hi_u = -3.0e38f, hi_v = -3.0e38f;
-            for (const auto &vertex : vertices) {
-                const float q = vertex.q != 0.0f ? vertex.q : 1.0f, u = vertex.u / q, v = vertex.v / q;
-                lo_u = std::min(lo_u, u); hi_u = std::max(hi_u, u);
-                lo_v = std::min(lo_v, v); hi_v = std::max(hi_v, v);
-            }
-            if (std::isfinite(lo_u) && std::isfinite(hi_u) && std::isfinite(lo_v) && std::isfinite(hi_v))
-                constants.uv_range = {lo_u, lo_v, hi_u, hi_v};
-        }
+        // render.w: bit0 enhanced filtering, bit1 32-bit colour in 16-bit targets (racing only).
+        const bool extended_color = s.racing && s.post.active() && s.post.extended_color;
+        constants.render = {s.raster_half, s.output_scale, s.antialiasing,
+                            (s.enhanced_filtering ? 1u : 0u) | (extended_color ? 2u : 0u)};
+        constants.wide = {1.0f / aspect, 240.0f, widen ? 1.0f : 0.0f, 0.0f};
         if (texture && texture->feedback_address) {
             feedback = feedback_snapshot(s, memory, *texture, constants.feedback);
             ++report.feedback_draws;
@@ -1438,6 +1582,20 @@ void gpu_submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<c
                                  (replacement->no_alpha ? 1u : 0u) | (texture->opaque ? 2u : 0u)};  // see shade()
             replacement_descriptor = replacement->descriptor;
             ++report.replaced_draws;
+        }
+        if ((!replacement || !texture->opaque) && s.enhanced_filtering && texture && !feedback &&
+            (draw.commands[0x1E] & 1u) && (draw.commands[0xC6] & 0x101u)) {
+            // Atlas bounds affect only original bilinear-filtered textures.
+            // Opaque replacements and nearest filtering do not consume it;
+            // translucent replacements still need the original's alpha/mips.
+            float lo_u = 3.0e38f, lo_v = 3.0e38f, hi_u = -3.0e38f, hi_v = -3.0e38f;
+            for (const auto &vertex : vertices) {
+                const float q = vertex.q != 0.0f ? vertex.q : 1.0f, u = vertex.u / q, v = vertex.v / q;
+                lo_u = std::min(lo_u, u); hi_u = std::max(hi_u, u);
+                lo_v = std::min(lo_v, v); hi_v = std::max(hi_v, v);
+            }
+            if (std::isfinite(lo_u) && std::isfinite(hi_u) && std::isfinite(lo_v) && std::isfinite(hi_v))
+                constants.uv_range = {lo_u, lo_v, hi_u, hi_v};
         }
         cb_offset = static_cast<UINT>(allocate(s, sizeof(constants), 256));
         std::memcpy(s.mapped + cb_offset, &constants, sizeof(constants));
@@ -1474,6 +1632,10 @@ void gpu_submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<c
     D3D12_RECT scissor{raster(draw.left, static_cast<int>(draw.stride)), raster(draw.top, static_cast<int>(height)),
                        raster(draw.right, static_cast<int>(draw.stride)),
                        raster(draw.bottom, static_cast<int>(height))};
+    if (widen && (draw.left > 0 || draw.right < 480)) {
+        scissor.left = static_cast<LONG>(std::floor(widescreen_hud_x(static_cast<float>(draw.left), aspect) * s.raster_half * 0.5f));
+        scissor.right = static_cast<LONG>(std::ceil(widescreen_hud_x(static_cast<float>(draw.right), aspect) * s.raster_half * 0.5f));
+    }
     s.list->RSSetScissorRects(1, &scissor);
     s.list->IASetPrimitiveTopology(topology);
     D3D12_VERTEX_BUFFER_VIEW view{s.upload->GetGPUVirtualAddress() + vertex_offset,
@@ -1750,13 +1912,17 @@ GpuImage gpu_capture(psprecomp::GuestMemory &memory, std::uint32_t framebuffer, 
 }
 #if defined(_WIN32)
 namespace {
-void create_present_queue(State &s) {
+void create_present_queue(State &s, UINT width, UINT height) {
     if (s.present_queue)
         return;
     D3D12_COMMAND_QUEUE_DESC desc{};
     desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     check(s.device->CreateCommandQueue(&desc, IID_PPV_ARGS(&s.present_queue)), "create present queue");
     check(s.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s.present_fence)), "create present fence");
+    desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    check(s.device->CreateCommandQueue(&desc, IID_PPV_ARGS(&s.post_queue)), "create async post queue");
+    check(s.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s.post_fence)), "create async post fence");
+    check(s.post_queue->GetTimestampFrequency(&s.post_frequency), "post timestamp frequency");
     s.present_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!s.present_event)
         throw std::runtime_error("Cannot create present fence event");
@@ -1767,8 +1933,22 @@ void create_present_queue(State &s) {
                                           IID_PPV_ARGS(&frame.list)),
               "create present list");
         check(frame.list->Close(), "close present list");
+        check(s.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&frame.post_allocator)),
+              "create post allocator");
+        check(s.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, frame.post_allocator.Get(), nullptr,
+                                          IID_PPV_ARGS(&frame.post_list)), "create async post list");
+        check(frame.post_list->Close(), "close async post list");
+        if (perf::enabled()) {
+            D3D12_QUERY_HEAP_DESC queries{};
+            queries.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+            queries.Count = 4;
+            check(s.device->CreateQueryHeap(&queries, IID_PPV_ARGS(&frame.post_queries)), "create post timestamps");
+            frame.post_timing = buffer(s, 4 * sizeof(UINT64), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        }
         frame.constants = buffer(s, 4096, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         check(frame.constants->Map(0, nullptr, &frame.mapped), "map present constants");
+        // Allocate during initial menu presentation, not at the race boundary.
+        if (s.post.active()) prepare_post_buffers(s, frame, width, height);
     }
 }
 // Wait until the present queue has finished everything submitted to it.
@@ -1791,7 +1971,7 @@ void create_backbuffer_views(State &s) {
         s.device->CreateRenderTargetView(s.backbuffers[i].Get(), nullptr, handle);
     }
 }
-void create_swapchain(State &s, HWND window) {
+void create_swapchain(State &s, HWND window, UINT frame_width, UINT frame_height) {
     RECT client{};
     GetClientRect(window, &client);
     const UINT w = std::max<LONG>(1, client.right), h = std::max<LONG>(1, client.bottom);
@@ -1816,7 +1996,7 @@ void create_swapchain(State &s, HWND window) {
     desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     desc.Flags = s.swap_flags;
     ComPtr<IDXGISwapChain1> chain;
-    create_present_queue(s);
+    create_present_queue(s, frame_width, frame_height);
     check(s.factory->CreateSwapChainForHwnd(s.present_queue.Get(), window, &desc, nullptr, nullptr, &chain),
           "create swapchain");
     check(chain.As(&s.swapchain), "query swapchain");
@@ -1909,6 +2089,137 @@ void update_present_target(State &s) {
     s.present_width = w;
     s.present_height = h;
 }
+// Post-processing settings in the present constants. commands[] is unused by
+// presentation, so it carries them (see PostPS in motorstorm_gpu.hlsl).
+enum PostSlot : UINT {
+    kPostFlags, kPostFade, kPostSharpness, kPostExposure, kPostContrast, kPostSaturation, kPostBalance,
+    kPostPeak = kPostBalance + 3, kPostLook, kPostLutSize, kPostLutStrength, kPostDebandThreshold,
+    kPostDebandRange, kPostFrame, kPostAgxGain
+};
+enum PostFlag : std::uint32_t { kPostCas = 2, kPostGrade = 4, kPostAgx = 8, kPostLut = 16, kPostDither = 32 };
+// Effects fade in over half a second when a race starts and out when it ends.
+float update_post_fade(State &s, bool racing) {
+    const auto now = std::chrono::steady_clock::now();
+    const float elapsed = s.post_clock.time_since_epoch().count() == 0
+                              ? 0.0f
+                              : std::min(0.1f, std::chrono::duration<float>(now - s.post_clock).count());
+    s.post_clock = now;
+    constexpr float kFadeSeconds = 0.5f;
+    s.post_fade = std::clamp(s.post_fade + (racing ? elapsed : -elapsed) / kFadeSeconds, 0.0f, 1.0f);
+    // The first race frame after a long idle still starts the fade.
+    if (racing && s.post_fade == 0.0f)
+        s.post_fade = 1.0f / 60.0f;
+    return s.post_fade;
+}
+void set_post_constants(const PostSettings &p, Constants &constants, float fade,
+                        UINT lut_size, UINT output_scale, UINT frame) {
+    auto &c = constants.commands;
+    const auto put = [&](UINT slot, float value) { c[slot] = std::bit_cast<std::uint32_t>(value); };
+    c[kPostFlags] = (p.sharpening ? kPostCas : 0u) | (p.color_correction ? kPostGrade : 0u) |
+                    (p.agx ? kPostAgx : 0u) | (p.lut && lut_size ? kPostLut : 0u) | kPostDither;
+    put(kPostFade, fade);
+    put(kPostSharpness, p.sharpening_strength);
+    put(kPostExposure, std::exp2(p.exposure));
+    put(kPostContrast, p.contrast);
+    put(kPostSaturation, p.saturation);
+    const auto balance = white_balance(p.temperature, p.tint);
+    for (UINT i = 0; i < 3; ++i)
+        put(kPostBalance + i, balance[i]);
+    put(kPostPeak, p.hdr_peak);
+    put(kPostAgxGain, agx_mid_grey_gain(p.hdr_peak, p.agx_look));
+    c[kPostLook] = p.agx_look;
+    c[kPostLutSize] = lut_size;
+    put(kPostLutStrength, p.lut_strength);
+    // Debanding: steps up to about 2.5/255 within 3 PSP pixels count as a
+    // quantized gradient (16-bit colour steps after shading are this small).
+    put(kPostDebandThreshold, 2.5f / 255.0f);
+    put(kPostDebandRange, 3.0f * static_cast<float>(output_scale));
+    c[kPostFrame] = frame;
+}
+void buffer_barrier(ID3D12GraphicsCommandList *list, ID3D12Resource *resource, D3D12_RESOURCE_STATES before,
+                    D3D12_RESOURCE_STATES after) {
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
+    list->ResourceBarrier(1, &barrier);
+}
+// Called only after the slot's present fence completed, so Map never waits.
+void collect_post_timings(State &s, State::PresentFrame &frame) {
+    if (!frame.timed_post) return;
+    void *mapped{};
+    D3D12_RANGE range{0, 4 * sizeof(UINT64)};
+    check(frame.post_timing->Map(0, &range, &mapped), "read completed post timestamps");
+    const auto *timestamps = static_cast<const UINT64 *>(mapped);
+    UINT64 total = 0;
+    for (UINT i = 0; i < 3; ++i) {
+        const auto ns = static_cast<UINT64>((timestamps[i+1] - timestamps[i]) * (1.0e9 / s.post_frequency));
+        report.post_gpu_ns[i] += ns;
+        total += ns;
+    }
+    ++report.post_gpu_frames;
+    report.post_gpu_max_ns = std::max(report.post_gpu_max_ns, total);
+    D3D12_RANGE none{};
+    frame.post_timing->Unmap(0, &none);
+    frame.timed_post = false;
+}
+// Each snapshot owns its allocator and scratch. GPU-side fences connect GE,
+// async compute and presentation; runtime post processing never waits on CPU.
+UINT64 enqueue_post(State &s, State::PresentFrame &frame, D3D12_GPU_VIRTUAL_ADDRESS constants) {
+    const UINT width = frame.width * s.output_scale, height = frame.height * s.output_scale;
+    // Slot recycling guarantees any prior presentation has finished.
+    prepare_post_buffers(s, frame, frame.width, frame.height);
+    check(frame.post_allocator->Reset(), "reset async post allocator");
+    check(frame.post_list->Reset(frame.post_allocator.Get(), s.post_resolve_pipeline.Get()), "reset async post list");
+    auto *list = frame.post_list.Get();
+    const auto timestamp = [&](UINT index) {
+        if (frame.post_queries) list->EndQuery(frame.post_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, index);
+    };
+    const bool deband = s.post.extended_color;
+    list->SetComputeRootSignature(s.root.Get());
+    list->SetComputeRootConstantBufferView(0, constants);
+    list->SetPipelineState(s.post_resolve_pipeline.Get());
+    list->SetComputeRootShaderResourceView(4, frame.image->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(6, frame.post_buffers[0]->GetGPUVirtualAddress());
+    timestamp(0);
+    list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+    buffer_barrier(list, frame.post_buffers[0].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    timestamp(1);
+    ID3D12Resource *source = frame.post_buffers[0].Get();
+    if (deband) {
+        list->SetPipelineState(s.deband_pipeline.Get());
+        list->SetComputeRootShaderResourceView(4, source->GetGPUVirtualAddress());
+        list->SetComputeRootUnorderedAccessView(6, frame.post_buffers[1]->GetGPUVirtualAddress());
+        list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+        source = frame.post_buffers[1].Get();
+        buffer_barrier(list, source, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    timestamp(2);
+    buffer_barrier(list, frame.post_color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    list->SetPipelineState(s.post_color_pipeline.Get());
+    list->SetComputeRootShaderResourceView(4, source->GetGPUVirtualAddress());
+    list->SetComputeRootShaderResourceView(5, (s.lut ? s.lut.Get() : source)->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(6, frame.post_color->GetGPUVirtualAddress());
+    list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+    buffer_barrier(list, frame.post_color.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    timestamp(3);
+    buffer_barrier(list, frame.post_buffers[0].Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (deband)
+        buffer_barrier(list, frame.post_buffers[1].Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (frame.post_queries)
+        list->ResolveQueryData(frame.post_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 4, frame.post_timing.Get(), 0);
+    check(list->Close(), "close async post list");
+    check(s.post_queue->Wait(s.fence.Get(), frame.copy_fence), "async post waits for GE snapshot");
+    ID3D12CommandList *lists[]{list};
+    s.post_queue->ExecuteCommandLists(1, lists);
+    const UINT64 value = ++s.post_fence_value;
+    check(s.post_queue->Signal(s.post_fence.Get(), value), "signal async post fence");
+    frame.timed_post = frame.post_queries != nullptr;
+    return value;
+}
 void present_snapshot(State &s, State::PresentFrame &frame) {
     check(frame.allocator->Reset(), "reset present allocator");
     check(frame.list->Reset(frame.allocator.Get(), s.present_pipeline.Get()), "reset present list");
@@ -1920,9 +2231,17 @@ void present_snapshot(State &s, State::PresentFrame &frame) {
     constants.surface = {frame.width, frame.height, raster_extent(frame.stride, s.raster_half), 0};
     constants.mode[0] = frame.format;
     constants.render = {s.raster_half, s.output_scale, s.antialiasing, 0};
+    const float fade = s.post.active() ? update_post_fade(s, frame.racing) : 0.0f;
+    const bool post = fade > 0.0f;
+    if (post)
+        set_post_constants(s.post, constants, fade, s.lut_size, s.output_scale, ++s.post_frames);
     std::memcpy(frame.mapped, &constants, sizeof(constants));
-    list->SetGraphicsRootConstantBufferView(0, frame.constants->GetGPUVirtualAddress());
-    list->SetGraphicsRootShaderResourceView(4, frame.image->GetGPUVirtualAddress());
+    const auto constant_address = frame.constants->GetGPUVirtualAddress();
+    const UINT64 post_done = post ? enqueue_post(s, frame, constant_address) : 0u;
+    list->SetPipelineState(post ? s.post_present_pipeline.Get() : s.present_pipeline.Get());
+    list->SetGraphicsRootConstantBufferView(0, constant_address);
+    list->SetGraphicsRootShaderResourceView(4, post ? frame.post_color->GetGPUVirtualAddress()
+                                                    : frame.image->GetGPUVirtualAddress());
     const UINT index = s.swapchain->GetCurrentBackBufferIndex();
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1934,7 +2253,8 @@ void present_snapshot(State &s, State::PresentFrame &frame) {
     list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     constexpr float black[]{0, 0, 0, 1};
     list->ClearRenderTargetView(rtv, black, 0, nullptr);
-    const auto fitted = fit_presentation(s.present_width, s.present_height, frame.width, frame.height);
+    const auto fitted = fit_game_presentation(s.present_width, s.present_height, frame.width, frame.height,
+                                             frame.aspect_scale);
     D3D12_VIEWPORT viewport{static_cast<float>(fitted.left), static_cast<float>(fitted.top),
         static_cast<float>(fitted.width), static_cast<float>(fitted.height), 0, 1};
     D3D12_RECT rect{static_cast<LONG>(fitted.left), static_cast<LONG>(fitted.top),
@@ -1947,7 +2267,8 @@ void present_snapshot(State &s, State::PresentFrame &frame) {
     list->ResourceBarrier(1, &barrier);
     check(list->Close(), "close presentation list");
     // GPU-side wait for the snapshot copy on the GE queue.
-    check(s.present_queue->Wait(s.fence.Get(), frame.copy_fence), "present queue wait");
+    check(s.present_queue->Wait(post ? s.post_fence.Get() : s.fence.Get(), post ? post_done : frame.copy_fence),
+          "present queue waits for completed image");
     ID3D12CommandList *present_lists[]{list};
     s.present_queue->ExecuteCommandLists(1, present_lists);
     const bool tear = !s.vsync && s.tearing && !s.exclusive_active;
@@ -2033,6 +2354,87 @@ void release_swapchain(State &s) {
 }
 } // namespace
 #endif
+void gpu_set_output_size(std::uint32_t width, std::uint32_t height) noexcept {
+    if (width && height)
+        output_size.store((static_cast<std::uint64_t>(width) << 32) | height, std::memory_order_relaxed);
+}
+GpuImage gpu_debug_post(const GpuImage &input, const PostSettings &settings, float fade, bool reference) {
+    GpuImage result;
+#if defined(_WIN32)
+    if (!input.width || !input.height || input.rgba.size() != static_cast<std::size_t>(input.width) * input.height * 4)
+        throw std::runtime_error("invalid post diagnostic image");
+    if (!settings.active()) return input;
+    if (!gpu_initialize()) throw std::runtime_error("post diagnostics require the D3D12 renderer");
+    auto &s = *state;
+    if (s.recording) throw std::runtime_error("post diagnostic requires a completed GE list");
+    const UINT width = input.width, height = input.height;
+    const UINT64 bytes = input.rgba.size();
+    auto source = buffer(s, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    void *mapped{};
+    check(source->Map(0, nullptr, &mapped), "map post diagnostic input");
+    std::memcpy(mapped, input.rgba.data(), input.rgba.size());
+    source->Unmap(0, nullptr);
+    auto resolved = buffer(s, bytes * 2, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+    auto debanded = buffer(s, bytes * 2, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+    auto output = buffer(s, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+    auto readback = buffer(s, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    ComPtr<ID3D12Resource> lut_buffer;
+    UINT lut_size = 0;
+    if (settings.lut) {
+        const auto lut = settings.lut_file.empty() ? build_photoreal_lut() : load_cube_lut(settings.lut_file);
+        const auto packed = pack_lut(lut);
+        lut_size = lut.size;
+        lut_buffer = buffer(s, packed.size() * 4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        check(lut_buffer->Map(0, nullptr, &mapped), "map post diagnostic LUT");
+        std::memcpy(mapped, packed.data(), packed.size() * 4);
+        lut_buffer->Unmap(0, nullptr);
+    }
+    begin(s);
+    Constants constants{};
+    constants.surface = {width, height, width, 0};
+    constants.mode[0] = 3;
+    constants.render = {2, 1, 0, 0};
+    set_post_constants(settings, constants, std::clamp(fade, 0.0f, 1.0f), lut_size, 1, 1);
+    compute(s, s.post_resolve_pipeline.Get(), constants, source->GetGPUVirtualAddress(),
+            resolved->GetGPUVirtualAddress(), width, height);
+    buffer_barrier(s.list.Get(), resolved.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    ID3D12Resource *post_source = resolved.Get();
+    if (settings.extended_color) {
+        compute(s, s.deband_pipeline.Get(), constants, resolved->GetGPUVirtualAddress(),
+                debanded->GetGPUVirtualAddress(), width, height);
+        buffer_barrier(s.list.Get(), debanded.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        post_source = debanded.Get();
+    }
+    s.list->SetComputeRootShaderResourceView(5, (lut_buffer ? lut_buffer.Get() : source.Get())->GetGPUVirtualAddress());
+    ComPtr<ID3D12Resource> post_color;
+    if (!reference) {
+        post_color = buffer(s, bytes * 3, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+        compute(s, s.post_color_pipeline.Get(), constants, post_source->GetGPUVirtualAddress(),
+                post_color->GetGPUVirtualAddress(), width, height);
+        buffer_barrier(s.list.Get(), post_color.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        post_source = post_color.Get();
+    }
+    compute(s, reference ? s.post_capture_pipeline.Get() : s.post_color_capture_pipeline.Get(), constants, post_source->GetGPUVirtualAddress(),
+            output->GetGPUVirtualAddress(), width, height);
+    buffer_barrier(s.list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    s.list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, bytes);
+    check(s.list->Close(), "close post diagnostic list");
+    s.recording = false;
+    ID3D12CommandList *lists[]{s.list.Get()};
+    s.queue->ExecuteCommandLists(1, lists);
+    ++s.executions;
+    wait(s);
+    check(readback->Map(0, nullptr, &mapped), "map post diagnostic output");
+    result = {width, height, std::vector<std::uint8_t>(input.rgba.size())};
+    std::memcpy(result.rgba.data(), mapped, result.rgba.size());
+    D3D12_RANGE none{};
+    readback->Unmap(0, &none);
+#endif
+    return result;
+}
 bool gpu_present(psprecomp::GuestMemory &memory, void *window, std::uint32_t framebuffer,
                  std::uint32_t stride, std::uint32_t format, std::uint32_t width, std::uint32_t height) {
 #if defined(_WIN32)
@@ -2060,7 +2462,7 @@ bool gpu_present(psprecomp::GuestMemory &memory, void *window, std::uint32_t fra
     if (s.swapchain && s.window != window)
         release_swapchain(s);
     if (!s.swapchain)
-        create_swapchain(s, static_cast<HWND>(window));
+        create_swapchain(s, static_cast<HWND>(window), width, height);
     if (!s.presenter.joinable()) {
         s.presenter_stop = false;
         s.presenter = std::thread([&s] { presenter_main(s); });
@@ -2089,6 +2491,7 @@ bool gpu_present(psprecomp::GuestMemory &memory, void *window, std::uint32_t fra
             ++report.skipped_presents;  // every snapshot is still in flight to the display
             return true;
         }
+        collect_post_timings(s, s.present_frames[index]);
         s.present_frames[index].state = State::FrameState::Writing;
     }
     State::PresentFrame &frame = s.present_frames[index];
@@ -2122,6 +2525,8 @@ bool gpu_present(psprecomp::GuestMemory &memory, void *window, std::uint32_t fra
     frame.height = height;
     frame.stride = stride;
     frame.format = format;
+    frame.racing = s.racing;
+    frame.aspect_scale = color->aspect_scale;
     {
         std::lock_guard lock(s.present_mutex);
         if (s.ready_frame >= 0 && s.ready_frame != index) {

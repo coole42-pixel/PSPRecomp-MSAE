@@ -61,6 +61,9 @@ struct GpuReport {
     std::uint64_t draws{}, hardware_transform_draws{}, vertices{}, submissions{}, texture_uploads{},
         feedback_syncs{}, feedback_draws{}, software_draws{}, presents{}, skipped_presents{}, superseded_presents{},
         replaced_draws{}, replacement_uploads{}, replacements_evicted{}, streamed_texture_updates{};
+    // Optional asynchronous GPU timestamp totals: resolve, deband, colour.
+    std::uint64_t post_gpu_frames{}, post_gpu_max_ns{};
+    std::array<std::uint64_t, 3> post_gpu_ns{};
     bool active{};
     std::uint32_t resolution_scale{1}, raster_half{2}, antialiasing{};  // raster scale in half units
 };
@@ -100,6 +103,14 @@ GpuReport gpu_report();
 std::uint64_t gpu_memory_epoch() noexcept;
 GpuImage gpu_capture(psprecomp::GuestMemory &, std::uint32_t framebuffer, std::uint32_t stride,
                      std::uint32_t format, std::uint32_t width, std::uint32_t height);
+struct PostSettings;
+// Pixel readback of PostPS shading using private diagnostic scratch buffers.
+GpuImage gpu_debug_post(const GpuImage &, const PostSettings &, float fade = 1.0f, bool reference = false);
+// UI thread publishes client dimensions without accessing renderer state.
+void gpu_set_output_size(std::uint32_t width, std::uint32_t height) noexcept;
+// The game is racing (countdown or race): the [enhancements] effects apply to
+// the frames drawn and presented from now on. Set by the HLE at every flip.
+void gpu_set_racing(bool racing) noexcept;
 bool gpu_present(psprecomp::GuestMemory &, void *window, std::uint32_t framebuffer,
                  std::uint32_t stride, std::uint32_t format, std::uint32_t width, std::uint32_t height);
 } // namespace motorstorm

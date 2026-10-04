@@ -1,13 +1,19 @@
 #include "motorstorm_ge.hpp"
 #include "motorstorm_gpu.hpp"
+#include "motorstorm_post.hpp"
+#include "motorstorm_presentation.hpp"
+#include "motorstorm_textures.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <stdexcept>
 #include <vector>
 #include <string_view>
+#define NOMINMAX
 #include <windows.h>
 
 namespace motorstorm {
@@ -250,6 +256,218 @@ void decode_parity() {
     std::printf("GPU texture decoding matches the CPU path in %zu format/swizzle/palette cases\n", cases);
 }
 
+void indexed_vertex_cache(psprecomp::GuestMemory &memory) {
+    motorstorm::reset_software_ge();
+    constexpr std::uint32_t indexes = kVertices + 0x2000;
+    for (unsigned i = 0; i < 4; ++i) vertex(memory,i,5+i,6,0xFF102030u+i);
+    for (unsigned i = 0; i < 1024; ++i) memory.store16(indexes+i*2,static_cast<std::uint16_t>(i%4));
+    std::vector<std::uint32_t> list;
+    command(list,0x9C,kColor); command(list,0x9D,0x040020); command(list,0xD2,3);
+    command(list,0xD4,0); command(list,0xD5,31|(31<<10));
+    command(list,0x12,0x80119F); command(list,0x10,0x080000); command(list,0x01,kVertices); command(list,0x02,indexes);
+    for (auto cmd : {0x1D,0x1E,0x1F,0x21,0x22,0x23,0x24,0x27,0xD3,0xE8,0xE9}) command(list,cmd,0);
+    command(list,0x04,1024); command(list,0x0C,0);
+    for (unsigned i = 0; i < list.size(); ++i) memory.store32(kList+i*4,list[i]);
+    memory.zero(kColor,32*32*4);
+    motorstorm::software_ge_execute_list(memory,kList,0);
+    const auto first = motorstorm::software_ge_summary();
+    if (first.vertex_decodes != 4 || first.vertex_cache_hits != 1020)
+        throw std::runtime_error("Indexed draws must decode each reused vertex only once");
+    for (unsigned i = 0; i < 4; ++i)
+        if (memory.load32(kColor+(6*32+5+i)*4) != 0xFF102030u+i)
+            throw std::runtime_error("Cached indexed point output differs from original vertices");
+    vertex(memory,0,5,6,0xFFAABBCCu);
+    memory.zero(kColor,32*32*4);
+    motorstorm::software_ge_execute_list(memory,kList,0);
+    if (memory.load32(kColor+(6*32+5)*4) != 0xFFAABBCCu)
+        throw std::runtime_error("A vertex cache must never retain vertex data across draws");
+    std::puts("Indexed vertex reuse: 1024 references decoded 4 times, changed vertices refreshed next draw");
+}
+
+void replacement_alpha(psprecomp::GuestMemory &memory) {
+    namespace tx = motorstorm::textures;
+    const auto root = std::filesystem::temp_directory_path() / ("motorstorm_gpu_pack_"+std::to_string(GetCurrentProcessId()));
+    std::filesystem::create_directories(root);
+    constexpr std::uint64_t hashes[]{0x1122334455667788ull,0x8877665544332211ull};
+    for (unsigned i = 0; i < 2; ++i) {
+        char name[64]; std::snprintf(name,sizeof(name),"%016llX_2x2.png",static_cast<unsigned long long>(hashes[i]));
+        const std::array<std::uint32_t,4> pixels{i ? 0x80552211u : 0x00552211u,i ? 0x80552211u : 0x00552211u,
+                                               i ? 0x80552211u : 0x00552211u,i ? 0x80552211u : 0x00552211u};
+        if (!tx::save_png(root/name,2,2,pixels)) throw std::runtime_error("Cannot create replacement alpha fixture");
+    }
+    tx::Settings settings; settings.replace=true; settings.replace_dir=root; tx::configure(settings);
+    motorstorm::reset_software_ge();
+    _putenv_s("PSPRECOMP_MOTORSTORM_TEXTURE_FILTER","enhanced");
+    for (unsigned image = 0; image < 2; ++image)
+        for (unsigned alpha : {255u,64u}) {
+            motorstorm::GpuTexture texture;
+            texture.key = 0xAA000000ull+image*256+alpha;
+            texture.width=texture.height=2;
+            texture.levels={{(alpha<<24)|0x00ABCDEFu,(alpha<<24)|0x00ABCDEFu,
+                             (alpha<<24)|0x00ABCDEFu,(alpha<<24)|0x00ABCDEFu}};
+            texture.opaque=alpha==255;
+            texture.replacement_hash=hashes[image]; texture.replacement_width=texture.replacement_rows=2;
+            motorstorm::GpuDraw draw;
+            draw.framebuffer=kColor; draw.stride=32; draw.format=3; draw.right=draw.bottom=32;
+            draw.commands[0x1E]=1; draw.commands[0xB8]=0x101; draw.commands[0xC9]=0x103;
+            draw.commands[0xC6]=0x101;
+            const auto v=[](float x,float y,float u,float vv) { return motorstorm::GpuVertex{x,y,0,0xFFFFFFFFu,0,u,vv}; };
+            const std::array vertices{v(4,4,0,0),v(20,4,2,0),v(4,20,0,2),v(4,20,0,2),v(20,4,2,0),v(20,20,2,2)};
+            for (unsigned attempt = 0; attempt < 500; ++attempt) {
+                memory.zero(kColor,32*32*4);
+                motorstorm::gpu_initialize();
+                const auto before = motorstorm::gpu_report().replaced_draws;
+                motorstorm::gpu_submit(memory,draw,vertices,&texture); motorstorm::gpu_sync(memory);
+                if (motorstorm::gpu_report().replaced_draws > before) break;
+                if (attempt == 499) throw std::runtime_error("Replacement fixture did not load");
+                Sleep(2);
+            }
+            const std::uint32_t expected = ((image ? std::min(alpha,128u) : alpha)<<24)|0x00552211u;
+            if (memory.load32(kColor+(10*32+10)*4) != expected)
+                throw std::runtime_error("Skipping an opaque original changed replacement colour or runtime alpha");
+        }
+    tx::shutdown();
+    motorstorm::gpu_shutdown();
+    _putenv_s("PSPRECOMP_MOTORSTORM_TEXTURE_FILTER","");
+    std::filesystem::remove_all(root);
+    std::puts("Enhanced replacement colour/alpha exact for opaque, translucent and RGB-only pack images");
+}
+
+void post_pixels() {
+    motorstorm::GpuImage input{256, 8, std::vector<std::uint8_t>(256 * 8 * 4)};
+    for (unsigned y = 0; y < input.height; ++y)
+        for (unsigned x = 0; x < input.width; ++x) {
+            auto *p = input.rgba.data() + (y * input.width + x) * 4;
+            p[0] = p[1] = p[2] = static_cast<std::uint8_t>(x); p[3] = 255;
+        }
+    motorstorm::PostSettings settings;
+    settings.extended_color = settings.color_correction = settings.lut = settings.sharpening = false;
+    for (unsigned look = 0; look < 3; ++look)
+        for (float peak : {1.0f, 2.0f, 6.0f, 16.0f}) {
+            settings.agx_look = look; settings.hdr_peak = peak;
+            const auto output = motorstorm::gpu_debug_post(input, settings);
+            const float gain = motorstorm::agx_mid_grey_gain(peak, look);
+            for (unsigned x = 0; x < 256; ++x) {
+                const auto *p = output.rgba.data() + x * 4;
+                const float y = (0.2126f*p[0] + 0.7152f*p[1] + 0.0722f*p[2]) / 255;
+                if (std::fabs(y - motorstorm::agx_display(x / 255.0f, peak, gain, look)) > 2.0f / 255)
+                    throw std::runtime_error("AgX CPU calibration differs from GPU post pixels");
+            }
+            const auto *grey = output.rgba.data() + 117 * 4;
+            const float y = (0.2126f*grey[0] + 0.7152f*grey[1] + 0.0722f*grey[2]) / 255;
+            if (std::fabs(y - 117.0f / 255) > 2.0f / 255)
+                throw std::runtime_error("Every AgX look must preserve GPU mid grey");
+            if (look < 2 && output.rgba[255 * 4] == 255)
+                throw std::runtime_error("Synthetic HDR white must not hard-clip in AgX");
+        }
+    settings = motorstorm::PostSettings{};
+    // This patterned gradient exercises debanding, CAS, grade, LUT and dither.
+    for (unsigned y = 0; y < input.height; ++y)
+        for (unsigned x = 0; x < input.width; ++x) {
+            auto *p = input.rgba.data() + (y * input.width + x) * 4;
+            p[0] = p[1] = p[2] = static_cast<std::uint8_t>(120 + (x + y) % 3);
+        }
+    if (motorstorm::gpu_debug_post(input, settings, 0.0f).rgba != input.rgba)
+        throw std::runtime_error("Zero fade must preserve the original pixels, including debanding and dither");
+    if (motorstorm::gpu_debug_post(input, settings, 1.0f).rgba == input.rgba)
+        throw std::runtime_error("Post effects must actually change the GPU image");
+    settings.agx = settings.color_correction = settings.lut = settings.sharpening = false;
+    if (motorstorm::gpu_debug_post(input, settings, 0.0f).rgba != input.rgba ||
+        motorstorm::gpu_debug_post(input, settings, 1.0f).rgba == input.rgba)
+        throw std::runtime_error("Debanding must fade independently of the other effects");
+    // Async colour results use full float32 RGB; moving colour work out of the
+    // monitor-resolution pixel shader must preserve the original post pixels.
+    motorstorm::GpuImage pattern{37,19,std::vector<std::uint8_t>(37*19*4)};
+    for (std::size_t p = 0; p < pattern.rgba.size(); p += 4) {
+        pattern.rgba[p] = static_cast<std::uint8_t>((p*31+17)%256);
+        pattern.rgba[p+1] = static_cast<std::uint8_t>((p*13+85)%256);
+        pattern.rgba[p+2] = static_cast<std::uint8_t>((p*47+33)%256);
+        pattern.rgba[p+3] = 255;
+    }
+    for (unsigned look = 0; look < 3; ++look)
+        for (float fade : {0.0f,0.1f,0.5f,1.0f}) {
+            settings = motorstorm::PostSettings{};
+            settings.agx_look = look;
+            settings.hdr_peak = look == 2 ? 16.0f : 6.0f;
+            settings.exposure = 0.3f; settings.contrast = 1.2f;
+            settings.temperature = 0.25f; settings.tint = -0.1f;
+            settings.saturation = 1.1f;
+            const auto async = motorstorm::gpu_debug_post(pattern,settings,fade);
+            const auto reference = motorstorm::gpu_debug_post(pattern,settings,fade,true);
+            if (async.rgba != reference.rgba)
+                throw std::runtime_error("Async float32 post output must equal reference shader pixels");
+        }
+    std::puts("Async float32 post colour matches reference pixels for all looks, grades and fades");
+    std::puts("GPU post pixels: all AgX looks/peaks calibrated, highlight shoulder and complete fade verified");
+}
+
+void widescreen_pixels(psprecomp::GuestMemory &memory) {
+    motorstorm::gpu_shutdown();
+    _putenv_s("PSPRECOMP_MOTORSTORM_WIDESCREEN", "auto");
+    const auto run = [&](unsigned width, unsigned height, bool racing, bool hardware,
+                         float left, float top, float right, float bottom, bool partial_scissor = false) {
+        motorstorm::gpu_set_output_size(width, height);
+        motorstorm::gpu_set_racing(racing);
+        memory.zero(kColor, 512u * 272u * 4);
+        motorstorm::gpu_initialize();
+        motorstorm::GpuDraw draw;
+        draw.framebuffer = kColor; draw.stride = 512; draw.format = 3;
+        draw.right = 480; draw.bottom = 272;
+        draw.hardware_transform = hardware;
+        draw.model_to_clip = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        draw.scale = {240, -136, 1, 0}; draw.center = {240, 136, 0, 0};
+        if (partial_scissor) { draw.left = 20; draw.right = 100; }
+        const auto v = [](float x, float y) {
+            return motorstorm::GpuVertex{x,y,0,0xFFFFFFFFu};
+        };
+        const std::array vertices{v(left,top),v(right,top),v(left,bottom),
+                                 v(left,bottom),v(right,top),v(right,bottom)};
+        motorstorm::gpu_submit(memory, draw, vertices, nullptr);
+        motorstorm::gpu_sync(memory);
+        return motorstorm::gpu_capture(memory, kColor, 512, 3, 480, 272);
+    };
+    const auto count = [](const motorstorm::GpuImage &image) {
+        unsigned count = 0;
+        for (std::size_t p = 0; p < image.rgba.size(); p += 4)
+            if (image.rgba[p]) ++count;
+        return count;
+    };
+    if (count(run(480,272,true,true,1.1f,-0.1f,1.2f,0.1f)) != 0)
+        throw std::runtime_error("Native frustum must clip geometry beyond its horizontal edge");
+    for (const auto size : {std::array{1920u,1080u}, std::array{2560u,1080u}, std::array{3840u,1080u}}) {
+        const float aspect = motorstorm::widescreen_scale(size[0], size[1]);
+        const auto world = run(size[0],size[1],true,true,-0.25f,-0.1f,0.25f,0.1f);
+        const unsigned area = count(world);
+        // Horizontal expansion must compensate presentation, keeping objects
+        // the same physical width/height rather than stretching or cropping.
+        if (std::fabs(static_cast<float>(area) * aspect - 120.0f * 28.0f) > 120.0f)
+            throw std::runtime_error("Widescreen world geometry changed its displayed proportions");
+        if (aspect > 1.2f && count(run(size[0],size[1],true,true,1.1f,-0.1f,1.2f,0.1f)) == 0)
+            throw std::runtime_error("Ultrawide must reveal geometry beyond the PSP frustum");
+        const auto hud = run(size[0],size[1],true,false,20,20,100,60,true);
+        const int expected_left = static_cast<int>(std::ceil(motorstorm::widescreen_hud_x(20,aspect)-0.5f));
+        const int expected_right = static_cast<int>(std::ceil(motorstorm::widescreen_hud_x(100,aspect)-0.5f));
+        for (int x = 0; x < 480; ++x) {
+            const bool on = hud.rgba[(30*480+x)*4] != 0;
+            if (on != (x >= expected_left && x < expected_right))
+                throw std::runtime_error("Centred HUD position, width or scissor changed on an ultrawide display");
+        }
+        if (count(run(size[0],size[1],true,false,0,0,480,272)) != 480u*272u)
+            throw std::runtime_error("Full-screen overlays must cover the expanded image");
+        if (count(run(size[0],size[1],false,true,1.1f,-0.1f,1.2f,0.1f)) != 0)
+            throw std::runtime_error("Menus must retain their native frustum on wider monitors");
+    }
+    motorstorm::gpu_shutdown();
+    _putenv_s("PSPRECOMP_MOTORSTORM_WIDESCREEN", "psp");
+    if (count(run(3840,1080,true,true,1.1f,-0.1f,1.2f,0.1f)) != 0)
+        throw std::runtime_error("The PSP aspect option must disable the widened frustum");
+    motorstorm::gpu_shutdown();
+    _putenv_s("PSPRECOMP_MOTORSTORM_WIDESCREEN", "");
+    motorstorm::gpu_set_output_size(480,272);
+    motorstorm::gpu_set_racing(false);
+    std::puts("GPU widescreen: 16:9 / 21:9 / 32:9 Hor+, HUD/scissors, overlays, menus and PSP opt-out passed");
+}
+
 int main() {
     try {
         _putenv_s("PSPRECOMP_MOTORSTORM_RESOLUTION", "1");
@@ -292,6 +510,11 @@ int main() {
             throw std::runtime_error("Depth-disabled UI must preserve the vehicle preview depth buffer");
         _putenv_s("PSPRECOMP_MOTORSTORM_RENDERER", "d3d12");
         motorstorm::reset_software_ge();
+        post_pixels();
+        widescreen_pixels(memory);
+        indexed_vertex_cache(memory);
+        replacement_alpha(memory);
+        motorstorm::reset_software_ge();
         for (std::size_t i = 0; i < cases.size(); ++i)
             if (run(memory, cases[i]) != expected[i]) {
                 std::fprintf(stderr, "GPU/software mismatch case=%zu format=%u first_state=%08X\n", i,
@@ -302,6 +525,26 @@ int main() {
         run(memory, Case{3, {}});
         if (memory.load16(kDepth + (10 * 32 + 10) * 2) != 50)
             throw std::runtime_error("GPU depth-disabled UI must preserve the preview depth buffer");
+        // 32-bit colour while racing: 16-bit targets keep the dropped colour
+        // bits on the GPU, but what the game reads back stays PSP exact.
+        motorstorm::gpu_set_racing(true);
+        for (std::size_t i = 0; i < cases.size(); ++i)
+            if (run(memory, cases[i]) != expected[i]) {
+                std::fprintf(stderr, "32-bit colour changed guest pixels case=%zu format=%u\n", i, cases[i].format);
+                return 1;
+            }
+        const auto pixel = [&](bool racing) {
+            motorstorm::gpu_set_racing(racing);
+            run(memory, Case{0, {}});  // RGB565 sprite of colour D0 B0 90
+            const auto image = motorstorm::gpu_capture(memory, kColor, 32, 0, 32, 32);
+            const auto *p = image.rgba.data() + (10 * 32 + 10) * 4;
+            return std::array<std::uint8_t, 3>{p[0], p[1], p[2]};
+        };
+        if (pixel(true) != std::array<std::uint8_t, 3>{0xD0, 0xB0, 0x90} ||
+            pixel(false) != std::array<std::uint8_t, 3>{214, 178, 148})
+            throw std::runtime_error("32-bit colour must show full channels in RGB565 only while racing");
+        run(memory, Case{3, {}});  // the presentation checks below show a 32-bit target
+        std::puts("32-bit colour in 16-bit targets: guest pixels exact, display precision restored");
         decode_parity();
         auto report = motorstorm::gpu_report();
         if (!report.active || report.draws < cases.size() + 3 || report.software_draws ||
@@ -358,6 +601,13 @@ int main() {
                                     nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
                 if (!motorstorm::gpu_present(memory, scaled_window, kColor, 32, 3, 32, 32))
                     throw std::runtime_error("Scaled GPU presentation failed");
+                // Race enhancements run their passes at every scale and AA mode.
+                motorstorm::gpu_set_racing(true);
+                for (int frame = 0; frame < 3; ++frame) {
+                    if (!motorstorm::gpu_present(memory, scaled_window, kColor, 32, 3, 32, 32))
+                        throw std::runtime_error("Enhanced GPU presentation failed");
+                    Sleep(20);
+                }
                 motorstorm::gpu_shutdown();
                 DestroyWindow(scaled_window);
                 std::printf("resolution=%dx AA=%s: resolve, feedback, detail retention, edge filtering and "

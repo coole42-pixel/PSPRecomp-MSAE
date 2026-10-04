@@ -20,6 +20,7 @@ struct NativeConfig {
     bool dynamic_fps{true};  // fall back to 30 fps instead of running in slow motion
     bool vsync{true};
     std::string texture_filtering{"psp"};  // psp (exact) or enhanced (anisotropic + mips)
+    std::string widescreen{"auto"};  // auto = Hor+ gameplay, psp = original aspect
     std::string fullscreen_mode{"borderless"}, audio_api{"wasapi"};
     std::uint32_t fullscreen_refresh{};  // exclusive fullscreen refresh in Hz, 0 = desktop
     // Texture packs; directories are absolute (relative INI values resolve
@@ -27,6 +28,14 @@ struct NativeConfig {
     bool texture_dump{}, texture_replace{true};
     std::filesystem::path texture_dump_dir, texture_replace_dir;
     std::uint32_t texture_budget_mb{1024};
+    // [enhancements]: race-only image effects (see motorstorm_post.hpp). Kept
+    // as the INI text; reals are validated here and parsed by the renderer.
+    bool post{true}, post_color_correction{true}, post_lut{true}, post_sharpen{true};
+    std::uint32_t post_color_depth{32};
+    std::string post_tonemap{"agx"}, post_agx_look{"punchy"};
+    std::string post_hdr_peak{"6.0"}, post_exposure{"0.0"}, post_contrast{"1.0"}, post_saturation{"1.0"},
+        post_temperature{"0.0"}, post_tint{"0.0"}, post_lut_strength{"1.0"}, post_sharpen_strength{"0.2"};
+    std::filesystem::path post_lut_file;
     bool trace_imports{}, trace_filesystem{}, verbose{};
     std::vector<std::pair<std::string, std::string>> debug_environment;
     // Unknown or misplaced keys; they are reported in the log, never fatal.

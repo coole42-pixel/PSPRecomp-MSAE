@@ -108,6 +108,10 @@ std::uint32_t key_to_pad(WPARAM key) {
 
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     switch (message) {
+    case WM_SIZE:
+        if (wparam != SIZE_MINIMIZED)
+            gpu_set_output_size(LOWORD(lparam), HIWORD(lparam));
+        return 0;
     case WM_CLOSE:
         g_close_requested.store(true);
         DestroyWindow(window);
@@ -277,6 +281,7 @@ void window_thread_main() {
         DispatchMessageW(&message);
     }
     g_window = nullptr;
+    gpu_set_output_size(480, 272);
     g_fullscreen.store(false);
 }
 

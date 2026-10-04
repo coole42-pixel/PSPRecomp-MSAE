@@ -33,8 +33,12 @@ dumps and bounded runs. Both the executable and launcher honor edited settings;
 explicit launcher arguments or `PSPRECOMP_*` environment options override them.
 `--config <path>` selects another INI, with relative paths based on its directory.
 
-**F11 or Alt+Enter** toggles borderless fullscreen on the current monitor. The PSP
-aspect ratio is preserved with black bars when needed. Escape returns to the
+**F11 or Alt+Enter** toggles borderless fullscreen on the current monitor.
+`[graphics] widescreen = auto` (default) expands the horizontal gameplay view
+to match wider windows and 16:9, 21:9 or 32:9 monitors. Vertical field of view
+stays the same and the HUD retains its proportions in a centred safe area.
+Menus, movies and narrower windows retain the PSP aspect ratio. Set
+`widescreen = psp` to keep the original gameplay view as well. Escape returns to the
 original window size; Escape in windowed mode or Alt+F4 closes the game.
 Set `[window] fullscreen = true` for fullscreen startup, or use `run.ps1 -Fullscreen`.
 
@@ -45,6 +49,8 @@ See [build/configuration/fullscreen verification](docs/BUILD_CONFIGURATION_FULLS
 for the native tests and game-run evidence.
 See [SSAA performance and audio recovery](docs/PERFORMANCE_AUDIO_SSAA.md) for
 the current quality-preserving optimization, frame comparisons and audio checks.
+See [widescreen and post effects](docs/WIDESCREEN_POST.md) for the implementation
+and validation of the aspect and image-effect fixes.
 
 The launcher selects hardware D3D12 rendering. It requires a D3D12 GPU with rasterizer ordered views. Use `-Renderer software` for the software reference or `-Renderer auto` to allow a reported software fallback. `-Bringup` enables historical scene skips for diagnostics; normal play leaves it off.
 

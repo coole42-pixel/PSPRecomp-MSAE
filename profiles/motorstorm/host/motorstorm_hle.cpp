@@ -350,6 +350,23 @@ void trace_game_state(const Runtime &runtime) {
     log_line("STATE", out.str());
 }
 
+// Race scenes for the [enhancements] effects. The scene runner's current scene
+// object (0x08A76FDC, see trace_game_state) is 0x08A76044 during the race
+// countdown and 0x08A76064 while racing; the pause menu (0x08A76074), loading
+// screens, menus and movies are other scenes and keep the original image.
+void update_racing_scene(const Runtime &runtime) {
+    const auto &memory = runtime.memory();
+    const auto scene = memory.contains(0x08A76FDCu, 4u) ? memory.load32(0x08A76FDCu) : 0u;
+    const bool racing = scene == 0x08A76044u || scene == 0x08A76064u;
+    static bool previous = false;
+    if (racing != previous) {
+        log_line(category::kGe, std::string("race scene ") + (racing ? "entered" : "left") +
+                                    " (scene " + hex32(scene) + ", guest_us=" + std::to_string(g_virtual_time_us) + ")");
+        previous = racing;
+    }
+    gpu_set_racing(racing);
+}
+
 // Scheduler counters for the end-of-run census.
 std::uint64_t g_switch_count = 0;
 std::uint64_t g_delay_count = 0;
@@ -3294,6 +3311,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
                                             " sync=" + hex32(ctx.gpr[7]));
             }
             trace_game_state(rt);
+            update_racing_scene(rt);
             if (MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_TRACE_DISPLAY")) {
                 if (g_display.set_frame_buf_count <= 4u || g_display.set_frame_buf_count % 60u == 0u) {
                     std::ostringstream out;
@@ -3537,6 +3555,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
             const bool rasterize = (MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_SOFTGE") || gpu_requested()) &&
                 g_ge_submissions >= start_after;
             for (const auto &record : g_ge_list_records) {
+                update_racing_scene(rt);
                 const auto interrupts = motorstorm::software_ge_execute_list(rt.memory(), record.list, record.stall, rasterize, record.submission);
                 const auto found = g_ge_callback_table.find(record.callback_id);
                 if (found == g_ge_callback_table.end()) continue;
@@ -4555,6 +4574,14 @@ void report_summary() {
                 << " streamed_texture_updates=" << gpu.streamed_texture_updates
                 << " replaced_draws=" << gpu.replaced_draws << " replacement_uploads=" << gpu.replacement_uploads
                 << " replacements_evicted=" << gpu.replacements_evicted;
+            if (gpu.post_gpu_frames) {
+                const double scale = 1.0e-6 / gpu.post_gpu_frames;
+                out << " post_gpu_frames=" << gpu.post_gpu_frames
+                    << " post_resolve_ms=" << gpu.post_gpu_ns[0]*scale
+                    << " post_deband_ms=" << gpu.post_gpu_ns[1]*scale
+                    << " post_color_ms=" << gpu.post_gpu_ns[2]*scale
+                    << " post_max_ms=" << gpu.post_gpu_max_ns*1.0e-6;
+            }
             out << " output=" << gpu.resolution_scale*480 << 'x' << gpu.resolution_scale*272
                 << " raster=" << gpu.raster_half*240 << 'x' << gpu.raster_half*136 << " AA=" << gpu.antialiasing;
             log_line(category::kGe, out.str());
@@ -4578,6 +4605,7 @@ void report_summary() {
             << " sprites=" << summary.prims_by_type[6] << " unknown=" << summary.unknown_commands
             << " pixels=" << summary.pixels_drawn << " colored=" << summary.pixels_colored
             << " textured_draws=" << summary.textured_draws
+            << " vertex_decodes=" << summary.vertex_decodes << " vertex_cache_hits=" << summary.vertex_cache_hits
             << " transfers=" << summary.block_transfers << " transferred_bytes=" << summary.transferred_bytes;
         log_line(category::kGe, out.str());
     }

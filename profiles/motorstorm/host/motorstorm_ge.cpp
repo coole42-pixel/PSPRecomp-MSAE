@@ -2341,12 +2341,32 @@ void execute_list(GuestMemory &memory, std::uint32_t address, std::uint32_t stal
             const bool gpu_transform=gpu_draw && type!=6u;
             {
                 perf::Scope decode_profile(perf::kGeDecode);
+                // A PSP indexed mesh can reference the same vertex many times.
+                // Morphing, skinning, lighting and UV generation depend only
+                // on that vertex and this draw's immutable GE state. Reuse the
+                // complete result within the draw, never across commands.
+                struct VertexCache {
+                    std::array<Vertex, 4096> decoded{};
+                    std::array<std::uint32_t, 4096> stamps{};
+                    std::uint32_t generation{};
+                };
+                static thread_local VertexCache cache;
+                static const bool cache_enabled = [] {
+                    const char *value = std::getenv("PSPRECOMP_MOTORSTORM_VERTEX_CACHE");
+                    return !value || std::strcmp(value, "0") != 0;
+                }();
+                const bool use_cache = cache_enabled && index_width != 0u && count >= 32u;
+                if (use_cache && ++cache.generation == 0u) {
+                    cache.stamps.fill(0u);
+                    cache.generation = 1u;
+                }
                 for (std::uint32_t index = 0u; index < count; ++index) {
+                    std::uint32_t element = UINT32_MAX;
                     if (index_width != 0u) {
                         const std::uint32_t at = g_state.index_address + index * index_width;
                         if (!memory.contains(at, index_width))
                             break;
-                        const std::uint32_t element = index_width == 1u   ? memory.aot_load8(at)
+                        element = index_width == 1u   ? memory.aot_load8(at)
                                                       : index_width == 2u ? memory.aot_load16(at)
                                                                           : memory.aot_load32(at);
                         const std::uint64_t at_vertex = static_cast<std::uint64_t>(g_state.vertex_address) +
@@ -2355,9 +2375,19 @@ void execute_list(GuestMemory &memory, std::uint32_t address, std::uint32_t stal
                             break;
                         vertex_cursor = static_cast<std::uint32_t>(at_vertex);
                     }
+                    if (use_cache && element < cache.stamps.size() && cache.stamps[element] == cache.generation) {
+                        vertices.push_back(cache.decoded[element]);
+                        ++g_summary.vertex_cache_hits;
+                        continue;
+                    }
                     Vertex vertex{};
                     if (!decode_vertex(memory, g_state, vertex_cursor, vertex, gpu_transform))
                         break;
+                    ++g_summary.vertex_decodes;
+                    if (use_cache && element < cache.stamps.size()) {
+                        cache.decoded[element] = vertex;
+                        cache.stamps[element] = cache.generation;
+                    }
                     vertices.push_back(vertex);
                 }
             }

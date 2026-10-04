@@ -108,6 +108,10 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
                     invalid("must be None, FXAA, SSAA2x or SSAA4x");
                 config.antialiasing = choice;
             } else if (key == "vsync") config.vsync = boolean();
+            else if (key == "widescreen") {
+                if (choice != "auto" && choice != "psp") invalid("must be auto or psp");
+                config.widescreen = choice;
+            }
             else if (key == "texture_filtering") {
                 if (choice != "psp" && choice != "enhanced") invalid("must be psp or enhanced");
                 config.texture_filtering = choice;
@@ -136,16 +140,52 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
             else if (key == "replace_dir") config.texture_replace_dir = resolve();
             else if (key == "budget_mb") config.texture_budget_mb = static_cast<std::uint32_t>(number(64u, 65536u));
         }
+        if (section == "enhancements") {
+            const auto real = [&](double minimum, double maximum) {
+                double result{};
+                const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result);
+                if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || result < minimum ||
+                    result > maximum)
+                    invalid("is not a number in its documented range");
+                return value;
+            };
+            if (key == "enabled") config.post = boolean();
+            else if (key == "color_depth") {
+                if (choice != "16" && choice != "32") invalid("must be 16 or 32");
+                config.post_color_depth = choice == "16" ? 16u : 32u;
+            } else if (key == "tonemapping") {
+                if (choice != "agx" && choice != "none") invalid("must be agx or none");
+                config.post_tonemap = choice;
+            } else if (key == "agx_look") {
+                if (choice != "none" && choice != "punchy" && choice != "golden")
+                    invalid("must be none, punchy or golden");
+                config.post_agx_look = choice;
+            } else if (key == "hdr_peak") config.post_hdr_peak = real(1.0, 16.0);
+            else if (key == "color_correction") config.post_color_correction = boolean();
+            else if (key == "exposure") config.post_exposure = real(-3.0, 3.0);
+            else if (key == "contrast") config.post_contrast = real(0.5, 2.0);
+            else if (key == "saturation") config.post_saturation = real(0.0, 2.0);
+            else if (key == "temperature") config.post_temperature = real(-1.0, 1.0);
+            else if (key == "tint") config.post_tint = real(-1.0, 1.0);
+            else if (key == "lut") config.post_lut = boolean();
+            else if (key == "lut_file") config.post_lut_file = (path.parent_path() / value).lexically_normal();
+            else if (key == "lut_strength") config.post_lut_strength = real(0.0, 1.0);
+            else if (key == "sharpening") config.post_sharpen = boolean();
+            else if (key == "sharpening_strength") config.post_sharpen_strength = real(0.0, 1.0);
+        }
         static const std::map<std::string, std::set<std::string>> known{
             {"", {"eboot", "disc_root", "log_file", "trace_imports", "trace_filesystem", "verbose"}},
             {"paths", {"eboot", "disc_root"}},
             {"logging", {"log_file", "trace_imports", "trace_filesystem", "verbose"}},
             {"runtime", {"max_dispatches"}},
             {"graphics", {"resolution", "renderer", "antialiasing", "fps", "dynamic_fps", "vsync",
-                          "texture_filtering"}},
+                          "texture_filtering", "widescreen"}},
             {"window", {"enabled", "fullscreen", "scale", "fullscreen_mode", "fullscreen_refresh"}},
             {"audio", {"enabled", "api"}},
             {"textures", {"dump", "replace", "dump_dir", "replace_dir", "budget_mb"}},
+            {"enhancements", {"enabled", "color_depth", "tonemapping", "agx_look", "hdr_peak", "color_correction",
+                              "exposure", "contrast", "saturation", "temperature", "tint", "lut", "lut_file",
+                              "lut_strength", "sharpening", "sharpening_strength"}},
             {"debug", {"profile", "trace_controller", "trace_music", "trace_atrac", "trace_display",
                        "d3d12_debug", "pc_sample", "frame_dump", "stop_after_ge", "frame_dump_every",
                        "frame_dump_count", "frame_dump_dir"}},
@@ -203,6 +243,7 @@ void apply_native_config(const NativeConfig &config) {
     set_default("PSPRECOMP_MOTORSTORM_DYNAMIC_FPS", config.dynamic_fps ? "1" : "0");
     set_default("PSPRECOMP_MOTORSTORM_VSYNC", config.vsync ? "1" : "0");
     set_default("PSPRECOMP_MOTORSTORM_TEXTURE_FILTER", config.texture_filtering);
+    set_default("PSPRECOMP_MOTORSTORM_WIDESCREEN", config.widescreen);
     set_default("PSPRECOMP_MOTORSTORM_FULLSCREEN_MODE", config.fullscreen_mode);
     set_default("PSPRECOMP_MOTORSTORM_FULLSCREEN_REFRESH", std::to_string(config.fullscreen_refresh));
     set_default("PSPRECOMP_MOTORSTORM_AUDIO_API", config.audio_api);
@@ -215,6 +256,23 @@ void apply_native_config(const NativeConfig &config) {
     set_default("PSPRECOMP_MOTORSTORM_TEXTURE_DUMP_DIR", dump_dir.lexically_normal().string());
     set_default("PSPRECOMP_MOTORSTORM_TEXTURE_REPLACE_DIR", replace_dir.lexically_normal().string());
     set_default("PSPRECOMP_MOTORSTORM_TEXTURE_BUDGET_MB", std::to_string(config.texture_budget_mb));
+    set_default("PSPRECOMP_MOTORSTORM_POST", config.post ? "1" : "0");
+    set_default("PSPRECOMP_MOTORSTORM_POST_COLOR_DEPTH", std::to_string(config.post_color_depth));
+    set_default("PSPRECOMP_MOTORSTORM_POST_TONEMAP", config.post_tonemap);
+    set_default("PSPRECOMP_MOTORSTORM_POST_AGX_LOOK", config.post_agx_look);
+    set_default("PSPRECOMP_MOTORSTORM_POST_HDR_PEAK", config.post_hdr_peak);
+    set_default("PSPRECOMP_MOTORSTORM_POST_COLOR_CORRECTION", config.post_color_correction ? "1" : "0");
+    set_default("PSPRECOMP_MOTORSTORM_POST_EXPOSURE", config.post_exposure);
+    set_default("PSPRECOMP_MOTORSTORM_POST_CONTRAST", config.post_contrast);
+    set_default("PSPRECOMP_MOTORSTORM_POST_SATURATION", config.post_saturation);
+    set_default("PSPRECOMP_MOTORSTORM_POST_TEMPERATURE", config.post_temperature);
+    set_default("PSPRECOMP_MOTORSTORM_POST_TINT", config.post_tint);
+    set_default("PSPRECOMP_MOTORSTORM_POST_LUT", config.post_lut ? "1" : "0");
+    if (!config.post_lut_file.empty())
+        set_default("PSPRECOMP_MOTORSTORM_POST_LUT_FILE", config.post_lut_file.string());
+    set_default("PSPRECOMP_MOTORSTORM_POST_LUT_STRENGTH", config.post_lut_strength);
+    set_default("PSPRECOMP_MOTORSTORM_POST_SHARPEN", config.post_sharpen ? "1" : "0");
+    set_default("PSPRECOMP_MOTORSTORM_POST_SHARPEN_STRENGTH", config.post_sharpen_strength);
     set_default("PSPRECOMP_MOTORSTORM_WINDOW", config.window ? "1" : "0");
     set_default("PSPRECOMP_MOTORSTORM_FULLSCREEN", config.fullscreen ? "1" : "0");
     set_default("PSPRECOMP_MOTORSTORM_WINDOW_SCALE", std::to_string(config.window_scale));

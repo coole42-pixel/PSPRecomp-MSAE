@@ -3,6 +3,7 @@
 #include "motorstorm_presentation.hpp"
 
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -13,11 +14,11 @@ void check(bool condition, const char *message) {
     if (!condition) throw std::runtime_error(message);
 }
 struct EnvironmentScope {
-    std::array<const char *, 10> names{"PSPRECOMP_MOTORSTORM_RENDERER", "PSPRECOMP_MOTORSTORM_RESOLUTION",
+    std::array<const char *, 11> names{"PSPRECOMP_MOTORSTORM_RENDERER", "PSPRECOMP_MOTORSTORM_RESOLUTION",
         "PSPRECOMP_MOTORSTORM_AA", "PSPRECOMP_MOTORSTORM_WINDOW", "PSPRECOMP_MOTORSTORM_FULLSCREEN",
         "PSPRECOMP_MOTORSTORM_WINDOW_SCALE", "PSPRECOMP_MOTORSTORM_AUDIO", "PSPRECOMP_MOTORSTORM_SOFTGE",
-        "PSPRECOMP_MOTORSTORM_PROFILE", "PSPRECOMP_MOTORSTORM_FPS"};
-    std::array<std::string, 10> previous;
+        "PSPRECOMP_MOTORSTORM_PROFILE", "PSPRECOMP_MOTORSTORM_FPS", "PSPRECOMP_MOTORSTORM_WIDESCREEN"};
+    std::array<std::string, 11> previous;
     EnvironmentScope() {
         for (std::size_t i = 0; i < names.size(); ++i) {
             if (const char *value = std::getenv(names[i])) previous[i] = value;
@@ -34,7 +35,7 @@ int main() {
     try {
         const auto shipped = motorstorm::load_native_config(MOTORSTORM_CONFIG_TEMPLATE);
         check(shipped.loaded && shipped.resolution == 4u && shipped.antialiasing == "ssaa4x" &&
-              shipped.renderer == "d3d12" && shipped.window && shipped.audio && shipped.fps == 60u,
+              shipped.renderer == "d3d12" && shipped.window && shipped.audio && shipped.fps == 60u && shipped.widescreen == "auto",
               "Shipped INI must enable native 4x / SSAA4x / 60 fps with window and audio");
         check(!shipped.fullscreen && !shipped.trace_imports && !shipped.trace_filesystem &&
               !shipped.verbose && shipped.debug_environment.empty(), "Debug examples remain commented out");
@@ -43,7 +44,7 @@ int main() {
         const auto path = directory / "settings.ini";
         {
             std::ofstream file(path);
-            file << "\xEF\xBB\xBF[graphics]\nresolution=2\nantialiasing=None\nrenderer=auto\nfps=Original\n"
+            file << "\xEF\xBB\xBF[graphics]\nresolution=2\nantialiasing=None\nrenderer=auto\nfps=Original\nwidescreen=psp\n"
                     "[window]\nenabled=false\nfullscreen=true\nscale=3\n[audio]\nenabled=false\n"
                     "[logging]\ntrace_imports=true\ntrace_filesystem=true\nverbose=true\n"
                     "[runtime]\nmax_dispatches=123456\n[debug]\nprofile=true ; example comment\n"
@@ -52,7 +53,7 @@ int main() {
         const auto custom = motorstorm::load_native_config(path);
         check(custom.resolution == 2u && custom.antialiasing == "none" && custom.renderer == "auto" &&
               !custom.window && custom.fullscreen && custom.window_scale == 3u && !custom.audio &&
-              custom.fps == 0u,
+              custom.fps == 0u && custom.widescreen == "psp",
               "INI graphics, window and audio choices load independently");
         check(custom.trace_imports && custom.trace_filesystem && custom.verbose && custom.max_dispatches == 123456u,
               "Logging and dispatch options are honored");
@@ -66,6 +67,10 @@ int main() {
             check(std::string(std::getenv("PSPRECOMP_MOTORSTORM_RESOLUTION")) == "1" &&
                   std::string(std::getenv("PSPRECOMP_MOTORSTORM_WINDOW")) == "0", "Explicit environment choices override INI");
             check(std::string(std::getenv("PSPRECOMP_MOTORSTORM_FPS")) == "60", "INI frame rate reaches the runtime");
+            check(std::string(std::getenv("PSPRECOMP_MOTORSTORM_WIDESCREEN")) == "auto", "INI enables automatic widescreen");
+            _putenv_s("PSPRECOMP_MOTORSTORM_WIDESCREEN", "psp");
+            motorstorm::apply_native_config(shipped);
+            check(std::string(std::getenv("PSPRECOMP_MOTORSTORM_WIDESCREEN")) == "psp", "Explicit PSP aspect overrides auto");
             check(std::string(std::getenv("PSPRECOMP_MOTORSTORM_AA")) == "ssaa4x" &&
                   std::getenv("PSPRECOMP_MOTORSTORM_PROFILE") == nullptr, "INI fills defaults without enabling debug switches");
             _putenv_s("PSPRECOMP_MOTORSTORM_PROFILE", "");
@@ -77,7 +82,8 @@ int main() {
         }
         for (const char *invalid : {"[graphics]\nresolution=0\n", "[graphics]\nantialiasing=MSAA\n",
                                    "[window]\nfullscreen=perhaps\n", "[window]\nscale=9\n",
-                                   "[graphics]\nfps=20\n", "[graphics]\nfps=241\n", "[graphics]\nfps=fast\n"}) {
+                                   "[graphics]\nfps=20\n", "[graphics]\nfps=241\n", "[graphics]\nfps=fast\n",
+                                   "[graphics]\nwidescreen=stretch\n"}) {
             { std::ofstream file(path); file << invalid; }
             bool rejected = false;
             try { (void)motorstorm::load_native_config(path); }
@@ -145,6 +151,17 @@ int main() {
         const auto ultrawide = motorstorm::fit_presentation(2560, 1080, 480, 272);
         check(ultrawide.height == 1080u && ultrawide.width == 1905u && ultrawide.left == 327u && ultrawide.top == 0u,
               "Ultrawide fullscreen pillarboxes the PSP aspect ratio");
+        for (const auto width : {1920u, 2560u, 3840u}) {
+            const float scale = motorstorm::widescreen_scale(width, 1080);
+            const auto fitted = motorstorm::fit_game_presentation(width, 1080, 480, 272, scale);
+            check(fitted.height == 1080u && fitted.width >= width - 1u && fitted.left == 0u,
+                  "Automatic widescreen gameplay fills 16:9, 21:9 and 32:9 windows");
+            const float left = motorstorm::widescreen_hud_x(0, scale), right = motorstorm::widescreen_hud_x(480, scale);
+            check(std::fabs((right - left) * scale - 480) < 0.001f && std::fabs((left + right) / 2 - 240) < 0.001f,
+                  "HUD keeps its physical width in a centred safe area");
+        }
+        check(motorstorm::widescreen_scale(1080, 1920) == 1.0f && motorstorm::widescreen_scale(0, 0) == 1.0f,
+              "Narrow and minimized windows keep the native aspect");
         const auto portrait = motorstorm::fit_presentation(1080, 1920, 480, 272);
         check(portrait.width == 1080u && portrait.height == 612u && portrait.top == 654u,
               "Portrait presentation letterboxes the PSP aspect ratio");

@@ -13,9 +13,10 @@ cbuffer DrawState : register(b0) {
     uint4 surface; // width, height, color stride, depth stride
     uint4 mode; // format, hardware transform, clip/isPoint flags, valid depth
     uint4 feedback; // use, base index, texture stride, packed format
-    uint4 render; // raster scale in half units (2 = 1x, 3 = 1.5x), output scale, AA mode, flags (bit0 enhanced filtering)
+    uint4 render; // raster scale in half units (2 = 1x, 3 = 1.5x), output scale, AA mode, flags (bit0 enhanced filtering, bit1 32-bit colour)
     uint4 replace; // texture pack: active, covered PSP width, covered rows
     float4 uvRange; // enhanced filtering: texel range of the draw (min uv, max uv); 0 = unknown
+    float4 wide; // inverse horizontal aspect scale, HUD centre, active, unused
 };
 uint C(uint i) { return commands[i >> 2][i & 3]; }
 // Native <-> raster mapping (see raster_extent in motorstorm_gpu.cpp).
@@ -45,8 +46,28 @@ struct Input {
 float4 channels(uint c) { return float4(c & 255, (c >> 8) & 255, (c >> 16) & 255, c >> 24); }
 uint4 bytes(uint c) { return uint4(c & 255, (c >> 8) & 255, (c >> 16) & 255, c >> 24); }
 uint pack(uint4 c) { return c.x | (c.y << 8) | (c.z << 16) | (c.w << 24); }
+// 32-bit colour in 16-bit targets ([enhancements] color_depth = 32, racing
+// only). The low 16 bits stay the exact PSP pixel that guest readback takes;
+// the high bits keep the colour bits the 16-bit format drops, so blending and
+// display see full 8-bit channels. Bit 31 marks them, bits 28-29 hold the
+// format they were written in (a 16-bit target may be read as another format).
+uint3 droppedBits(uint format) { return format==0 ? uint3(3,2,3) : format==1 ? uint3(3,3,3) : uint3(4,4,4); }
+uint extendFrame(uint packed, uint3 rgb, uint format) {
+    uint3 k=droppedBits(format), low=rgb&((1u<<k)-1);
+    return packed | (low.r<<16) | (low.g<<(16+k.r)) | (low.b<<(16+k.r+k.g)) | (format<<28) | 0x80000000u;
+}
 uint unpackColor(uint c, uint format) {
     if (format == 3) return c;
+    if ((c>>31)!=0 && ((c>>28)&3)==format) {
+        uint3 k=droppedBits(format), mask=(1u<<k)-1;
+        uint e=c>>16;
+        uint3 low=uint3(e&mask.r,(e>>k.r)&mask.g,(e>>(k.r+k.g))&mask.b);
+        uint3 high=format==0 ? uint3(c&31,(c>>5)&63,(c>>11)&31)
+                 : format==1 ? uint3(c&31,(c>>5)&31,(c>>10)&31) : uint3(c&15,(c>>4)&15,(c>>8)&15);
+        uint a=format==0 ? 255 : format==1 ? ((c>>15)&1)*255 : ((c>>12)&15)*17;
+        return pack(uint4((high<<k)|low,a));
+    }
+    c &= 0xFFFF;
     if (format == 0) {
         uint3 rgb=uint3(c&31,(c>>5)&63,(c>>11)&31);
         return pack(uint4((rgb.x<<3)|(rgb.x>>2),(rgb.y<<2)|(rgb.y>>4),(rgb.z<<3)|(rgb.z>>2),255));
@@ -61,9 +82,11 @@ uint unpackFrame(uint c) { return unpackColor(c,mode.x); }
 uint packFrame(uint rgba) {
     uint4 c = bytes(rgba);
     if (mode.x == 3) return rgba;
-    if (mode.x == 0) return (c.x >> 3) | ((c.y >> 2) << 5) | ((c.z >> 3) << 11);
-    if (mode.x == 1) return (c.x >> 3) | ((c.y >> 3) << 5) | ((c.z >> 3) << 10) | ((c.w >> 7) << 15);
-    return (c.x >> 4) | ((c.y >> 4) << 4) | ((c.z >> 4) << 8) | ((c.w >> 4) << 12);
+    uint packed;
+    if (mode.x == 0) packed = (c.x >> 3) | ((c.y >> 2) << 5) | ((c.z >> 3) << 11);
+    else if (mode.x == 1) packed = (c.x >> 3) | ((c.y >> 3) << 5) | ((c.z >> 3) << 10) | ((c.w >> 7) << 15);
+    else packed = (c.x >> 4) | ((c.y >> 4) << 4) | ((c.z >> 4) << 8) | ((c.w >> 4) << 12);
+    return (render.w&2)!=0 ? extendFrame(packed,c.rgb,mode.x) : packed;
 }
 struct Varying {
     float4 position : SV_Position;
@@ -79,7 +102,13 @@ Varying VS(Input i) {
     float4 p = float4(i.position, 1);
     float4 clip = mode.y ? float4(dot(clipRows[0],p),dot(clipRows[1],p),dot(clipRows[2],p),dot(clipRows[3],p)) : p;
     float w = mode.y ? clip.w : 1;
+    // Widen the horizontal frustum before clipping; vertical FOV stays put.
+    if(wide.z!=0 && mode.y) clip.x*=wide.x;
     float2 xy = mode.y ? clip.xy * viewportScale.xy + viewportCenter.xy * w : i.position.xy;
+    if(wide.z!=0) {
+        if(!mode.y) xy.x=wide.y+(xy.x-wide.y)*wide.x;
+        else xy.x+=(wide.y-viewportCenter.x)*(1-wide.x)*w;
+    }
     bool isPoint = (mode.z&2)!=0;
     if(isPoint) xy=(floor(xy/w)+0.5)*w;
     xy *= rasterScale();
@@ -97,6 +126,7 @@ Varying VS(Input i) {
 void PointGS(point Varying inputVertices[1], inout TriangleStream<Varying> outputVertices) {
     Varying a=inputVertices[0];
     float2 radius=rasterScale()/float2(surface.xy)*a.position.w;
+    if(wide.z!=0) radius.x*=wide.x;
     Varying v=a; v.position.xy=a.position.xy+radius*float2(-1,1); outputVertices.Append(v);
     v=a; v.position.xy=a.position.xy+radius*float2(1,1); outputVertices.Append(v);
     v=a; v.position.xy=a.position.xy+radius*float2(-1,-1); outputVertices.Append(v);
@@ -227,7 +257,9 @@ uint4 shade(float2 uv, uint4 v, float clipW) {
     uint level = linearMip ? lod>>4 : min(maxLevel,(lod+8)>>4);
     // replace.w: bit0 the pack image has no alpha (use the game's), bit1 the
     // game's texture is opaque (the original need not be sampled at all).
-    bool needOriginal = replace.x==0 || (replace.w&1)!=0 || (replace.w&2)==0;
+    // An opaque original supplies constant alpha 255, including RGB-only pack
+    // images. Its full original sample can be skipped without changing alpha.
+    bool needOriginal = replace.x==0 || (replace.w&2)==0;
     uint4 t = uint4(255,255,255,255);
     if(needOriginal) {
         if((render.w&1)!=0 && feedback.x==0 && filterLinear) t = sampleEnhanced(st0,st0dx,st0dy,float2(baseW,baseH));
@@ -470,4 +502,207 @@ void MipCS(uint3 id : SV_DispatchThreadID) {
     }
     uint3 rgb = alpha ? (weighted+alpha/2)/alpha : (plain+2)/4;
     computeOutput[id.y*surface.z+id.x]=pack(uint4(rgb,(alpha+2)/4));
+}
+
+// Race-only image enhancements ([enhancements], see motorstorm_post.hpp). They
+// run on the present queue in three passes over the output-resolution image,
+// kept as half-float RGB (two words per pixel):
+//   PostResolveCS  the presented image (AA resolve, FXAA) -> buffer A
+//   DebandCS       removes the steps of 16-bit gradients, A -> B (32-bit colour)
+//   PostPS         CAS sharpening, colour correction, AgX, LUT, dither -> display
+// Settings arrive in commands[] (unused by presentation); see PostSlot in C++.
+float postF(uint i) { return asfloat(C(i)); }
+uint2 postExtent() { return surface.xy*render.y; }
+void storeHalf(uint i, float3 c) {
+    computeOutput[2*i]=f32tof16(c.r)|(f32tof16(c.g)<<16);
+    computeOutput[2*i+1]=f32tof16(c.b);
+}
+float3 loadHalf(int2 p) {
+    uint2 e=postExtent();
+    p=clamp(p,0,int2(e)-1);
+    uint i=p.y*e.x+p.x, a=presentColor[2*i], b=presentColor[2*i+1];
+    return float3(f16tof32(a),f16tof32(a>>16),f16tof32(b));
+}
+uint pcg(uint v) { uint s=v*747796405u+2891336453u; uint w=((s>>((s>>28)+4))^s)*277803737u; return (w>>22)^w; }
+float random(uint2 p, uint salt) { return pcg(p.x^pcg(p.y^pcg(salt)))*(1.0/4294967296.0); }
+[numthreads(8,8,1)]
+void PostResolveCS(uint3 id : SV_DispatchThreadID) {
+    uint2 e=postExtent();
+    if(any(id.xy>=e)) return;
+    storeHalf(id.y*e.x+id.x,displayShade((float2(id.xy)+0.5)/e));
+}
+// Debanding (after the mpv deband filter): average four points at a random
+// distance and angle. Where every sample is within the threshold of this
+// pixel the region is a smooth gradient that 16-bit colour quantized into
+// steps, and the average replaces it. A sample beyond twice the threshold (an
+// edge or real texture detail) keeps the pixel unchanged.
+[numthreads(8,8,1)]
+void DebandCS(uint3 id : SV_DispatchThreadID) {
+    uint2 e=postExtent();
+    if(any(id.xy>=e)) return;
+    int2 p=int2(id.xy);
+    float3 c=loadHalf(p);
+    float3 original=c;
+    float threshold=postF(13), range=postF(14);
+    [unroll] for(uint it=1; it<=2; ++it) {
+        float reach=random(id.xy,C(15)*4+it*2)*range*it*0.5;
+        float angle=random(id.xy,C(15)*4+it*2+1)*6.2831853;
+        int2 o=int2(round(float2(cos(angle),sin(angle))*reach));
+        float3 s0=loadHalf(p+o), s1=loadHalf(p-o), s2=loadHalf(p+int2(-o.y,o.x)), s3=loadHalf(p+int2(o.y,-o.x));
+        float3 average=(s0+s1+s2+s3)*0.25;
+        float3 spread=max(max(abs(s0-c),abs(s1-c)),max(abs(s2-c),abs(s3-c)));
+        float limit=threshold/it;
+        if(all(abs(average-c)<limit) && all(spread<2*limit)) c=average;
+    }
+    storeHalf(id.y*e.x+id.x,lerp(original,c,postF(1)));
+}
+// AMD FidelityFX Contrast Adaptive Sharpening (sharpen only, no scaling).
+float3 casSharpen(int2 p, float sharpness) {
+    float3 a=saturate(loadHalf(p+int2(-1,-1))), b=saturate(loadHalf(p+int2(0,-1))), c=saturate(loadHalf(p+int2(1,-1)));
+    float3 d=saturate(loadHalf(p+int2(-1,0))), e=saturate(loadHalf(p)), f=saturate(loadHalf(p+int2(1,0)));
+    float3 g=saturate(loadHalf(p+int2(-1,1))), h=saturate(loadHalf(p+int2(0,1))), i=saturate(loadHalf(p+int2(1,1)));
+    float3 lo=min(min(min(d,e),min(f,b)),h), hi=max(max(max(d,e),max(f,b)),h);
+    lo+=min(lo,min(min(a,c),min(g,i)));
+    hi+=max(hi,max(max(a,c),max(g,i)));
+    float3 amplitude=sqrt(saturate(min(lo,2-hi)/max(hi,1e-5)));
+    float3 w=amplitude*(-1/lerp(8.0,5.0,saturate(sharpness)));
+    return saturate((b*w+d*w+f*w+h*w+e)/(1+4*w));
+}
+// sRGB transfer functions (the BT.709 OETF variant of the AgX reference).
+float3 toLinear(float3 c) { return c<0.04045 ? c/12.92 : pow(max((c+0.055)/1.055,0),2.4); }
+float3 fromLinear(float3 c) { return c<0.0031308 ? c*12.92 : 1.055*pow(max(c,0),1/2.4)-0.055; }
+float lumaLinear(float3 c) { return dot(c,float3(0.2126,0.7152,0.0722)); }
+// The PSP image is display-referred: expand it to scene-referred light so
+// AgX has highlights to roll off. Inverse Reinhard on the largest channel
+// (keeps hue): white becomes `peak`, mid grey barely moves.
+float3 expandSdr(float3 c, float peak) {
+    float m=saturate(max(max(c.r,c.g),c.b));
+    return c*(1/(1-m*(1-1/peak)));
+}
+// Colour correction in linear light: exposure and white balance (multipliers
+// prepared on the CPU), contrast around 18% grey, saturation.
+float3 colorCorrect(float3 c) {
+    c*=float3(postF(6),postF(7),postF(8))*postF(3);
+    c=0.18*pow(max(c,0)/0.18,postF(4));
+    float y=lumaLinear(c);
+    return max(y+(c-y)*postF(5),0);
+}
+// AgX tone mapping, from https://github.com/bWFuanVzYWth/AgX (MIT, linlin):
+// the analytical form of the AgX sigmoid, no LUT. HLSL float3x3 rows are the
+// GLSL mat3 columns, so mul(v,M) here is M*v there.
+float3 agxCurve(float3 v) {
+    const float threshold=0.6060606060606061;
+    const float aUp=69.86278913545539, aDown=59.507875;
+    const float bUp=13.0/4.0, bDown=3.0/1.0;
+    const float cUp=-4.0/13.0, cDown=-1.0/3.0;
+    float3 mask=step(v,threshold);
+    float3 a=aUp+(aDown-aUp)*mask, b=bUp+(bDown-bUp)*mask, c=cUp+(cDown-cUp)*mask;
+    return 0.5+(-2.0*threshold+2.0*v)*pow(1.0+a*pow(abs(v-threshold),b),c);
+}
+float3 agx(float3 linearColor, uint look) {
+    const float minEv=-12.473931188332413, maxEv=4.026068811667588, range=maxEv-minEv;
+    // Keep synthetic SDR expansion/exposure below the hard log-domain clamp.
+    // Preserve hue while smoothly rolling the brightest input channel off.
+    float ceiling=exp2(maxEv), knee=ceiling*0.5;
+    float maximum=max(max(linearColor.r,linearColor.g),linearColor.b);
+    if(maximum>knee) {
+        float bounded=knee+(maximum-knee)/(1+(maximum-knee)/knee);
+        linearColor*=bounded/maximum;
+    }
+    const float3x3 inset=float3x3(0.8424010709504686,0.04240107095046854,0.04240107095046854,
+                                  0.07843650156180276,0.8784365015618028,0.07843650156180276,
+                                  0.0791624274877287,0.0791624274877287,0.8791624274877287);
+    const float3x3 outset=float3x3(1.1969986613119143,-0.053001338688085674,-0.053001338688085674,
+                                   -0.09804562695225345,1.1519543730477466,-0.09804562695225345,
+                                   -0.09895303435966087,-0.09895303435966087,1.151046965640339);
+    float3 c=mul(max(linearColor,1e-10),inset);
+    c=agxCurve(saturate(log2(c)*(1.0/range)-minEv/range));
+    // Looks (Blender's ASC CDL values), applied to the sigmoid output.
+    if(look!=0) {
+        float3 slope=look==2 ? float3(1.0,0.9,0.5) : 1.0;
+        float power=look==2 ? 0.8 : 1.35, saturation=look==2 ? 0.8 : 1.4;
+        c=pow(max(c*slope,0),power);
+        float y=lumaLinear(c);
+        c=y+saturation*(c-y);
+    }
+    return saturate(mul(c,outset));  // display encoded
+}
+// 3D LUT: lutSize^3 entries of 10:10:10 RGB, red fastest (the .cube order).
+uint lutSize() { return C(11); }
+float3 lutEntry(uint3 i) {
+    uint n=lutSize(), v=feedbackImage[(i.z*n+i.y)*n+i.x];
+    return float3(v&1023,(v>>10)&1023,(v>>20)&1023)/1023.0;
+}
+float3 applyLut(float3 c) {
+    uint n=lutSize();
+    float3 x=saturate(c)*(n-1);
+    uint3 i=min(uint3(x),n-2);
+    float3 f=x-i;
+    float3 c00=lerp(lutEntry(i),lutEntry(i+uint3(1,0,0)),f.x);
+    float3 c10=lerp(lutEntry(i+uint3(0,1,0)),lutEntry(i+uint3(1,1,0)),f.x);
+    float3 c01=lerp(lutEntry(i+uint3(0,0,1)),lutEntry(i+uint3(1,0,1)),f.x);
+    float3 c11=lerp(lutEntry(i+uint3(0,1,1)),lutEntry(i+1),f.x);
+    return lerp(lerp(c00,c10,f.y),lerp(c01,c11,f.y),f.z);
+}
+float3 postColor(int2 p) {
+    uint flags=C(0);
+    float3 original=saturate(loadHalf(p));
+    float3 c=(flags&2)!=0 ? casSharpen(p,postF(2)) : original;
+    if((flags&(4|8))!=0) {
+        float3 light=toLinear(c);
+        // AgX: expand, then the scene gain that keeps PSP mid grey in place.
+        if((flags&8)!=0) light=expandSdr(light,postF(9))*postF(16);
+        if((flags&4)!=0) light=colorCorrect(light);
+        c=(flags&8)!=0 ? agx(light,C(10)) : saturate(fromLinear(light));
+    }
+    if((flags&16)!=0) c=lerp(c,applyLut(c),postF(12));
+    // Fade in/out at race start and end.
+    c=lerp(original,c,postF(1));
+    return c;
+}
+float3 postDither(float3 c, uint2 q) {
+    // Triangular dither to the 8-bit display, so the half-float chain adds
+    // no banding of its own.
+    if((C(0)&32)!=0) {
+        c+=postF(1)*(random(q,C(15)*2)+random(q,C(15)*2+1)-1)/255.0;
+    }
+    return saturate(c);
+}
+float3 postShade(int2 p, uint2 q) { return postDither(postColor(p),q); }
+float4 PostPS(PresentVarying i) : SV_Target {
+    int2 p=min(int2(i.uv*postExtent()),int2(postExtent())-1);
+    return float4(postShade(p,uint2(i.position.xy)),1);
+}
+// Readback of the exact post shading code for pixel checks, before swapchain
+// scaling. Diagnostic calls use their own scratch buffers.
+[numthreads(8,8,1)]
+void PostCaptureCS(uint3 id : SV_DispatchThreadID) {
+    uint2 e=postExtent();
+    if(any(id.xy>=e)) return;
+    computeOutput[id.y*e.x+id.x]=pack(uint4(postShade(int2(id.xy),id.xy)*255+0.5,255));
+}
+// Colour depends on the output pixel, not on the monitor's pixel density.
+// Shade it once on async compute, keeping float32 RGB so no precision is lost.
+[numthreads(8,8,1)]
+void PostColorCS(uint3 id : SV_DispatchThreadID) {
+    uint2 e=postExtent();
+    if(any(id.xy>=e)) return;
+    float3 c=postColor(int2(id.xy));
+    uint p=3*(id.y*e.x+id.x);
+    computeOutput[p]=asuint(c.r); computeOutput[p+1]=asuint(c.g); computeOutput[p+2]=asuint(c.b);
+}
+float3 loadPostColor(uint2 p) {
+    uint off=3*(p.y*postExtent().x+p.x);
+    return asfloat(uint3(presentColor[off],presentColor[off+1],presentColor[off+2]));
+}
+float4 PostPresentPS(PresentVarying i) : SV_Target {
+    uint2 p=min(uint2(i.uv*postExtent()),postExtent()-1);
+    // Dither remains at monitor-pixel resolution with the original seed/fade.
+    return float4(postDither(loadPostColor(p),uint2(i.position.xy)),1);
+}
+[numthreads(8,8,1)]
+void PostColorCaptureCS(uint3 id : SV_DispatchThreadID) {
+    uint2 e=postExtent();
+    if(any(id.xy>=e)) return;
+    computeOutput[id.y*e.x+id.x]=pack(uint4(postDither(loadPostColor(id.xy),id.xy)*255+0.5,255));
 }

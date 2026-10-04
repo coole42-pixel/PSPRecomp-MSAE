@@ -8,6 +8,7 @@
 // total run wall time, which the bootstrap reports alongside these sections.
 
 #include <array>
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <vector>
 
 namespace motorstorm::perf {
 
@@ -117,6 +119,8 @@ struct BenchWindow {
     std::uint64_t start_frame{};
     std::uint64_t start_submissions{};
     std::array<std::uint64_t, kSlotCount> start_ticks{};
+    std::uint64_t previous_frame_ns{};
+    std::vector<std::uint64_t> frame_intervals_ns;
 };
 
 inline BenchWindow &bench_window() {
@@ -152,8 +156,12 @@ inline bool bench_frame(std::uint64_t guest_us, std::uint64_t frames, std::uint6
         window.start_frame = frames;
         window.start_submissions = submissions;
         window.start_ticks = ticks();
+        window.previous_frame_ns = window.start_wall_ns;
         return false;
     }
+    const auto frame_now = now_ns();
+    window.frame_intervals_ns.push_back(frame_now - window.previous_frame_ns);
+    window.previous_frame_ns = frame_now;
     if (guest_us < window.end_us) return false;
     window.finished = true;
 
@@ -186,6 +194,17 @@ inline bool bench_frame(std::uint64_t guest_us, std::uint64_t frames, std::uint6
     field("guest_ms", guest_us_span);
     field("guest_per_wall", guest_seconds / wall_seconds);
     field("fps", static_cast<double>(frame_span) / guest_seconds);
+    field("wall_fps", static_cast<double>(frame_span) / wall_seconds);
+    std::sort(window.frame_intervals_ns.begin(), window.frame_intervals_ns.end());
+    const auto percentile = [&](double fraction) {
+        const auto &samples = window.frame_intervals_ns;
+        const auto index = std::min(samples.size() - 1, static_cast<std::size_t>(fraction * samples.size()));
+        return ms(samples[index]);
+    };
+    field("frame_p50_ms", percentile(0.50));
+    field("frame_p95_ms", percentile(0.95));
+    field("frame_p99_ms", percentile(0.99));
+    field("frame_max_ms", ms(window.frame_intervals_ns.back()));
     field("ge_decode_ms", section_ms[kGeDecode]);
     field("ge_convert_ms", section_ms[kGeConvert]);
     field("texture_ms", section_ms[kTexture]);

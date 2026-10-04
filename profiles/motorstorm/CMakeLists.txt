@@ -86,6 +86,7 @@ set(MOTORSTORM_HOST_SOURCES
     host/motorstorm_audio.cpp
     host/motorstorm_pacing.cpp
     host/motorstorm_textures.cpp
+    host/motorstorm_post.cpp
     host/motorstorm_atrac.cpp
     host/motorstorm_media.cpp
     ../vcs/host/vcs_media_decoder.cpp
@@ -112,7 +113,9 @@ set(MOTORSTORM_SHADER_SOURCE "${MOTORSTORM_PROFILE_DIR}/host/motorstorm_gpu.hlsl
 set(MOTORSTORM_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/motorstorm_shaders")
 set(MOTORSTORM_SHADER_HEADERS)
 foreach(shader IN ITEMS VS:vs_5_1 PS:ps_5_1 PointGS:gs_5_1 PresentVS:vs_5_1 PresentPS:ps_5_1
-                        ExpandCS:cs_5_1 ResolveCS:cs_5_1 CaptureCS:cs_5_1 DecodeCS:cs_5_1 MipCS:cs_5_1)
+                        ExpandCS:cs_5_1 ResolveCS:cs_5_1 CaptureCS:cs_5_1 DecodeCS:cs_5_1 MipCS:cs_5_1
+                        PostResolveCS:cs_5_1 DebandCS:cs_5_1 PostPS:ps_5_1 PostCaptureCS:cs_5_1
+                        PostColorCS:cs_5_1 PostPresentPS:ps_5_1 PostColorCaptureCS:cs_5_1)
     string(REPLACE ":" ";" shader_parts "${shader}")
     list(GET shader_parts 0 entry)
     list(GET shader_parts 1 profile)
@@ -199,7 +202,8 @@ add_executable(MotorStormTextureExtract
     tools/texture_extract/motorstorm_texture_extract.cpp
     host/motorstorm_ge.cpp
     host/motorstorm_gpu.cpp
-    host/motorstorm_textures.cpp)
+    host/motorstorm_textures.cpp
+    host/motorstorm_post.cpp)
 target_include_directories(MotorStormTextureExtract PRIVATE "${MOTORSTORM_PROFILE_DIR}/host")
 target_link_libraries(MotorStormTextureExtract PRIVATE psprecomp_core d3d12 dxgi dxguid windowscodecs ole32)
 motorstorm_use_shaders(MotorStormTextureExtract)
@@ -220,6 +224,7 @@ if(PSPRECOMP_BUILD_PROFILE_TESTS)
         host/motorstorm_audio.cpp
         host/motorstorm_pacing.cpp
         host/motorstorm_textures.cpp
+        host/motorstorm_post.cpp
         host/motorstorm_atrac.cpp
         host/motorstorm_media.cpp
         ../vcs/host/vcs_media_decoder.cpp)
@@ -240,9 +245,17 @@ if(PSPRECOMP_BUILD_PROFILE_TESTS)
     target_link_libraries(motorstorm_texture_tests PRIVATE windowscodecs ole32)
     motorstorm_set_runtime_output(motorstorm_texture_tests)
     add_test(NAME motorstorm_texture_tests COMMAND motorstorm_texture_tests)
+    add_executable(motorstorm_post_tests tests/motorstorm_post_tests.cpp host/motorstorm_post.cpp
+        host/motorstorm_config.cpp)
+    target_include_directories(motorstorm_post_tests PRIVATE "${MOTORSTORM_PROFILE_DIR}/host")
+    target_compile_definitions(motorstorm_post_tests PRIVATE
+        MOTORSTORM_CONFIG_TEMPLATE="${MOTORSTORM_PROFILE_DIR}/config/motorstorm.ini")
+    motorstorm_set_runtime_output(motorstorm_post_tests)
+    add_test(NAME motorstorm_post_tests COMMAND motorstorm_post_tests)
 
     add_executable(motorstorm_window_tests tests/motorstorm_window_tests.cpp
-        host/motorstorm_window.cpp host/motorstorm_gpu.cpp host/motorstorm_ge.cpp host/motorstorm_textures.cpp)
+        host/motorstorm_window.cpp host/motorstorm_gpu.cpp host/motorstorm_ge.cpp host/motorstorm_textures.cpp
+        host/motorstorm_post.cpp)
     target_include_directories(motorstorm_window_tests PRIVATE "${MOTORSTORM_PROFILE_DIR}/host")
     target_link_libraries(motorstorm_window_tests PRIVATE psprecomp_core d3d12 dxgi dxguid user32 gdi32
         windowscodecs ole32)
@@ -254,7 +267,7 @@ if(PSPRECOMP_BUILD_PROFILE_TESTS)
         set_tests_properties(motorstorm_window_tests PROPERTIES TIMEOUT 20)
     endif()
     add_executable(motorstorm_gpu_tests tests/motorstorm_gpu_tests.cpp
-        host/motorstorm_ge.cpp host/motorstorm_gpu.cpp host/motorstorm_textures.cpp)
+        host/motorstorm_ge.cpp host/motorstorm_gpu.cpp host/motorstorm_textures.cpp host/motorstorm_post.cpp)
     target_include_directories(motorstorm_gpu_tests PRIVATE "${MOTORSTORM_PROFILE_DIR}/host")
     target_link_libraries(motorstorm_gpu_tests PRIVATE psprecomp_core d3d12 dxgi dxguid windowscodecs ole32)
     motorstorm_use_shaders(motorstorm_gpu_tests)
