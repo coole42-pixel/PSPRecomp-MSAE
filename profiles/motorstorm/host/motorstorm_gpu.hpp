@@ -50,6 +50,15 @@ struct GpuTexture {
     bool identify{};
     mutable std::uint64_t last_use{};
     std::uint32_t feedback_address{}, feedback_stride{}, feedback_format{};
+    // Rendered by the GPU in the current list: the texel bytes (gpu_source) or
+    // the palette (gpu_clut) are read from those targets on the GPU, in command
+    // order, so the list never waits for a readback.
+    bool gpu_source{}, gpu_clut{};
+    // Texel bytes partly inside 32-bit targets drawn in this list: the guest
+    // bytes are uploaded and the drawn parts overwritten from those targets on
+    // the GPU before decoding.
+    bool gpu_overlay{};
+    std::uint32_t gpu_source_address{}, gpu_clut_address{}, gpu_clut_bytes{};
     // Texture-pack identity of the decoded base level (0 when packs are off),
     // and the replacement chosen for it: its identity and how many rows of the
     // GE texture it covers (fewer than height for non-power-of-two artwork).
@@ -60,7 +69,8 @@ struct GpuReport {
     std::string adapter;
     std::uint64_t draws{}, hardware_transform_draws{}, vertices{}, submissions{}, texture_uploads{},
         feedback_syncs{}, feedback_draws{}, software_draws{}, presents{}, skipped_presents{}, superseded_presents{},
-        replaced_draws{}, replacement_uploads{}, replacements_evicted{}, streamed_texture_updates{};
+        replaced_draws{}, replacement_uploads{}, replacements_evicted{}, streamed_texture_updates{},
+        gpu_vertex_draws{};
     // Optional asynchronous GPU timestamp totals: resolve, deband, colour.
     std::uint64_t post_gpu_frames{}, post_gpu_max_ns{};
     // Readback publishes by trigger: draw, sync, list end, CPU VRAM access,
@@ -89,7 +99,21 @@ std::vector<std::uint32_t> gpu_debug_decode(const GpuTexture &texture, std::size
 bool gpu_initialize();
 void gpu_shutdown(bool reset_report = false) noexcept;
 bool gpu_active() noexcept;
-void gpu_submit(psprecomp::GuestMemory &, const GpuDraw &, std::span<const GpuVertex>, const GpuTexture *);
+// Vertices processed on the GPU (VertexCS in motorstorm_gpu.hlsl): the GE
+// hands over the raw guest vertex bytes, an index table and a parameter block
+// instead of decoded vertices; the draw reads the shader's output.
+struct GpuVertexJob {
+    std::vector<std::uint32_t> header;   // parameter block (see VertexCS)
+    std::vector<std::uint32_t> indices;  // draw indices into the decoded vertices; empty: draw in order
+    std::uint32_t vertex_address{}, vertex_bytes{};
+    std::uint32_t decode_count{};        // input vertices VertexCS decodes
+    std::uint32_t output_count{};        // vertices (or indices) the draw consumes
+    bool strip{};                        // triangle strip, otherwise a triangle list
+    bool uv_range_valid{};
+    std::array<float, 4> uv_range{};     // texel range of the draw (min u, min v, max u, max v)
+};
+void gpu_submit(psprecomp::GuestMemory &, const GpuDraw &, std::span<const GpuVertex>, const GpuTexture *,
+                const GpuVertexJob *job = nullptr);
 // GE synchronization publishes GPU writes to guest memory before callbacks,
 // transfers and CPU reads. This is also the software/GPU fallback boundary.
 void gpu_sync(psprecomp::GuestMemory &);
@@ -111,6 +135,16 @@ bool gpu_transfer_from_target(std::uint32_t source, std::uint32_t source_stride,
 // Called before a CPU access to VRAM publishes GPU readbacks: the HLE waits
 // there for its GE thread, which owns the renderer while it runs lists.
 void gpu_set_publish_guard(void (*guard)()) noexcept;
+// These guest bytes lie inside one target drawn by the current list, so a
+// texture can be decoded from it on the GPU. `version` changes with each draw
+// to that target. A palette (`palette`) additionally needs a 32-bit target.
+bool gpu_source_in_target(std::uint32_t address, std::uint32_t bytes, bool palette,
+                          std::uint64_t &version) noexcept;
+// Every target drawn in the current list that overlaps these bytes is 32-bit
+// (its resolved pixels are the guest bytes), so a texture can be composed on
+// the GPU. `version` combines their draw versions. False: none overlap, or
+// one cannot be composed.
+bool gpu_overlay_targets(std::uint32_t address, std::uint32_t bytes, std::uint64_t &version) noexcept;
 // Any render target (drawn, pending readback or cached) overlaps these guest bytes.
 bool gpu_touches_surface(std::uint32_t address, std::uint32_t bytes) noexcept;
 bool gpu_feedback_available(std::uint32_t address, std::uint32_t stride, std::uint32_t format) noexcept;

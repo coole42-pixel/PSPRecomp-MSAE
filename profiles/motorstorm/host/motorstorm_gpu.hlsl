@@ -470,9 +470,15 @@ float4 PresentPS(PresentVarying i) : SV_Target {
 // pitch in texels, stride (TBW) in texels}; mode = {format, swizzled, CLUT
 // mode (0xC5), level}; feedback.x = texture mode (0xC2). Bit-exact with the
 // CPU read_texel path.
-uint rawByte(uint off) { return (presentColor[off>>2] >> ((off&3)*8)) & 255; }
-uint rawHalf(uint off) { return rawByte(off) | (rawByte(off+1)<<8); }
-uint rawWord(uint off) { return rawHalf(off) | (rawHalf(off+2)<<16); }
+// DecodeTargetCS reads a resolved render target instead (one word per pixel
+// holding replace.y guest bytes; the texture starts replace.z bytes in). The
+// flag is a literal at every call site, so DecodeCS compiles to the plain path.
+uint rawByte(uint off, bool target) {
+    if(target) { uint o=replace.z+off, bpp=max(replace.y,1u); return (presentColor[o/bpp] >> ((o%bpp)*8)) & 255; }
+    return (presentColor[off>>2] >> ((off&3)*8)) & 255;
+}
+uint rawHalf(uint off, bool target) { return rawByte(off,target) | (rawByte(off+1,target)<<8); }
+uint rawWord(uint off, bool target) { return rawHalf(off,target) | (rawHalf(off+2,target)<<16); }
 uint swizzledOffset(uint byteX, uint y, uint rowBytes) {
     return ((y>>3)*((rowBytes+15)>>4) + (byteX>>4))*128 + (y&7)*16 + (byteX&15);
 }
@@ -497,33 +503,245 @@ uint clutEntry(uint index) {
     uint packed = entryBytes==4 ? word : (word >> ((off&2)*8)) & 0xFFFF;
     return decodePacked(packed, format+4);
 }
-[numthreads(8,8,1)]
-void DecodeCS(uint3 id : SV_DispatchThreadID) {
+void decodeTexel(uint3 id, bool target) {
     if(any(id.xy>=surface.xy)) return;
     uint x=id.x, y=id.y, stride=surface.w, format=mode.x;
     bool swizzled=mode.y!=0;
     uint texel=0xFFFFFFFFu;
     if(format<=2) {
         uint rowBytes=stride*2, off=swizzled ? swizzledOffset(x*2,y,rowBytes) : y*rowBytes+x*2;
-        texel=decodePacked(rawHalf(off),format+4);
+        texel=decodePacked(rawHalf(off,target),format+4);
     } else if(format==3) {
         uint rowBytes=stride*4, off=swizzled ? swizzledOffset(x*4,y,rowBytes) : y*rowBytes+x*4;
-        texel=rawWord(off);
+        texel=rawWord(off,target);
     } else if(format==4) {
         uint rowBytes=(stride+1)/2, off=swizzled ? swizzledOffset(x>>1,y,rowBytes) : y*rowBytes+(x>>1);
-        uint packed=rawByte(off);
+        uint packed=rawByte(off,target);
         texel=clutEntry((x&1)!=0 ? packed>>4 : packed&15);
     } else if(format==5) {
         uint off=swizzled ? swizzledOffset(x,y,stride) : y*stride+x;
-        texel=clutEntry(rawByte(off));
+        texel=clutEntry(rawByte(off,target));
     } else if(format==6) {
         uint rowBytes=stride*2, off=swizzled ? swizzledOffset(x*2,y,rowBytes) : y*rowBytes+x*2;
-        texel=clutEntry(rawHalf(off));
+        texel=clutEntry(rawHalf(off,target));
     } else if(format==7) {
         uint rowBytes=stride*4, off=swizzled ? swizzledOffset(x*4,y,rowBytes) : y*rowBytes+x*4;
-        texel=clutEntry(rawWord(off));
+        texel=clutEntry(rawWord(off,target));
     }
     computeOutput[y*surface.z+x]=texel;
+}
+[numthreads(8,8,1)]
+void DecodeCS(uint3 id : SV_DispatchThreadID) { decodeTexel(id, false); }
+[numthreads(8,8,1)]
+void DecodeTargetCS(uint3 id : SV_DispatchThreadID) { decodeTexel(id, true); }
+// GPU vertex processing (VertexCS). The GE thread uploads, per hardware-
+// transformed triangle draw, one buffer (presentColor): a parameter block,
+// an index table and the raw guest vertex bytes. Each thread produces one
+// output vertex of the expanded triangle list, in the GpuVertex layout the
+// draw reads (9 words), one per input vertex. It mirrors decode_vertex/light_vertex in
+// motorstorm_ge.cpp operation for operation (`precise`: no fused or
+// reordered arithmetic), so the result matches the CPU path.
+// Parameter block, in words (see gpu_vertex_job in motorstorm_ge.cpp):
+static const uint kVCount = 0, kVPrim = 1, kVFlags = 2, kVStride = 3, kVMorphs = 4, kVOneSize = 5,
+    kVTypes = 6, kVOffsets = 7, kVWeightOffset = 8, kVIndexBase = 9, kVVertexBase = 10,
+    kVMaterialColor = 11, kVMaterialAlpha = 12, kVMaterialUpdate = 13, kVAlphaScale = 14,
+    kVMorphWeights = 16, kVBones = 24, kVWorld = 120, kVUvScale = 132, kVTextureSize = 136,
+    kVEmissive = 138, kVAmbientLight = 141, kVMaterial = 144, kVViewDirection = 153, kVExponent = 156,
+    kVLights = 157, kVLightWords = 32;
+// word 0: vertices to decode; flags: 4 lighting, 8 reverse normal, 16 separate specular
+static uint gLimit;  // read bound of the current job (bytes)
+uint vword(uint i) { return i*4 < gLimit ? presentColor[i] : 0; }
+float vfloat(uint i) { return asfloat(vword(i)); }
+uint typeStep(uint type) { return type == 0 ? 0 : 1u << (type - 1); }
+// Every read is bounded by the job's size (word 15): root views are unchecked.
+uint vbyte(uint off) { return off < gLimit ? (presentColor[off>>2] >> ((off&3)*8)) & 255 : 0; }
+uint vhalf(uint off) {
+    if((off&1) == 0 && off+2 <= gLimit) return (presentColor[off>>2] >> ((off&2)*8)) & 0xFFFF;
+    return vbyte(off) | (vbyte(off+1)<<8);
+}
+uint vword32(uint off) {
+    if((off&3) == 0 && off+4 <= gLimit) return presentColor[off>>2];
+    return vhalf(off) | (vhalf(off+2)<<16);
+}
+float signedValue(uint at, uint type) {
+    if(type==1) { int v=int(vbyte(at)); if(v>=128) v-=256; return float(v)/128.0; }
+    if(type==2) { int v=int(vhalf(at)); if(v>=32768) v-=65536; return float(v)/32768.0; }
+    return asfloat(vword32(at));
+}
+float unsignedValue(uint at, uint type) {
+    if(type==1) return float(vbyte(at))/128.0;
+    if(type==2) return float(vhalf(at))/32768.0;
+    return asfloat(vword32(at));
+}
+uint packedColor(uint packed, uint type) {
+    if(type==4) { uint r=packed&31, g=(packed>>5)&63, b=(packed>>11)&31;
+        return 0xFF000000u | ((b<<3|b>>2)<<16) | ((g<<2|g>>4)<<8) | (r<<3|r>>2); }
+    if(type==5) { uint r=packed&31, g=(packed>>5)&31, b=(packed>>10)&31, a=(packed>>15)!=0 ? 255 : 0;
+        return (a<<24) | ((b<<3|b>>2)<<16) | ((g<<3|g>>2)<<8) | (r<<3|r>>2); }
+    if(type==6) { uint r=packed&15, g=(packed>>4)&15, b=(packed>>8)&15, a=(packed>>12)&15;
+        return ((a*17)<<24) | ((b*17)<<16) | ((g*17)<<8) | (r*17); }
+    return packed;
+}
+float3 transformDirection(uint m, float3 v) {
+    precise float3 r;
+    r.x = vfloat(m+0)*v.x + vfloat(m+3)*v.y + vfloat(m+6)*v.z;
+    r.y = vfloat(m+1)*v.x + vfloat(m+4)*v.y + vfloat(m+7)*v.z;
+    r.z = vfloat(m+2)*v.x + vfloat(m+5)*v.y + vfloat(m+8)*v.z;
+    return r;
+}
+float3 transformPosition(uint m, float3 v) {
+    precise float3 r = transformDirection(m, v);
+    r.x += vfloat(m+9); r.y += vfloat(m+10); r.z += vfloat(m+11);
+    return r;
+}
+float dot3(float3 a, float3 b) { precise float d = a.x*b.x + a.y*b.y + a.z*b.z; return d; }
+float3 normalize3(float3 v) {
+    precise float length = sqrt(dot3(v, v));
+    if(!isfinite(length) || length <= 0.000001) return float3(0,0,1);
+    precise float3 r = float3(v.x/length, v.y/length, v.z/length);
+    return r;
+}
+// std::pow semantics for the cases lighting reaches (pow(x,0) = 1).
+float powCpu(float x, float y) { return y == 0 ? 1.0 : (x == 0 ? 0.0 : pow(x, y)); }
+float3 vfloat3(uint i) { return float3(vfloat(i), vfloat(i+1), vfloat(i+2)); }
+float3 colorComponents(uint c) { return float3(c & 255, (c>>8) & 255, (c>>16) & 255) / 255.0; }
+struct DecodedVertex { float3 position; uint color, secondary; float u, v; bool drawable; };
+DecodedVertex decodeVertex(uint element) {
+    uint flags = vword(kVFlags), stride = vword(kVStride), morphs = vword(kVMorphs), oneSize = vword(kVOneSize);
+    uint types = vword(kVTypes), offsets = vword(kVOffsets);
+    uint positionType = types & 15, normalType = (types>>4) & 15, tcType = (types>>8) & 15,
+         colorType = (types>>12) & 15, weightType = (types>>16) & 15, weightCount = (types>>20) & 15;
+    uint positionOffset = offsets & 255, normalOffset = (offsets>>8) & 255, tcOffset = (offsets>>16) & 255,
+         colorOffset = offsets>>24;
+    uint base = vword(kVVertexBase) + element * stride;
+    bool hasTexture = tcType != 0, hasColor = colorType >= 4;
+    precise float3 p = 0, normal = 0;
+    precise float4 color = 0;
+    precise float u = 0, v = 0;
+    for(uint i = 0; i < morphs; ++i) {
+        uint target = base + i * oneSize;
+        float weight = morphs == 1 ? 1.0 : vfloat(kVMorphWeights + i);
+        uint positionStep = typeStep(positionType);
+        [unroll] for(uint j = 0; j < 3; ++j) {
+            precise float value = signedValue(target + positionOffset + j*positionStep, positionType);
+            p[j] += weight * value;
+            precise float n = normalType == 0 ? (j == 2 ? 1.0 : 0.0)
+                : signedValue(target + normalOffset + j*typeStep(normalType), normalType);
+            normal[j] += weight * n;
+        }
+        if(hasTexture) {
+            uint at = target + tcOffset, step = typeStep(tcType);
+            u += weight * unsignedValue(at, tcType);
+            v += weight * unsignedValue(at + step, tcType);
+        }
+        if(hasColor) {
+            uint at = target + colorOffset;
+            uint packed = packedColor(colorType == 7 ? vword32(at) : vhalf(at), colorType);
+            [unroll] for(uint k = 0; k < 4; ++k) color[k] += weight * float((packed >> (k*8)) & 255);
+        }
+    }
+    DecodedVertex result;
+    result.secondary = 0;
+    result.color = (vword(kVMaterialAlpha) << 24) | vword(kVMaterialColor);
+    if(hasColor) {
+        result.color = 0;
+        [unroll] for(uint k = 0; k < 4; ++k) result.color |= uint(clamp(color[k], 0.0, 255.0)) << (k*8);
+    }
+    if(flags & 8) normal = -normal;
+    if(weightType != 0) {
+        precise float3 skinned = 0, skinnedNormal = 0;
+        for(uint i = 0; i < weightCount; ++i) {
+            precise float weight = unsignedValue(base + vword(kVWeightOffset) + i*typeStep(weightType), weightType);
+            precise float3 bone = transformPosition(kVBones + i*12, p);
+            precise float3 boneNormal = transformDirection(kVBones + i*12, normal);
+            [unroll] for(uint j = 0; j < 3; ++j) {
+                skinned[j] += bone[j] * weight;
+                skinnedNormal[j] += boneNormal[j] * weight;
+            }
+        }
+        p = skinned;
+        normal = skinnedNormal;
+    }
+    if(flags & 4) {
+        // light_vertex
+        precise float3 world = transformPosition(kVWorld, p);
+        precise float3 worldNormal = normalize3(transformDirection(kVWorld, normal));
+        uint update = vword(kVMaterialUpdate);
+        float3 material[3];
+        [unroll] for(uint m = 0; m < 3; ++m) {
+            material[m] = vfloat3(kVMaterial + m*3);
+            if(hasColor && (update & (1u << m)) != 0) material[m] = colorComponents(result.color);
+        }
+        precise float3 lit = vfloat3(kVEmissive) + material[0] * vfloat3(kVAmbientLight);
+        precise float3 highlight = 0;
+        float exponent = vfloat(kVExponent);
+        float3 viewDirection = vfloat3(kVViewDirection);
+        for(uint l = 0; l < 4; ++l) {
+            uint light = kVLights + l*kVLightWords;
+            if(vword(light) == 0) continue;
+            uint type = vword(light+1), kind = vword(light+2);
+            precise float3 direction = vfloat3(light+3);
+            precise float attenuation = 1.0;
+            if(type != 0) {
+                direction = direction - world;
+                precise float distance = sqrt(dot3(direction, direction));
+                precise float denominator = vfloat(light+12) + distance*vfloat(light+13) + distance*distance*vfloat(light+14);
+                attenuation = denominator > 0 ? clamp(1.0/denominator, 0.0, 1.0) : 1.0;
+                direction = normalize3(direction);
+            } else {
+                direction = vfloat3(light+6);
+            }
+            if(type >= 2) {
+                precise float cosine = -dot3(direction, vfloat3(light+15));
+                attenuation *= cosine >= vfloat(light+18) ? powCpu(max(cosine, 0.0), vfloat(light+19)) : 0.0;
+            }
+            precise float facing = max(0.0, dot3(worldNormal, direction));
+            precise float diffuseFactor = kind == 2 ? powCpu(facing, exponent) : facing;
+            precise float specularFactor = 0;
+            if(kind == 1 && facing > 0) {
+                float3 halfway = type == 0 ? vfloat3(light+9) : normalize3(direction + viewDirection);
+                specularFactor = powCpu(max(0.0, dot3(worldNormal, halfway)), exponent);
+            }
+            float3 ambient = vfloat3(light+20), diffuse = vfloat3(light+23), specular = vfloat3(light+26);
+            [unroll] for(uint j = 0; j < 3; ++j) {
+                lit[j] += attenuation * (material[0][j]*ambient[j] + diffuseFactor*material[1][j]*diffuse[j]);
+                highlight[j] += attenuation * specularFactor * material[2][j] * specular[j];
+            }
+        }
+        uint alpha = hasColor && (update & 1) != 0 ? result.color >> 24 : vword(kVMaterialAlpha);
+        result.color = ((alpha * vword(kVAlphaScale) + 127) / 255) << 24;
+        [unroll] for(uint j = 0; j < 3; ++j) {
+            if((flags & 16) == 0) lit[j] += highlight[j];
+            else result.secondary |= uint(clamp(highlight[j]*255.0, 0.0, 255.0)) << (j*8);
+            result.color |= uint(clamp(lit[j]*255.0, 0.0, 255.0)) << (j*8);
+        }
+    }
+    result.position = p;
+    result.u = u; result.v = v;
+    if(hasTexture) {
+        precise float su = (u * vfloat(kVUvScale) + vfloat(kVUvScale+2)) * vfloat(kVTextureSize);
+        precise float sv = (v * vfloat(kVUvScale+1) + vfloat(kVUvScale+3)) * vfloat(kVTextureSize+1);
+        result.u = su; result.v = sv;
+    }
+    result.drawable = isfinite(p.x) && isfinite(p.y) && isfinite(p.z);
+    return result;
+}
+// One thread per input vertex (word 0: count); the draw expands strips/fans.
+[numthreads(64,1,1)]
+void VertexCS(uint3 id : SV_DispatchThreadID) {
+    gLimit = presentColor[15];
+    if(id.x >= presentColor[0]) return;
+    DecodedVertex self = decodeVertex(id.x);
+    uint base = id.x*9;
+    computeOutput[base+0] = asuint(self.position.x);
+    computeOutput[base+1] = asuint(self.position.y);
+    computeOutput[base+2] = asuint(self.position.z);
+    computeOutput[base+3] = self.color;
+    computeOutput[base+4] = self.secondary;
+    computeOutput[base+5] = asuint(self.u);
+    computeOutput[base+6] = asuint(self.v);
+    computeOutput[base+7] = asuint(1.0);
+    computeOutput[base+8] = asuint(1.0);
 }
 // Next mip level, alpha-weighted 2x2 box (same as texture packs). surface =
 // {width, height, output pitch, source pitch}; mode.xy = source size.

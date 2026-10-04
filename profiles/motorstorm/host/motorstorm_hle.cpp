@@ -4847,7 +4847,8 @@ void report_summary() {
             << " pixels=" << summary.pixels_drawn << " colored=" << summary.pixels_colored
             << " textured_draws=" << summary.textured_draws
             << " vertex_decodes=" << summary.vertex_decodes << " vertex_cache_hits=" << summary.vertex_cache_hits
-            << " transfers=" << summary.block_transfers << " transfer_syncs=" << summary.transfer_syncs << " clut_syncs=" << summary.clut_syncs
+            << " transfers=" << summary.block_transfers << " transfer_syncs=" << summary.transfer_syncs << " clut_syncs=" << summary.clut_syncs << " gpu_cluts=" << summary.gpu_cluts
+            << " gpu_sourced_textures=" << summary.gpu_sourced_textures
             << " transferred_bytes=" << summary.transferred_bytes;
         log_line(category::kGe, out.str());
     }

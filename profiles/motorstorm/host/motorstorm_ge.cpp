@@ -102,6 +102,11 @@ struct GeState {
     // FNV-1a hash of the current CLUT bytes, refreshed whenever LOADCLUT runs.
     // Texture Lookup hashes this 8-byte value instead of 1 KiB per draw.
     std::uint64_t clut_hash{};
+    // The loaded palette was rendered by the GPU in the current list and has
+    // not been read back: textures decode it from its target on the GPU.
+    // Any readback publish since (clut_gpu_epoch) makes guest memory valid.
+    bool clut_gpu{};
+    std::uint64_t clut_gpu_epoch{}, clut_gpu_version{};
     std::uint32_t texture_size{};
     std::uint32_t texture_func{};
     std::uint32_t texture_env_color{0xFFFFFFu};
@@ -1646,8 +1651,25 @@ std::uint64_t hash_bytes(std::uint64_t hash, const void *data, std::size_t bytes
     return hash;
 }
 
+// Reads the loaded palette bytes from guest memory.
+void load_clut(GuestMemory &memory) {
+    for (std::uint32_t i = 0u; i < g_state.clut_loaded_bytes; ++i) {
+        const auto at = g_state.texture_clut_address + i;
+        g_state.clut[i] = memory.contains(at, 1u) ? memory.aot_load8(at) : 0u;
+    }
+    g_state.clut_hash = hash_bytes(14695981039346656037ull, g_state.clut.data(), g_state.clut.size());
+    g_state.clut_gpu = false;
+}
+// A GPU palette is only valid until the next readback publish; after one the
+// guest copy is current.
+void settle_gpu_clut(GuestMemory &memory) {
+    if (g_state.clut_gpu && g_state.clut_gpu_epoch != gpu_memory_epoch())
+        load_clut(memory);
+}
+
 const GpuTexture *gpu_texture(GuestMemory &memory) {
     if (!g_state.texture_enabled || (g_state.clear_mode & 1u)) return nullptr;
+    settle_gpu_clut(memory);
     if(g_list_texture_epoch!=gpu_memory_epoch()) {
         g_list_texture_keys.clear(); g_list_texture_epoch=gpu_memory_epoch();
     }
@@ -1668,6 +1690,8 @@ const GpuTexture *gpu_texture(GuestMemory &memory) {
     state_key = hash_bytes(state_key,&g_state.clut_hash,sizeof(g_state.clut_hash));
     struct Level { std::uint32_t address,bytes,width,height,stride; };
     std::array<Level,8> levels{};
+    bool gpu_source=false, gpu_overlay=false;
+    std::uint64_t source_version=0u;
     for (std::uint32_t mip=0;mip<=max_level;++mip) {
         const auto size=mip ? g_state.commands[0xB8u+mip] : g_state.texture_size;
         const auto width=1u<<(size&15u),height=1u<<((size>>8)&15u);
@@ -1680,7 +1704,22 @@ const GpuTexture *gpu_texture(GuestMemory &memory) {
         const auto bytes=(g_state.texture_mode&1) ? ((height+7)&~7u)*std::max(16u,(row_bytes+15)&~15u) : height*row_bytes;
         levels[mip]={address,bytes,width,height,stride};
         state_key=hash_bytes(state_key,&levels[mip],sizeof(Level));
+        // Texel bytes the GPU drew in this list: decode them from that target
+        // on the GPU instead of waiting for a readback (single-level only).
+        if(max_level==0 && g_state.texture_format<=7u && gpu_texture_decode()) {
+            const auto extent=std::max(bytes,texel_extent(g_state.texture_format,width,height,stride,
+                                                           (g_state.texture_mode&1u)!=0u));
+            gpu_source=gpu_source_in_target(address,extent,false,source_version);
+            if(!gpu_source && memory.contains(address,extent))
+                gpu_overlay=gpu_overlay_targets(address,extent,source_version);
+            if(gpu_source || gpu_overlay) {
+                state_key=hash_bytes(state_key,&source_version,sizeof(source_version));
+                ++g_summary.gpu_sourced_textures;
+                break;
+            }
+        }
         gpu_sync_texture(memory,address,bytes);
+        settle_gpu_clut(memory);
         if(g_list_texture_epoch!=gpu_memory_epoch()) {
             g_list_texture_keys.clear(); g_list_texture_epoch=gpu_memory_epoch();
         }
@@ -1694,7 +1733,7 @@ const GpuTexture *gpu_texture(GuestMemory &memory) {
     // Hash in L1-friendly chunks so no per-texture heap copy is needed; only
     // the content key consumes the bytes, the decoder reads guest memory again.
     std::array<std::uint8_t,16u*1024u> chunk{};
-    for(std::uint32_t mip=0;mip<=max_level;++mip) {
+    for(std::uint32_t mip=0;mip<=max_level && !gpu_source && !gpu_overlay;++mip) {
         const auto &level=levels[mip];
         if(!memory.contains(level.address,level.bytes)) continue;
         std::uint32_t offset=0u;
@@ -1711,16 +1750,26 @@ const GpuTexture *gpu_texture(GuestMemory &memory) {
     // entry and GPU texture instead of creating new ones (and skips pack
     // matching). Slots the game merely reuses for other textures over time
     // (track streaming) change rarely and keep normal, matchable textures.
-    if(g_texture_streams.size()>8192) g_texture_streams.clear();
-    auto &stream=g_texture_streams[state_key];
-    if(stream.content!=content_key) {
-        const auto list=g_summary.lists_executed;
-        stream.changes=stream.content!=0u && list-stream.last_change<=4u ? stream.changes+1u : 0u;
-        stream.last_change=list;
-        stream.content=content_key;
+    // Textures read from the GPU (texels or palette) change with every draw to
+    // their targets: one cache entry per texture slot, re-decoded per version.
+    const bool gpu_palette=g_state.clut_gpu && g_state.texture_format>=4u && g_state.texture_format<=7u;
+    bool streaming=gpu_source || gpu_overlay || gpu_palette;
+    auto cache_key=content_key;
+    if(streaming) {
+        cache_key=hash_bytes(0x47505553524Bull,values.data(),sizeof(values)) ^
+                  (static_cast<std::uint64_t>(gpu_palette ? g_state.texture_clut_address : 0u)<<1u) ^ (gpu_source ? 1u : 0u);
+    } else {
+        if(g_texture_streams.size()>8192) g_texture_streams.clear();
+        auto &stream=g_texture_streams[state_key];
+        if(stream.content!=content_key) {
+            const auto list=g_summary.lists_executed;
+            stream.changes=stream.content!=0u && list-stream.last_change<=4u ? stream.changes+1u : 0u;
+            stream.last_change=list;
+            stream.content=content_key;
+        }
+        streaming=stream.changes>=3u && gpu_texture_decode();
+        if(streaming) cache_key=state_key ^ 0x53545245414D0000ull;
     }
-    const bool streaming=stream.changes>=3u && gpu_texture_decode();
-    const auto cache_key=streaming ? (state_key ^ 0x53545245414D0000ull) : content_key;
     auto found=g_gpu_textures.find(cache_key);
     if(found==g_gpu_textures.end() || (streaming && found->second.generation!=content_key)) {
         GpuTexture texture; texture.key=cache_key; texture.width=levels[0].width; texture.height=levels[0].height;
@@ -1728,8 +1777,19 @@ const GpuTexture *gpu_texture(GuestMemory &memory) {
         texture.format=g_state.texture_format; texture.clut_mode=g_state.texture_clut_format;
         texture.texture_mode=g_state.texture_mode;
         std::memcpy(texture.clut.data(),g_state.clut.data(),g_state.clut.size());
+        texture.gpu_source=gpu_source;
+        texture.gpu_overlay=gpu_overlay;
+        texture.gpu_source_address=levels[0].address;
+        texture.gpu_clut=gpu_palette;
+        texture.gpu_clut_address=g_state.texture_clut_address;
+        texture.gpu_clut_bytes=g_state.clut_loaded_bytes;
         bool raw_ok=gpu_texture_decode();
-        for(std::uint32_t mip=0;mip<=max_level && raw_ok;++mip) {
+        if(gpu_source) {
+            // Only the shape: DecodeCS reads the bytes from the target.
+            auto &raw=texture.raw.emplace_back();
+            raw.width=levels[0].width; raw.height=levels[0].height; raw.stride=levels[0].stride;
+        }
+        for(std::uint32_t mip=0;mip<=max_level && raw_ok && !gpu_source;++mip) {
             const auto &level=levels[mip];
             if(level.width!=std::max(1u,texture.width>>mip) || level.height!=std::max(1u,texture.height>>mip)) break;
             const auto extent=std::max(level.bytes,texel_extent(texture.format,level.width,level.height,level.stride,
@@ -1788,12 +1848,9 @@ const GpuTexture *gpu_texture(GuestMemory &memory) {
     return &found->second;
 }
 
-void submit_gpu_primitive(GuestMemory &memory, std::uint32_t type, const std::vector<Vertex> &vertices) {
+// GE state of one draw, as the GPU renderer consumes it.
+GpuDraw gpu_draw_state(std::uint32_t type) {
     GpuDraw draw;
-    const GpuTexture *texture = nullptr;
-    static thread_local std::vector<GpuVertex> triangles;
-    {
-    perf::Scope convert_profile(perf::kGeConvert);
     draw.commands=g_state.commands;
     draw.framebuffer=g_state.framebuffer; draw.stride=g_state.framebuffer_stride; draw.format=g_state.framebuffer_format;
     draw.depthbuffer=g_state.depthbuffer; draw.depth_stride=g_state.depth_stride;
@@ -1815,6 +1872,183 @@ void submit_gpu_primitive(GuestMemory &memory, std::uint32_t type, const std::ve
         for(std::size_t row=0;row<4;++row) draw.model_to_clip[row*4+column]=
             g_state.projection[row]*view[0]+g_state.projection[4+row]*view[1]+g_state.projection[8+row]*view[2]+(column==3?g_state.projection[12+row]:0);
     }
+    return draw;
+}
+
+// PSPRECOMP_MOTORSTORM_GPU_VERTICES=0 decodes every vertex on the CPU.
+bool gpu_vertices_enabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("PSPRECOMP_MOTORSTORM_GPU_VERTICES");
+        return !(value && std::strcmp(value, "0") == 0);
+    }();
+    return enabled;
+}
+
+// Hardware-transformed triangles, strips and fans whose vertices VertexCS can
+// process: the GE skips the CPU decode and hands the GPU the raw vertex bytes.
+// Returns false (nothing submitted) when the draw must take the CPU path.
+bool submit_gpu_vertices(GuestMemory &memory, std::uint32_t type, std::uint32_t count, const VertexLayout &layout,
+                         std::uint32_t index_width, std::uint32_t &vertex_end) {
+    const auto &c = g_state.commands;
+    if (layout.stride == 0u || layout.morph_count > 8u || layout.weight_count > 8u || layout.position_type == 0u ||
+        layout.one_size > 255u || layout.color_offset > 255u || (c[0xC0u] & 3u) != 0u)
+        return false;
+    // Camera-facing blended particles take the CPU path: soft particles
+    // measure their view-depth range from the decoded vertices.
+    if ((c[0x21u] & 1u) && (c[0x23u] & 1u) && c[0xE7u] != 0u && (c[0xDEu] & 7u) >= 4u)
+        return false;
+    // Flat shading colours a triangle by its last vertex: the CPU path does that.
+    if ((g_state.shade_mode & 1u) == 0u && (g_state.clear_mode & 1u) == 0u)
+        return false;
+    const std::uint32_t outputs = type == 3u ? count / 3u * 3u : (count >= 3u ? (count - 2u) * 3u : 0u);
+    if (outputs == 0u)
+        return false;
+    static thread_local GpuVertexJob job;
+    static thread_local std::vector<std::uint32_t> elements;
+    elements.clear();
+    std::uint32_t highest = count - 1u;
+    if (index_width != 0u) {
+        if (!memory.contains(g_state.index_address, count * index_width))
+            return false;
+        elements.resize(count);
+        highest = 0u;
+        for (std::uint32_t i = 0u; i < count; ++i) {
+            const std::uint32_t at = g_state.index_address + i * index_width;
+            const std::uint32_t element = index_width == 1u ? memory.aot_load8(at)
+                                        : index_width == 2u ? memory.aot_load16(at) : memory.aot_load32(at);
+            elements[i] = element;
+            highest = std::max(highest, element);
+        }
+    }
+    // The input assembler expands the primitive: strips natively (D3D's odd-
+    // triangle order has the PSP's winding), fans through an index list.
+    job.strip = type == 4u;
+    job.decode_count = highest + 1u;
+    job.indices.clear();
+    if (type == 5u) {
+        job.indices.reserve(outputs);
+        const auto element = [&](std::uint32_t k) { return index_width != 0u ? elements[k] : k; };
+        for (std::uint32_t i = 1u; i + 1u < count; ++i)
+            job.indices.insert(job.indices.end(), {element(0u), element(i), element(i + 1u)});
+    } else if (index_width != 0u) {
+        job.indices.assign(elements.begin(), elements.begin() + (type == 3u ? outputs : count));
+    }
+    const std::uint64_t bytes = (static_cast<std::uint64_t>(highest) + 1u) * layout.stride;
+    if (bytes > 16u * 1024u * 1024u || !memory.contains(g_state.vertex_address, static_cast<std::uint32_t>(bytes)))
+        return false;
+    job.vertex_address = g_state.vertex_address;
+    job.vertex_bytes = static_cast<std::uint32_t>(bytes);
+    job.output_count = type == 4u ? count : outputs;
+
+    // Parameter block (layout: VertexCS in motorstorm_gpu.hlsl).
+    auto &h = job.header;
+    h.assign(288u, 0u);
+    const auto put = [&](std::size_t at, float value) { h[at] = std::bit_cast<std::uint32_t>(value); };
+    const bool lighting = (c[0x17u] & 1u) != 0u;
+    h[0] = job.decode_count;
+    h[1] = type;
+    h[2] = (lighting ? 4u : 0u) | (g_state.reverse_normal != 0u ? 8u : 0u) | ((c[0x5Eu] & 1u) != 0u ? 16u : 0u);
+    h[3] = layout.stride;
+    h[4] = layout.morph_count;
+    h[5] = layout.one_size;
+    h[6] = layout.position_type | (layout.normal_type << 4u) | (layout.tc_type << 8u) | (layout.color_type << 12u) |
+           (layout.weight_type << 16u) | (layout.weight_count << 20u);
+    h[7] = layout.position_offset | (layout.normal_offset << 8u) | (layout.tc_offset << 16u) |
+           (layout.color_offset << 24u);
+    h[8] = layout.weight_offset;
+    h[11] = g_state.material_color;
+    h[12] = g_state.material_alpha;
+    h[13] = c[0x53u];
+    h[14] = c[0x5Du] & 255u;
+    for (std::size_t i = 0; i < 8u; ++i) put(16u + i, g_state.morph_weights[i]);
+    for (std::size_t b = 0; b < 8u; ++b)
+        for (std::size_t i = 0; i < 12u; ++i) put(24u + b * 12u + i, g_state.bones[b][i]);
+    for (std::size_t i = 0; i < 12u; ++i) put(120u + i, g_state.world[i]);
+    put(132u, g_state.texture_scale_u); put(133u, g_state.texture_scale_v);
+    put(134u, g_state.texture_offset_u); put(135u, g_state.texture_offset_v);
+    const float texture_width = static_cast<float>(1u << (g_state.texture_size & 15u));
+    const float texture_height = static_cast<float>(1u << ((g_state.texture_size >> 8u) & 15u));
+    put(136u, texture_width); put(137u, texture_height);
+    if (lighting) {
+        const auto &setup = light_setup(g_state);
+        for (std::size_t j = 0; j < 3u; ++j) {
+            put(138u + j, setup.emissive[j]);
+            put(141u + j, setup.ambient_light[j]);
+            for (std::size_t m = 0; m < 3u; ++m) put(144u + m * 3u + j, setup.material[m][j]);
+            put(153u + j, setup.view_direction[j]);
+        }
+        put(156u, setup.exponent);
+        for (std::size_t l = 0; l < 4u; ++l) {
+            const auto &light = setup.lights[l];
+            const std::size_t at = 157u + l * 32u;
+            h[at] = light.enabled ? 1u : 0u;
+            if (!light.enabled) continue;
+            h[at + 1u] = light.type;
+            h[at + 2u] = light.kind;
+            for (std::size_t j = 0; j < 3u; ++j) {
+                put(at + 3u + j, light.direction[j]);
+                put(at + 6u + j, light.unit_direction[j]);
+                put(at + 9u + j, light.halfway[j]);
+                put(at + 15u + j, light.spot[j]);
+                put(at + 20u + j, light.ambient[j]);
+                put(at + 23u + j, light.diffuse[j]);
+                put(at + 26u + j, light.specular[j]);
+            }
+            put(at + 12u, light.a0); put(at + 13u, light.a1); put(at + 14u, light.a2);
+            put(at + 18u, light.cutoff); put(at + 19u, light.spot_exponent);
+        }
+    }
+
+    // Texel range for enhanced filtering, from the raw coordinates exactly as
+    // the CPU decode computes them (the transform is monotonic per axis).
+    job.uv_range_valid = false;
+    if (layout.tc_type != 0u) {
+        float lo_u = 3.0e38f, lo_v = 3.0e38f, hi_u = -3.0e38f, hi_v = -3.0e38f;
+        const auto raw = [&](std::uint32_t at) {
+            if (layout.tc_type == 1u) return static_cast<float>(memory.aot_load8(at)) / 128.0f;
+            if (layout.tc_type == 2u) return static_cast<float>(memory.aot_load16(at)) / 32768.0f;
+            return std::bit_cast<float>(memory.aot_load32(at));
+        };
+        const std::uint32_t step = 1u << (layout.tc_type - 1u);
+        const std::uint32_t used = type == 3u ? outputs : count;
+        for (std::uint32_t i = 0u; i < used; ++i) {
+            const std::uint32_t element = index_width != 0u ? elements[i] : i;
+            const std::uint32_t base = g_state.vertex_address + element * layout.stride;
+            float u = 0.0f, v = 0.0f;
+            for (std::uint32_t m = 0u; m < layout.morph_count; ++m) {
+                const float weight = layout.morph_count == 1u ? 1.0f : g_state.morph_weights[m];
+                const std::uint32_t at = base + m * layout.one_size + layout.tc_offset;
+                u += weight * raw(at);
+                v += weight * raw(at + step);
+            }
+            u = (u * g_state.texture_scale_u + g_state.texture_offset_u) * texture_width;
+            v = (v * g_state.texture_scale_v + g_state.texture_offset_v) * texture_height;
+            lo_u = std::min(lo_u, u); hi_u = std::max(hi_u, u);
+            lo_v = std::min(lo_v, v); hi_v = std::max(hi_v, v);
+        }
+        job.uv_range = {lo_u, lo_v, hi_u, hi_v};
+        job.uv_range_valid = true;
+    }
+
+    GpuDraw draw = gpu_draw_state(type);
+    const GpuTexture *texture = nullptr;
+    {
+        perf::Scope texture_profile(perf::kTexture);
+        texture = gpu_texture(memory);
+    }
+    gpu_submit(memory, draw, {}, texture, &job);
+    g_summary.vertex_decodes += count;
+    vertex_end = g_state.vertex_address + count * layout.stride;
+    return true;
+}
+
+void submit_gpu_primitive(GuestMemory &memory, std::uint32_t type, const std::vector<Vertex> &vertices) {
+    GpuDraw draw;
+    const GpuTexture *texture = nullptr;
+    static thread_local std::vector<GpuVertex> triangles;
+    {
+    perf::Scope convert_profile(perf::kGeConvert);
+    draw=gpu_draw_state(type);
     triangles.clear();
     triangles.reserve(vertices.size()*3);
     const auto convert=[](const Vertex &v) { return GpuVertex{v.x,v.y,v.z,v.color,v.secondary_color,v.u,v.v,v.q,v.fog}; };
@@ -2313,13 +2547,21 @@ void execute_list(GuestMemory &memory, std::uint32_t address, std::uint32_t stal
             break;
         case 0xC4u: { // LOADCLUT, 32-byte blocks
             g_state.clut_loaded_bytes = std::min(1024u, (data & 63u) * 32u);
-            if(gpu_sync_texture(memory,g_state.texture_clut_address,g_state.clut_loaded_bytes)) ++g_summary.clut_syncs;
-            for (std::uint32_t i = 0u; i < g_state.clut_loaded_bytes; ++i) {
-                const auto at = g_state.texture_clut_address + i;
-                g_state.clut[i] = memory.contains(at, 1u) ? memory.aot_load8(at) : 0u;
+            // A palette the GPU rendered in this list (8888 entries in a 32-bit
+            // target) stays there: textures read it on the GPU, no sync.
+            std::uint64_t version = 0u;
+            g_state.clut_gpu = (g_state.texture_clut_format & 3u) == 3u && gpu_texture_decode() &&
+                gpu_source_in_target(g_state.texture_clut_address, g_state.clut_loaded_bytes, true, version);
+            if (g_state.clut_gpu) {
+                ++g_summary.gpu_cluts;
+                g_state.clut_gpu_epoch = gpu_memory_epoch();
+                g_state.clut_gpu_version = version;
+                const std::array<std::uint64_t, 3> identity{0x47505543ull, g_state.texture_clut_address, version};
+                g_state.clut_hash = hash_bytes(14695981039346656037ull, identity.data(), sizeof(identity));
+                break;
             }
-            g_state.clut_hash = hash_bytes(14695981039346656037ull, g_state.clut.data(),
-                                           g_state.clut.size());
+            if(gpu_sync_texture(memory,g_state.texture_clut_address,g_state.clut_loaded_bytes)) ++g_summary.clut_syncs;
+            load_clut(memory);
             break;
         }
         case 0xC6u: // TEX filter
@@ -2378,6 +2620,20 @@ void execute_list(GuestMemory &memory, std::uint32_t address, std::uint32_t stal
             vertices.reserve(count);
             const bool gpu_draw=gpu_active() && type<=6u;
             const bool gpu_transform=gpu_draw && type!=6u;
+            if(gpu_transform && type>=3u && type<=5u && !(g_state.vertex_type&0x800000u) && gpu_vertices_enabled() &&
+               !inspection.enabled) {
+                std::uint32_t vertex_end=0u;
+                bool submitted=false;
+                {
+                    perf::Scope submit_profile(perf::kGeSubmit);
+                    submitted=submit_gpu_vertices(memory,type,count,layout,index_width,vertex_end);
+                }
+                if(submitted) {
+                    if(index_width!=0u) g_state.index_address+=count*index_width;
+                    else g_state.vertex_address=vertex_end;
+                    break;
+                }
+            }
             {
                 perf::Scope decode_profile(perf::kGeDecode);
                 // A PSP indexed mesh can reference the same vertex many times.

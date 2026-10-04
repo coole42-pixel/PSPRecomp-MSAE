@@ -31,7 +31,7 @@ struct GeSummary {
     std::uint64_t pixels_colored{};   // drawn with a non-black, non-transparent colour
     std::uint64_t vertex_decodes{}, vertex_cache_hits{};
     std::uint64_t textured_draws{};
-    std::uint64_t block_transfers{}, transferred_bytes{}, transfer_syncs{}, clut_syncs{};
+    std::uint64_t block_transfers{}, transferred_bytes{}, transfer_syncs{}, clut_syncs{}, gpu_cluts{}, gpu_sourced_textures{};
 };
 
 void reset_software_ge() noexcept;

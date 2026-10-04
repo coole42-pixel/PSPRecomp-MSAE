@@ -65,6 +65,8 @@ using Microsoft::WRL::ComPtr;
 #include "motorstorm_shader_CaptureCS.h"
 #include "motorstorm_shader_DecodeCS.h"
 #include "motorstorm_shader_MipCS.h"
+#include "motorstorm_shader_VertexCS.h"
+#include "motorstorm_shader_DecodeTargetCS.h"
 #include "motorstorm_shader_PostResolveCS.h"
 #include "motorstorm_shader_DebandCS.h"
 #include "motorstorm_shader_PostPS.h"
@@ -161,6 +163,9 @@ UINT64 chunk_draws_limit() {
 struct CommandSlot {
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
+    // VertexCS dispatches of the chunk, executed just before `list`.
+    ComPtr<ID3D12CommandAllocator> pre_allocator;
+    ComPtr<ID3D12GraphicsCommandList> pre_list;
     UINT64 fence_value{};
     bool pending{};
 };
@@ -183,6 +188,13 @@ struct State {
     // arena_fence: last submission that may still read the upload arena.
     UINT64 readback_fence{}, arena_fence{};
     ComPtr<ID3D12RootSignature> root;
+    // VertexCS output for the draws of the current arena generation (recycled
+    // together with the upload arena, see begin()).
+    ComPtr<ID3D12PipelineState> vertex_pipeline, decode_target_pipeline;
+    ComPtr<ID3D12Resource> vertex_arena;
+    D3D12_RESOURCE_STATES vertex_arena_state{D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+    UINT64 vertex_used{};
+    bool pre_open{};  // the slot's pre_list is recording this chunk's VertexCS work
     ComPtr<ID3D12PipelineState> pipeline, line_pipeline, point_pipeline, present_pipeline, expand_pipeline,
         resolve_pipeline, capture_pipeline, decode_pipeline, mip_pipeline;
     // GPU texture decoding scratch (decode output / mip ping-pong).
@@ -232,6 +244,11 @@ struct State {
     ComPtr<ID3D12Resource> transfer_ring;
     UINT64 transfer_used{};
     std::vector<PendingTransfer> pending_transfers;
+    // Decode constants whose palette is copied from a target on the GPU.
+    static constexpr UINT kClutConstantSlots = 64, kClutConstantStride = 1280;
+    ComPtr<ID3D12Resource> clut_constants;
+    D3D12_RESOURCE_STATES clut_constants_state{D3D12_RESOURCE_STATE_COPY_DEST};
+    UINT clut_constant_slot{};
     std::unordered_map<std::uint64_t, Texture> textures;
     // Texture-pack replacements, keyed by content hash. descriptor == 0 with
     // no image marks a file that was rejected (not retried this session).
@@ -465,16 +482,33 @@ void begin(State &s, UINT slot = 0) {
     // wait only when the arena would otherwise run short.
     if (s.arena_fence != 0u && s.fence->GetCompletedValue() < s.arena_fence && s.used > kUploadBytes / 2u)
         wait_value(s, s.arena_fence);
-    if (s.arena_fence == 0u || s.fence->GetCompletedValue() >= s.arena_fence)
+    if (s.arena_fence == 0u || s.fence->GetCompletedValue() >= s.arena_fence) {
         s.used = 0;
+        s.vertex_used = 0;
+    }
     s.frame_fence = 0;
     open_chunk(s, slot);
 }
 // Close and execute the recording chunk without waiting for it.
 void submit_chunk(State &s) {
     check(s.list->Close(), "close GE chunk");
-    ID3D12CommandList *lists[]{s.list.Get()};
-    s.queue->ExecuteCommandLists(1, lists);
+    CommandSlot &chunk = s.slots[s.slot_index];
+    if (s.pre_open) {
+        // The decoded vertices become the chunk's vertex buffers.
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition = {s.vertex_arena.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER};
+        chunk.pre_list->ResourceBarrier(1, &barrier);
+        s.vertex_arena_state = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+        check(chunk.pre_list->Close(), "close vertex list");
+        ID3D12CommandList *lists[]{chunk.pre_list.Get(), s.list.Get()};
+        s.queue->ExecuteCommandLists(2, lists);
+        s.pre_open = false;
+    } else {
+        ID3D12CommandList *lists[]{s.list.Get()};
+        s.queue->ExecuteCommandLists(1, lists);
+    }
     ++s.executions;
     ++report.submissions;
     CommandSlot &slot = s.slots[s.slot_index];
@@ -514,7 +548,9 @@ const Bytecode *compile(const char *entry, const char *) {
         MOTORSTORM_SHADER(VS),        MOTORSTORM_SHADER(PS),        MOTORSTORM_SHADER(PointGS),
         MOTORSTORM_SHADER(PresentVS), MOTORSTORM_SHADER(PresentPS), MOTORSTORM_SHADER(ExpandCS),
         MOTORSTORM_SHADER(ResolveCS), MOTORSTORM_SHADER(CaptureCS), MOTORSTORM_SHADER(DecodeCS),
-        MOTORSTORM_SHADER(MipCS),     MOTORSTORM_SHADER(PostResolveCS), MOTORSTORM_SHADER(DebandCS),
+        MOTORSTORM_SHADER(MipCS),     MOTORSTORM_SHADER(VertexCS),      MOTORSTORM_SHADER(DecodeTargetCS),
+        MOTORSTORM_SHADER(PostResolveCS),
+        MOTORSTORM_SHADER(DebandCS),
         MOTORSTORM_SHADER(PostPS), MOTORSTORM_SHADER(PostCaptureCS), MOTORSTORM_SHADER(PostColorCS),
         MOTORSTORM_SHADER(PostPresentPS), MOTORSTORM_SHADER(PostColorCaptureCS),
         MOTORSTORM_SHADER(DepthResolveCS)};
@@ -636,6 +672,8 @@ void create_pipeline(State &s) {
     create_compute("ResolveCS", s.resolve_pipeline);
     create_compute("CaptureCS", s.capture_pipeline);
     create_compute("DecodeCS", s.decode_pipeline);
+    create_compute("VertexCS", s.vertex_pipeline);
+    create_compute("DecodeTargetCS", s.decode_target_pipeline);
     create_compute("MipCS", s.mip_pipeline);
     create_compute("PostResolveCS", s.post_resolve_pipeline);
     create_compute("DebandCS", s.deband_pipeline);
@@ -644,14 +682,22 @@ void create_pipeline(State &s) {
     create_compute("PostColorCaptureCS", s.post_color_capture_pipeline);
     create_compute("DepthResolveCS", s.depth_resolve_pipeline);
 }
+void compute_with(State &s, ID3D12PipelineState *pipeline, D3D12_GPU_VIRTUAL_ADDRESS constants,
+                  D3D12_GPU_VIRTUAL_ADDRESS source, D3D12_GPU_VIRTUAL_ADDRESS destination, UINT width,
+                  UINT height);
 void compute(State &s, ID3D12PipelineState *pipeline, const Constants &constants,
              D3D12_GPU_VIRTUAL_ADDRESS source, D3D12_GPU_VIRTUAL_ADDRESS destination, UINT width,
              UINT height) {
     const auto offset = allocate(s, sizeof(constants), 256);
     std::memcpy(s.mapped + offset, &constants, sizeof(constants));
+    compute_with(s, pipeline, s.upload->GetGPUVirtualAddress() + offset, source, destination, width, height);
+}
+void compute_with(State &s, ID3D12PipelineState *pipeline, D3D12_GPU_VIRTUAL_ADDRESS constants,
+                  D3D12_GPU_VIRTUAL_ADDRESS source, D3D12_GPU_VIRTUAL_ADDRESS destination, UINT width,
+                  UINT height) {
     s.list->SetComputeRootSignature(s.root.Get());
     s.list->SetPipelineState(pipeline);
-    s.list->SetComputeRootConstantBufferView(0, s.upload->GetGPUVirtualAddress() + offset);
+    s.list->SetComputeRootConstantBufferView(0, constants);
     s.list->SetComputeRootShaderResourceView(4, source);
     s.list->SetComputeRootUnorderedAccessView(6, destination);
     s.list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
@@ -836,21 +882,120 @@ void queue_identify_copy(State &s, std::uint64_t key, UINT width, UINT height) {
     s.identify_copies.push_back({key, width, height, pitch, start, start + bytes, s.executions, 0});
     s.identify_head = start + bytes;
 }
-// Decodes one raw PSP level into scratch[index] with DecodeCS.
+void transition_image(State &s, ID3D12Resource *image, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to);
+// The target drawn in the current list that holds these guest bytes.
+Surface *drawn_target(State &s, std::uint32_t address, std::uint32_t bytes, bool palette) {
+    address = physical(address);
+    for (const auto &surface : s.surfaces)
+        if (surface->dirty && (!palette || surface->bpp == 4u) && address >= surface->address &&
+            static_cast<UINT64>(address) + bytes <= surface->address + surface->guest_bytes() &&
+            (!palette || (address - surface->address) % 4u == 0u))
+            return surface.get();
+    return nullptr;
+}
+void target_state(State &s, Surface &target, D3D12_RESOURCE_STATES next) {
+    if (target.raster_half == 2)
+        transition(s, target, next);
+    else
+        native_transition(s, target, next);
+}
+// Decode constants in a GPU buffer whose palette bytes (commands[]) are copied
+// from the target that rendered them. 0: the palette target is gone.
+D3D12_GPU_VIRTUAL_ADDRESS gpu_clut_constants(State &s, const Constants &constants, const GpuTexture &texture) {
+    Surface *target = drawn_target(s, texture.gpu_clut_address, texture.gpu_clut_bytes, true);
+    if (!target)
+        return 0;
+    if (!s.clut_constants) {
+        s.clut_constants = buffer(s, UINT64{State::kClutConstantSlots} * State::kClutConstantStride,
+                                  D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+        s.clut_constants_state = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    const auto constants_state = [&](D3D12_RESOURCE_STATES next) {
+        if (s.clut_constants_state == next)
+            return;
+        transition_image(s, s.clut_constants.Get(), s.clut_constants_state, next);
+        s.clut_constants_state = next;
+    };
+    const UINT64 slot = UINT64{s.clut_constant_slot++ % State::kClutConstantSlots} * State::kClutConstantStride;
+    const auto offset = allocate(s, sizeof(constants), 256);
+    std::memcpy(s.mapped + offset, &constants, sizeof(constants));
+    auto *resolved = resolve_surface(s, *target);
+    target_state(s, *target, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    constants_state(D3D12_RESOURCE_STATE_COPY_DEST);
+    s.list->CopyBufferRegion(s.clut_constants.Get(), slot, s.upload.Get(), offset, sizeof(constants));
+    // 32-bit target pixels are the palette's bytes, one word per pixel.
+    s.list->CopyBufferRegion(s.clut_constants.Get(), slot, resolved,
+                             physical(texture.gpu_clut_address) - target->address, texture.gpu_clut_bytes);
+    target_state(s, *target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    constants_state(D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+    s.has_commands = true;
+    return s.clut_constants->GetGPUVirtualAddress() + slot;
+}
+// Decodes one raw PSP level into scratch[index] with DecodeCS. The texel bytes
+// come from the upload arena, or straight from a drawn target (gpu_source).
 void decode_level(State &s, const GpuTexture &texture, UINT level, UINT index) {
     const auto &raw = texture.raw[level];
-    const auto padded = (raw.bytes.size() + 3u) & ~std::size_t{3};
-    const auto offset = allocate(s, padded + 4u, 4);
-    std::memcpy(s.mapped + offset, raw.bytes.data(), raw.bytes.size());
-    std::memset(s.mapped + offset + raw.bytes.size(), 0, padded + 4u - raw.bytes.size());
     Constants constants{};
     std::copy(texture.clut.begin(), texture.clut.end(), constants.commands.begin());
     constants.surface = {raw.width, raw.height, decode_pitch(raw.width), raw.stride};
     constants.mode = {texture.format, (texture.texture_mode & 1u) != 0u ? 1u : 0u, texture.clut_mode, level};
     constants.feedback = {texture.texture_mode, 0, 0, 0};
+    D3D12_GPU_VIRTUAL_ADDRESS source{};
+    Surface *source_target = nullptr;
+    if (texture.gpu_source) {
+        // DecodeCS reads guest bytes from the resolved target: one word per
+        // pixel holding `bpp` guest bytes (DecodeTargetCS, replace = {1, bpp, offset}).
+        source_target = drawn_target(s, texture.gpu_source_address, 1u, false);
+        if (!source_target)
+            throw std::runtime_error("MotorStorm GPU texture source target vanished");
+        auto *resolved = resolve_surface(s, *source_target);
+        target_state(s, *source_target, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        source = resolved->GetGPUVirtualAddress();
+        constants.replace = {1u, source_target->bpp,
+                             physical(texture.gpu_source_address) - source_target->address, 0u};
+    } else {
+        const auto padded = (raw.bytes.size() + 3u) & ~std::size_t{3};
+        const auto offset = allocate(s, padded + 4u, 4);
+        std::memcpy(s.mapped + offset, raw.bytes.data(), raw.bytes.size());
+        std::memset(s.mapped + offset + raw.bytes.size(), 0, padded + 4u - raw.bytes.size());
+        source = s.upload->GetGPUVirtualAddress() + offset;
+        if (texture.gpu_overlay && level == 0u) {
+            // Guest bytes first, then the drawn parts from each overlapping
+            // 32-bit target (its resolved words are the guest bytes).
+            auto composed = buffer(s, padded + 4u, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+            s.list->CopyBufferRegion(composed.Get(), 0, s.upload.Get(), offset, padded + 4u);
+            const UINT64 begin = physical(texture.gpu_source_address), end = begin + raw.bytes.size();
+            for (const auto &surface : s.surfaces) {
+                const UINT64 first = std::max<UINT64>(begin, surface->address);
+                const UINT64 last = std::min<UINT64>(end, surface->address + surface->guest_bytes());
+                if (!surface->dirty || first >= last)
+                    continue;
+                auto *resolved = resolve_surface(s, *surface);
+                target_state(s, *surface, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                s.list->CopyBufferRegion(composed.Get(), first - begin, resolved, first - surface->address,
+                                         last - first);
+                target_state(s, *surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            }
+            transition_image(s, composed.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            source = composed->GetGPUVirtualAddress();
+            s.transient.push_back(std::move(composed));
+            s.has_commands = true;
+        }
+    }
     scratch_state(s, index, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    compute(s, s.decode_pipeline.Get(), constants, s.upload->GetGPUVirtualAddress() + offset,
-            s.decode_scratch[index]->GetGPUVirtualAddress(), raw.width, raw.height);
+    D3D12_GPU_VIRTUAL_ADDRESS palette{};
+    if (texture.gpu_clut)
+        palette = gpu_clut_constants(s, constants, texture);
+    auto *pipeline = source_target ? s.decode_target_pipeline.Get() : s.decode_pipeline.Get();
+    if (palette)
+        compute_with(s, pipeline, palette, source, s.decode_scratch[index]->GetGPUVirtualAddress(), raw.width,
+                     raw.height);
+    else
+        compute(s, pipeline, constants, source, s.decode_scratch[index]->GetGPUVirtualAddress(), raw.width,
+                raw.height);
+    if (source_target)
+        target_state(s, *source_target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 }
 // Fills every mip of `image` from the raw levels; extra mips (enhanced
 // filtering) are box-filtered from the previous level on the GPU.
@@ -1451,6 +1596,13 @@ bool gpu_initialize() {
                                               nullptr, IID_PPV_ARGS(&slot.list)),
                   "create list");
             check(slot.list->Close(), "close initial list");
+            check(s.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                   IID_PPV_ARGS(&slot.pre_allocator)),
+                  "create vertex allocator");
+            check(s.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, slot.pre_allocator.Get(),
+                                              nullptr, IID_PPV_ARGS(&slot.pre_list)),
+                  "create vertex list");
+            check(slot.pre_list->Close(), "close initial vertex list");
         }
         s.allocator = s.slots[0].allocator;
         s.list = s.slots[0].list;
@@ -1504,10 +1656,64 @@ void gpu_shutdown(bool reset_report) noexcept {
         report.active = false;
     attempted = false;
 }
-void gpu_submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const GpuVertex> vertices,
-                const GpuTexture *texture) {
 #if defined(_WIN32)
-    if (!state || vertices.empty() || draw.framebuffer == 0 || draw.stride == 0 || draw.stride > 1024 ||
+namespace {
+// Uploads a VertexCS job and records its dispatch in the chunk's vertex
+// pre-pass; returns the offset of the decoded vertices in vertex_arena (a
+// vertex buffer by the time the chunk's draws run).
+UINT64 process_vertices(State &s, psprecomp::GuestMemory &memory, const GpuVertexJob &job, UINT output_bytes) {
+    constexpr UINT64 kVertexArenaBytes = 128ull * 1024 * 1024;
+    if (!s.vertex_arena) {
+        s.vertex_arena = buffer(s, kVertexArenaBytes, D3D12_HEAP_TYPE_DEFAULT,
+                                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, true);
+        s.vertex_arena_state = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+    }
+    if (s.vertex_used + output_bytes > kVertexArenaBytes) {
+        // Every earlier draw of this generation must finish before reuse.
+        flush_chunk(s);
+        wait(s);
+        s.vertex_used = 0;
+    }
+    const UINT64 output = s.vertex_used;
+    s.vertex_used = (s.vertex_used + output_bytes + 255u) & ~UINT64{255u};
+    // One buffer: parameter block, raw vertex bytes at their guest alignment.
+    std::vector<std::uint32_t> header = job.header;
+    const UINT64 header_bytes = header.size() * 4u;
+    const UINT64 vertex_at = header_bytes + (job.vertex_address & 3u);
+    const UINT64 total = vertex_at + job.vertex_bytes;
+    header[10] = static_cast<std::uint32_t>(vertex_at);  // vertex bytes (byte offset)
+    header[15] = static_cast<std::uint32_t>(total);      // read bound (bytes)
+    const auto offset = allocate(s, (total + 7u) & ~UINT64{7u}, 256);
+    std::memcpy(s.mapped + offset, header.data(), header_bytes);
+    std::span<std::uint8_t> raw(s.mapped + offset + vertex_at, job.vertex_bytes);
+    memory.copy_out(job.vertex_address, raw);
+    CommandSlot &chunk = s.slots[s.slot_index];
+    auto *list = chunk.pre_list.Get();
+    if (!s.pre_open) {
+        check(chunk.pre_allocator->Reset(), "reset vertex allocator");
+        check(list->Reset(chunk.pre_allocator.Get(), s.vertex_pipeline.Get()), "reset vertex list");
+        list->SetComputeRootSignature(s.root.Get());
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition = {s.vertex_arena.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              s.vertex_arena_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+        list->ResourceBarrier(1, &barrier);
+        s.vertex_arena_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        s.pre_open = true;
+    }
+    list->SetComputeRootShaderResourceView(4, s.upload->GetGPUVirtualAddress() + offset);
+    list->SetComputeRootUnorderedAccessView(6, s.vertex_arena->GetGPUVirtualAddress() + output);
+    list->Dispatch((job.decode_count + 63u) / 64u, 1, 1);
+    s.has_commands = true;
+    return output;
+}
+} // namespace
+#endif
+void gpu_submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const GpuVertex> vertices,
+                const GpuTexture *texture, const GpuVertexJob *job) {
+#if defined(_WIN32)
+    const UINT vertex_count = job ? job->output_count : static_cast<UINT>(vertices.size());
+    if (!state || vertex_count == 0 || draw.framebuffer == 0 || draw.stride == 0 || draw.stride > 1024 ||
         draw.right <= draw.left || draw.bottom <= draw.top)
         return;
     auto &s = *state;
@@ -1584,11 +1790,21 @@ void gpu_submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<c
     UINT cb_offset = 0;
     UINT vertex_offset = 0;
     UINT vertex_bytes = 0;
+    UINT index_offset = 0;
     {
         perf::Scope prepare_profile(perf::kGpuPrepare);
-        vertex_bytes = static_cast<UINT>(vertices.size_bytes());
-        vertex_offset = static_cast<UINT>(allocate(s, vertex_bytes, 4));
-        std::memcpy(s.mapped + vertex_offset, vertices.data(), vertex_bytes);
+        if (job) {
+            vertex_bytes = job->decode_count * static_cast<UINT>(sizeof(GpuVertex));
+            vertex_offset = static_cast<UINT>(process_vertices(s, memory, *job, vertex_bytes));
+            if (!job->indices.empty()) {
+                index_offset = static_cast<UINT>(allocate(s, job->indices.size() * 4u, 4));
+                std::memcpy(s.mapped + index_offset, job->indices.data(), job->indices.size() * 4u);
+            }
+        } else {
+            vertex_bytes = static_cast<UINT>(vertices.size_bytes());
+            vertex_offset = static_cast<UINT>(allocate(s, vertex_bytes, 4));
+            std::memcpy(s.mapped + vertex_offset, vertices.data(), vertex_bytes);
+        }
         Constants constants{draw.commands,
                             draw.model_to_clip,
                             draw.model_to_view_z,
@@ -1664,6 +1880,9 @@ void gpu_submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<c
             // Opaque replacements and nearest filtering do not consume it;
             // translucent replacements still need the original's alpha/mips.
             float lo_u = 3.0e38f, lo_v = 3.0e38f, hi_u = -3.0e38f, hi_v = -3.0e38f;
+            if (job && job->uv_range_valid) {
+                lo_u = job->uv_range[0]; lo_v = job->uv_range[1]; hi_u = job->uv_range[2]; hi_v = job->uv_range[3];
+            }
             for (const auto &vertex : vertices) {
                 const float q = vertex.q != 0.0f ? vertex.q : 1.0f, u = vertex.u / q, v = vertex.v / q;
                 lo_u = std::min(lo_u, u); hi_u = std::max(hi_u, u);
@@ -1687,6 +1906,7 @@ void gpu_submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<c
                                                           : s.pipeline.Get();
     const auto topology = draw.primitive == 0   ? D3D_PRIMITIVE_TOPOLOGY_POINTLIST
                           : draw.primitive == 1 ? D3D_PRIMITIVE_TOPOLOGY_LINELIST
+                          : job && job->strip   ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
                                                 : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     s.list->SetPipelineState(pipeline);
     // Root signature and descriptor heaps are bound once per command list.
@@ -1713,10 +1933,18 @@ void gpu_submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<c
     }
     s.list->RSSetScissorRects(1, &scissor);
     s.list->IASetPrimitiveTopology(topology);
-    D3D12_VERTEX_BUFFER_VIEW view{s.upload->GetGPUVirtualAddress() + vertex_offset,
+    D3D12_VERTEX_BUFFER_VIEW view{(job ? s.vertex_arena->GetGPUVirtualAddress() : s.upload->GetGPUVirtualAddress()) +
+                                      vertex_offset,
                                   static_cast<UINT>(vertex_bytes), sizeof(GpuVertex)};
     s.list->IASetVertexBuffers(0, 1, &view);
-    s.list->DrawInstanced(static_cast<UINT>(vertices.size()), 1, 0, 0);
+    if (job && !job->indices.empty()) {
+        D3D12_INDEX_BUFFER_VIEW indices{s.upload->GetGPUVirtualAddress() + index_offset,
+                                        static_cast<UINT>(job->indices.size() * 4u), DXGI_FORMAT_R32_UINT};
+        s.list->IASetIndexBuffer(&indices);
+        s.list->DrawIndexedInstanced(vertex_count, 1, 0, 0, 0);
+    } else {
+        s.list->DrawInstanced(vertex_count, 1, 0, 0);
+    }
     // ROV order is guaranteed within a draw. UAV barriers order separate draws.
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -1733,7 +1961,9 @@ void gpu_submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<c
         ++depth->version;
     }
     ++report.draws;
-    report.vertices += vertices.size();
+    report.vertices += vertex_count;
+    if (job)
+        ++report.gpu_vertex_draws;
     if (draw.hardware_transform)
         ++report.hardware_transform_draws;
     // Hand the finished chunk to the GPU so rasterization overlaps the next
@@ -2022,6 +2252,49 @@ bool gpu_transfer_from_target(std::uint32_t source, std::uint32_t source_stride,
     s.transfer_used += (bytes + 255u) & ~UINT64{255u};
     return true;
 #else
+    return false;
+#endif
+}
+bool gpu_source_in_target(std::uint32_t address, std::uint32_t bytes, bool palette,
+                          std::uint64_t &version) noexcept {
+#if defined(_WIN32)
+    if (!state || !state->recording || bytes == 0u || (palette && bytes % 4u != 0u))
+        return false;
+    const auto start = physical(address);
+    for (const auto &pending : state->pending_transfers)
+        if (start < static_cast<UINT64>(pending.start()) + pending.bytes() && pending.start() < start + bytes)
+            return false;
+    Surface *target = drawn_target(*state, address, bytes, palette);
+    if (!target)
+        return false;
+    version = (static_cast<std::uint64_t>(target->address) << 32) ^ target->version;
+    return true;
+#else
+    (void)address; (void)bytes; (void)palette; (void)version;
+    return false;
+#endif
+}
+bool gpu_overlay_targets(std::uint32_t address, std::uint32_t bytes, std::uint64_t &version) noexcept {
+#if defined(_WIN32)
+    if (!state || !state->recording || bytes == 0u)
+        return false;
+    const UINT64 begin = physical(address), end = begin + bytes;
+    for (const auto &pending : state->pending_transfers)
+        if (begin < static_cast<UINT64>(pending.start()) + pending.bytes() && pending.start() < end)
+            return false;
+    bool any = false;
+    version = 0u;
+    for (const auto &surface : state->surfaces) {
+        if (!surface->dirty || begin >= surface->address + surface->guest_bytes() || surface->address >= end)
+            continue;
+        if (surface->bpp != 4u)
+            return false;
+        any = true;
+        version = version * 1099511628211ull ^ ((static_cast<std::uint64_t>(surface->address) << 32) ^ surface->version);
+    }
+    return any;
+#else
+    (void)address; (void)bytes; (void)version;
     return false;
 #endif
 }
