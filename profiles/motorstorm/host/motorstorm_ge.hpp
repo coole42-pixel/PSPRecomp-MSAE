@@ -13,9 +13,12 @@
 #include "psprecomp/guest_memory.hpp"
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace motorstorm {
+
+struct GpuTexture;
 
 struct GeSummary {
     std::uint64_t lists_executed{};
@@ -51,5 +54,26 @@ struct GeInterrupt {
 std::vector<GeInterrupt> software_ge_execute_list(psprecomp::GuestMemory &memory,
     std::uint32_t address, std::uint32_t stall, bool rasterize = true,
     std::uint64_t submission = 0u);
+
+// Offline texture-pack extraction. Decodes texture bytes through the same
+// texel path the GPU texture cache uses at runtime, so extracted textures get
+// the identity the running game computes. `bytes` starts at texel (0,0) and
+// should extend as far as the game's memory would (the rest of the loaded
+// file): a non-power-of-two image is drawn as a larger GE texture whose extra
+// columns/rows read whatever follows.
+struct GeTextureSource {
+    std::uint32_t format{};                    // GE texture format 0-7 (4 = CLUT4, 5 = CLUT8)
+    std::uint32_t width_log2{}, height_log2{}; // GE texture size
+    std::uint32_t stride{};                    // texture buffer width, in texels
+    bool swizzled{};
+    std::span<const std::uint8_t> bytes;
+    std::span<const std::uint8_t> clut;        // palette bytes as loaded (at most 1024)
+    std::uint32_t clut_mode{0xFF03u};          // GE CMODE: 8888 entries, no shift, mask 0xFF, start 0
+};
+// Returns (1 << width_log2) x rows texels (RGBA8). Thread-safe (serialized).
+std::vector<std::uint32_t> ge_decode_texture(const GeTextureSource &source, std::uint32_t rows);
+// Fast CPU decode of a raw texture level captured for GPU decoding (texture
+// pack hashing); bit-exact with the per-texel GE path.
+std::vector<std::uint32_t> ge_decode_raw_level(const GpuTexture &texture, std::size_t level);
 
 } // namespace motorstorm

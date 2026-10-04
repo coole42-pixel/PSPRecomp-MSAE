@@ -1,6 +1,7 @@
 #include "motorstorm_bootstrap.hpp"
 #include "motorstorm_window.hpp"
 #include "motorstorm_audio.hpp"
+#include "motorstorm_textures.hpp"
 
 #include "psprecomp/common.hpp"
 #include "psprecomp/runtime.hpp"
@@ -111,11 +112,13 @@ int main(int argc, char **argv) {
                   << "Dispatches: " << paths.max_dispatches << "\n";
         (void)motorstorm::open_log_file(paths.log_file);
         const int result = motorstorm::run(paths);
+        motorstorm::textures::shutdown();  // writes any queued texture dumps
         motorstorm::window_shutdown();
         motorstorm::audio_shutdown();
         motorstorm::close_log_file();
         return result;
     } catch (const std::exception &error) {
+        motorstorm::textures::shutdown();
         motorstorm::audio_shutdown();
         motorstorm::window_shutdown();
         std::cerr << "[ERROR] MotorStormNative: " << error.what() << "\n";

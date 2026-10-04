@@ -9,6 +9,7 @@
 #include "motorstorm_atrac.hpp"
 #include "motorstorm_frame_rate.hpp"
 #include "motorstorm_pacing.hpp"
+#include "motorstorm_textures.hpp"
 #include "motorstorm_perf.hpp"
 
 #include "psprecomp/common.hpp"
@@ -1066,10 +1067,14 @@ void write_scaled_step(GuestMemory &memory, float step) {
     store_float(memory, kTimestepFps, std::bit_cast<float>(0x3F800000u) / step);
 }
 
+void restore_at_scene_boundary(GuestMemory &memory);
 // Replaces the guest timestep setter (f12 = frames per second) so scenes use
 // the active rate instead of their own 29.97/19.98.
 void set_frame_rate(Runtime &runtime, AllegrexContext &ctx) {
     auto &memory = runtime.memory();
+    // A scene (re)initialises its timestep here: the safe moment to return
+    // to the target rate after a fallback.
+    restore_at_scene_boundary(memory);
     const float rate = write_timestep(memory, g_active_rate.game_fps);
     memory.store8(kTimestepFlag, 1u);
     g_timestep_initialized = true;
@@ -1103,10 +1108,39 @@ struct Pacer {
     bool limit{}, govern{};
     std::uint64_t anchor_wall{}, anchor_guest{};
     std::uint64_t sample_wall{}, sample_guest{}, sample_idle{}, sample_frames{}, slept_us{}, frames{};
+    // Loading work seen at the previous sample (see loading_activity).
+    std::uint64_t sample_uploads{}, sample_replacements{}, sample_pack_loads{};
     std::uint64_t fallbacks{}, restores{};
     FrameRateGovernor governor;
 };
 Pacer g_pacer;
+
+// Returns the target after a fallback once the back-off has passed. Called
+// where a rate change cannot jolt gameplay: the game's own timestep setter
+// (scene start) and loading screens. Mid-race the rate only falls back.
+void restore_target(GuestMemory &memory, const char *where) {
+    if (!g_pacer.govern || g_active_rate.game_fps == g_frame_rate.game_fps || !g_pacer.governor.restore_due())
+        return;
+    (void)g_pacer.governor.restored();
+    ++g_pacer.restores;
+    switch_frame_rate(memory, g_frame_rate, std::string("target restored at ") + where);
+}
+void restore_at_scene_boundary(GuestMemory &memory) { restore_target(memory, "scene start"); }
+
+// Texture uploads, replacement uploads and pack decodes since the previous
+// sample. A burst marks streaming/loading work, not steady-state speed.
+bool loading_activity(double seconds) {
+    const auto gpu = gpu_report();
+    const auto pack = textures::stats();
+    const auto uploads = gpu.texture_uploads - gpu.streamed_texture_updates;
+    const bool busy = gpu.replacement_uploads != g_pacer.sample_replacements ||
+                      pack.loaded != g_pacer.sample_pack_loads ||
+                      static_cast<double>(uploads - std::min(uploads, g_pacer.sample_uploads)) > 96.0 * seconds;
+    g_pacer.sample_uploads = uploads;
+    g_pacer.sample_replacements = gpu.replacement_uploads;
+    g_pacer.sample_pack_loads = pack.loaded;
+    return busy;
+}
 
 // Called once per displayed frame.
 void pace_frame(GuestMemory &memory) {
@@ -1139,40 +1173,41 @@ void pace_frame(GuestMemory &memory) {
     if (!g_pacer.govern || !window_enabled() || (!audio_enabled() && !g_pacer.limit)) return;
     const auto wall = host_time_us();
     const auto idle = audio_blocked_us() + g_pacer.slept_us;
-    if (g_pacer.sample_wall == 0u) {
+    const auto restart = [&] {
         g_pacer.sample_wall = wall;
         g_pacer.sample_guest = g_virtual_time_us;
         g_pacer.sample_idle = idle;
         g_pacer.sample_frames = g_pacer.frames;
+    };
+    if (g_pacer.sample_wall == 0u) {
+        restart();
+        (void)loading_activity(0.0);
         return;
     }
-    if (wall - g_pacer.sample_wall < 1'000'000u) return;
-    // Loading screens present few frames and stall guest time for reasons
-    // unrelated to rendering speed; only judge seconds of actual play.
     const double sample_seconds = static_cast<double>(wall - g_pacer.sample_wall) / 1e6;
+    if (sample_seconds < FrameRateGovernor::kSampleSeconds) return;
+    // Loading screens present few frames and stall guest time for reasons
+    // unrelated to rendering speed: they are where the target comes back.
     const bool playing = static_cast<double>(g_pacer.frames - g_pacer.sample_frames) >=
                          0.5 * static_cast<double>(g_active_rate.game_fps) * sample_seconds;
+    const bool loading = loading_activity(sample_seconds);
     const bool at_target = g_active_rate.game_fps == g_frame_rate.game_fps;
     const auto fallback = plan_frame_rate(30u);
     if (!playing) {
-        g_pacer.sample_wall = wall;
-        g_pacer.sample_guest = g_virtual_time_us;
-        g_pacer.sample_idle = idle;
-        g_pacer.sample_frames = g_pacer.frames;
+        g_pacer.governor.elapse(sample_seconds);
+        restore_target(memory, "loading screen");
+        restart();
         return;
     }
     const auto decision = g_pacer.governor.update(
-        static_cast<double>(wall - g_pacer.sample_wall) / 1e6,
-        static_cast<double>(g_virtual_time_us - g_pacer.sample_guest) / 1e6,
+        sample_seconds, static_cast<double>(g_virtual_time_us - g_pacer.sample_guest) / 1e6,
         static_cast<double>(idle - g_pacer.sample_idle) / 1e6, at_target,
-        static_cast<double>(g_frame_rate.game_fps) / static_cast<double>(fallback.game_fps));
-    g_pacer.sample_wall = wall;
-    g_pacer.sample_guest = g_virtual_time_us;
-    g_pacer.sample_idle = idle;
-    g_pacer.sample_frames = g_pacer.frames;
+        static_cast<double>(g_frame_rate.game_fps) / static_cast<double>(fallback.game_fps), loading);
+    restart();
     if (decision == FrameRateGovernor::Decision::Fallback) {
         ++g_pacer.fallbacks;
-        switch_frame_rate(memory, fallback, "PC below real time; retrying the target in " +
+        switch_frame_rate(memory, fallback, "PC below real time for 2 s; the target returns at the next scene "
+                          "or loading screen after " +
                           std::to_string(static_cast<int>(g_pacer.governor.backoff_seconds())) + " s");
     } else if (decision == FrameRateGovernor::Decision::Restore) {
         ++g_pacer.restores;
@@ -4515,10 +4550,20 @@ void report_summary() {
                 << " hardware_transform_draws=" << gpu.hardware_transform_draws << " vertices=" << gpu.vertices
                 << " submissions=" << gpu.submissions << " texture_uploads=" << gpu.texture_uploads
                 << " feedback_syncs=" << gpu.feedback_syncs << " feedback_draws=" << gpu.feedback_draws << " software_draws=" << gpu.software_draws
-                << " presents=" << gpu.presents << " skipped_presents=" << gpu.skipped_presents;
+                << " presents=" << gpu.presents << " skipped_presents=" << gpu.skipped_presents
+                << " superseded_presents=" << gpu.superseded_presents
+                << " streamed_texture_updates=" << gpu.streamed_texture_updates
+                << " replaced_draws=" << gpu.replaced_draws << " replacement_uploads=" << gpu.replacement_uploads
+                << " replacements_evicted=" << gpu.replacements_evicted;
             out << " output=" << gpu.resolution_scale*480 << 'x' << gpu.resolution_scale*272
-                << " raster=" << gpu.raster_scale*480 << 'x' << gpu.raster_scale*272 << " AA=" << gpu.antialiasing;
+                << " raster=" << gpu.raster_half*240 << 'x' << gpu.raster_half*136 << " AA=" << gpu.antialiasing;
             log_line(category::kGe, out.str());
+        }
+        if (textures::active()) {
+            const auto pack = textures::stats();
+            log_line("TEXTURE", "indexed=" + std::to_string(pack.indexed) + " dumped=" + std::to_string(pack.dumped) +
+                                    " loaded=" + std::to_string(pack.loaded) + " rejected=" + std::to_string(pack.failed) +
+                                    " decode_ms=" + std::to_string(pack.load_microseconds / 1000u));
         }
     }
     psprecomp::report_sas_hle_summary();

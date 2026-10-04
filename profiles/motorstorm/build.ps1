@@ -39,10 +39,10 @@ if (-not (Test-Path -LiteralPath (Join-Path $buildPath 'CMakeCache.txt'))) {
 & $cmakePath @configureArgs
 if ($LASTEXITCODE -ne 0) { throw 'MotorStorm CMake configuration failed.' }
 
-$targets = @('MotorStormNative')
+$targets = @('MotorStormNative', 'MotorStormTextureExtract')
 if ($Tests -or $GpuTests) {
     $targets += @('psprecomp_tests', 'psprecomp_codegen_tests', 'motorstorm_profile_tests',
-                  'motorstorm_config_tests', 'motorstorm_window_tests')
+                  'motorstorm_config_tests', 'motorstorm_texture_tests', 'motorstorm_window_tests')
 }
 if ($GpuTests) { $targets += 'motorstorm_gpu_tests' }
 & $cmakePath --build $buildPath --config Release --parallel 1 --target @targets

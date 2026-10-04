@@ -1,24 +1,28 @@
 #include "motorstorm_gpu.hpp"
+#include "motorstorm_bootstrap.hpp"
 #include "motorstorm_presentation.hpp"
 #include "motorstorm_perf.hpp"
+#include "motorstorm_textures.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <d3d12.h>
-#include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <windows.h>
 #include <wrl/client.h>
@@ -40,7 +44,17 @@ std::uint64_t gpu_publish_epoch{};
 bool deferred_readback{};
 #if defined(_WIN32)
 using Microsoft::WRL::ComPtr;
-#include "motorstorm_gpu_shader.inc"
+// Shader bytecode compiled at build time by fxc from motorstorm_gpu.hlsl.
+#include "motorstorm_shader_VS.h"
+#include "motorstorm_shader_PS.h"
+#include "motorstorm_shader_PointGS.h"
+#include "motorstorm_shader_PresentVS.h"
+#include "motorstorm_shader_PresentPS.h"
+#include "motorstorm_shader_ExpandCS.h"
+#include "motorstorm_shader_ResolveCS.h"
+#include "motorstorm_shader_CaptureCS.h"
+#include "motorstorm_shader_DecodeCS.h"
+#include "motorstorm_shader_MipCS.h"
 constexpr UINT64 kUploadBytes = 64ull * 1024 * 1024;
 constexpr UINT kDescriptors = 16384;
 void check(HRESULT hr, const char *operation) {
@@ -56,9 +70,16 @@ std::uint32_t physical(std::uint32_t address) {
         address = 0x04000000u | (address & 0x1FFFFFu);
     return address;
 }
+// Raster scales are kept in half units (2 = 1x, 3 = 1.5x, 4 = 2x, ...) so
+// SSAA2x can rasterize at 1.5x per axis. Raster pixel r belongs to native
+// pixel (2r+1)/half; native pixel n starts at raster pixel (n*half)/2. Every
+// raster pixel centre lies inside exactly one native pixel, so native-aligned
+// content resolves exactly at any scale.
+constexpr UINT raster_extent(UINT native, UINT half) { return native * half / 2u; }
+constexpr UINT native_row_of_boundary(UINT raster, UINT half) { return (2u * raster + half - 1u) / half; }
 struct Surface {
     std::uint32_t address{}, stride{}, height{}, bpp{};
-    std::uint32_t raster_scale{1}, format{4};
+    std::uint32_t raster_half{2}, format{4};
     ComPtr<ID3D12Resource> image, native, readback;
     D3D12_RESOURCE_STATES native_state{D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
     UINT64 native_version{~0ull};
@@ -69,7 +90,9 @@ struct Surface {
     UINT64 snapshot_bytes{};
     UINT64 snapshot_guest_epoch{~0ull};
     ComPtr<ID3D12Resource> snapshot;
-    UINT64 bytes() const { return static_cast<UINT64>(stride) * height * 4 * raster_scale * raster_scale; }
+    UINT raster_stride() const { return raster_extent(stride, raster_half); }
+    UINT raster_height() const { return raster_extent(height, raster_half); }
+    UINT64 bytes() const { return static_cast<UINT64>(raster_stride()) * raster_height() * 4; }
     UINT64 native_bytes() const { return static_cast<UINT64>(stride) * height * 4; }
     UINT64 guest_bytes() const { return static_cast<UINT64>(stride) * height * bpp; }
 };
@@ -77,6 +100,8 @@ struct Texture {
     ComPtr<ID3D12Resource> image;
     UINT descriptor{};
     UINT64 bytes{}, last_used{};
+    UINT width{}, height{}, mips{};
+    std::uint64_t generation{};  // content of a streaming texture
 };
 // Draws are submitted in chunks while the list is being decoded so the GPU can
 // rasterize chunk N while the CPU decodes and records chunk N+1.  Execution
@@ -133,8 +158,28 @@ struct State {
     UINT64 readback_fence{}, arena_fence{};
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pipeline, line_pipeline, point_pipeline, present_pipeline, expand_pipeline,
-        resolve_pipeline, capture_pipeline;
-    UINT raster_scale{1}, output_scale{1}, antialiasing{};
+        resolve_pipeline, capture_pipeline, decode_pipeline, mip_pipeline;
+    // GPU texture decoding scratch (decode output / mip ping-pong).
+    ComPtr<ID3D12Resource> decode_scratch[2];
+    D3D12_RESOURCE_STATES decode_state[2]{D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+    bool enhanced_filtering{};
+    // Texture-pack identification: base levels decoded on the GPU are copied
+    // to this persistently mapped readback ring and handed to a hashing
+    // worker once their submission's fence completes.
+    struct IdentifyCopy {
+        std::uint64_t key{};
+        UINT width{}, height{}, pitch{};
+        UINT64 start{}, end{};        // monotonic ring positions
+        UINT64 execution{}, fence{};  // queue execution that holds the copy; its fence
+    };
+    ComPtr<ID3D12Resource> identify_ring;
+    const std::uint8_t *identify_mapped{};
+    UINT64 identify_head{}, identify_tail{};
+    std::deque<IdentifyCopy> identify_copies;
+    std::vector<std::uint64_t> identify_failed;
+    UINT64 executions{};  // command lists executed on the GE queue
+    UINT raster_half{2}, output_scale{1}, antialiasing{};
     ComPtr<ID3D12DescriptorHeap> srv, rtv;
     ComPtr<ID3D12Resource> upload;
     ComPtr<ID3D12Fence> fence;
@@ -148,6 +193,18 @@ struct State {
     bool recording{}, has_commands{};
     std::vector<std::unique_ptr<Surface>> surfaces;
     std::unordered_map<std::uint64_t, Texture> textures;
+    // Texture-pack replacements, keyed by content hash. descriptor == 0 with
+    // no image marks a file that was rejected (not retried this session).
+    struct Replacement {
+        ComPtr<ID3D12Resource> image;
+        UINT descriptor{};
+        UINT64 bytes{}, last_used{};
+        bool no_alpha{};  // pack image is fully transparent: use the game's alpha
+    };
+    std::unordered_map<std::uint64_t, Replacement> replacements;
+    std::unordered_map<std::uint64_t, std::unique_ptr<textures::Image>> pending_replacements;
+    UINT64 replacement_bytes{}, replacement_uploaded_in_list{};
+    UINT replacement_count_in_list{};
     ComPtr<IDXGISwapChain3> swapchain;
     HANDLE frame_latency{};
     // Three buffers keep the GE queue from waiting at vblank for a free one.
@@ -160,20 +217,32 @@ struct State {
     std::thread presenter;
     std::mutex present_mutex;
     std::condition_variable present_cv;
-    bool present_requested{}, present_busy{}, presenter_stop{};
+    bool presenter_stop{};
     HRESULT present_result{S_OK};
+    // Presentation options and the presenter thread's swap chain state.
+    bool vsync{true}, tearing{}, exclusive_fullscreen{}, exclusive_active{}, exclusive_failed{};
+    bool latency_token{};
+    UINT refresh_hz{}, swap_flags{};
+    UINT64 displayed{};
     // Presentation runs on its own queue, which owns the swap chain. A flip
     // present waits on its queue for a free back buffer at vblank; on the GE
     // queue that wait stalled every GE chunk behind it and capped emulation at
     // the display refresh. The GE queue only copies the displayed target into
     // a snapshot ring; the present queue scales/filters from the snapshot.
+    // Snapshot slots: the emulation thread writes one and publishes it as
+    // the newest frame; the presenter thread takes the newest when the
+    // display has room. A newer frame replaces an unshown one.
+    enum class FrameState { Free, Writing, Ready, Presenting };
     struct PresentFrame {
         ComPtr<ID3D12CommandAllocator> allocator;
         ComPtr<ID3D12GraphicsCommandList> list;
         ComPtr<ID3D12Resource> image, constants;
-        UINT64 bytes{}, fence{};
+        UINT64 bytes{}, fence{}, copy_fence{};
         void *mapped{};
+        FrameState state{FrameState::Free};
+        std::uint32_t width{}, height{}, stride{}, format{};
     };
+    int ready_frame{-1};
     static constexpr UINT kPresentFrames = 3;
     ComPtr<ID3D12CommandQueue> present_queue;
     ComPtr<ID3D12Fence> present_fence;
@@ -181,10 +250,6 @@ struct State {
     UINT64 present_fence_value{};
     PresentFrame present_frames[kPresentFrames];
     UINT present_frame{};
-    void wait_presenter_idle() {
-        std::unique_lock lock(present_mutex);
-        present_cv.wait(lock, [&] { return !present_busy; });
-    }
     void stop_presenter() {
         if (!presenter.joinable())
             return;
@@ -194,6 +259,7 @@ struct State {
         }
         present_cv.notify_all();
         presenter.join();
+        presenter_stop = false;
     }
     ~State() {
         stop_presenter();
@@ -224,8 +290,12 @@ struct Constants {
     std::array<std::uint32_t, 4> surface, mode;
     std::array<std::uint32_t, 4> feedback{};
     std::array<std::uint32_t, 4> render{1, 1, 0, 0};
+    std::array<std::uint32_t, 4> replace{};  // active, covered PSP width, covered rows, 0
+    // Enhanced filtering: texel range the draw's coordinates span (min u, min
+    // v, max u, max v); all zero = unknown, no mip clamp.
+    std::array<float, 4> uv_range{};
 };
-static_assert(sizeof(Constants) == 1200);
+static_assert(sizeof(Constants) == 1232);
 static_assert(sizeof(GpuVertex) == 36);
 ComPtr<ID3D12Resource> buffer(State &s, UINT64 bytes, D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES initial,
                               bool uav = false) {
@@ -259,6 +329,9 @@ void transition(State &s, Surface &surface, D3D12_RESOURCE_STATES next) {
 UINT64 signal_fence(State &s) {
     const UINT64 value = ++s.fence_value;
     check(s.queue->Signal(s.fence.Get(), value), "signal fence");
+    for (auto &copy : s.identify_copies)
+        if (copy.fence == 0u && copy.execution < s.executions)
+            copy.fence = value;
     return value;
 }
 void wait_value(State &s, UINT64 value) {
@@ -308,6 +381,7 @@ void submit_chunk(State &s) {
     check(s.list->Close(), "close GE chunk");
     ID3D12CommandList *lists[]{s.list.Get()};
     s.queue->ExecuteCommandLists(1, lists);
+    ++s.executions;
     ++report.submissions;
     CommandSlot &slot = s.slots[s.slot_index];
     slot.fence_value = signal_fence(s);
@@ -332,27 +406,35 @@ UINT64 allocate(State &s, UINT64 bytes, UINT64 alignment) {
     s.used += bytes;
     return offset;
 }
-ComPtr<ID3DBlob> compile(const char *entry, const char *profile) {
-    static std::unordered_map<std::string, ComPtr<ID3DBlob>> cache;
-    if (auto found = cache.find(entry); found != cache.end())
-        return found->second;
-    ComPtr<ID3DBlob> code, errors;
-    const auto hr =
-        D3DCompile(kGeShader, sizeof(kGeShader) - 1, "motorstorm_ge.hlsl", nullptr, nullptr, entry, profile,
-                   D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_ENABLE_STRICTNESS, 0, &code, &errors);
-    if (FAILED(hr) && errors)
-        throw std::runtime_error(
-            std::string(static_cast<const char *>(errors->GetBufferPointer()), errors->GetBufferSize()));
-    check(hr, "compile shader");
-    cache.emplace(entry, code);
-    return code;
+struct Bytecode {
+    std::string_view entry;
+    const void *data;
+    std::size_t size;
+    [[nodiscard]] const void *GetBufferPointer() const { return data; }
+    [[nodiscard]] std::size_t GetBufferSize() const { return size; }
+};
+// Precompiled shader for an entry point (the profile is fixed at build time).
+const Bytecode *compile(const char *entry, const char *) {
+#define MOTORSTORM_SHADER(name) Bytecode{#name, g_motorstorm_##name, sizeof(g_motorstorm_##name)}
+    static const Bytecode shaders[]{
+        MOTORSTORM_SHADER(VS),        MOTORSTORM_SHADER(PS),        MOTORSTORM_SHADER(PointGS),
+        MOTORSTORM_SHADER(PresentVS), MOTORSTORM_SHADER(PresentPS), MOTORSTORM_SHADER(ExpandCS),
+        MOTORSTORM_SHADER(ResolveCS), MOTORSTORM_SHADER(CaptureCS), MOTORSTORM_SHADER(DecodeCS),
+        MOTORSTORM_SHADER(MipCS)};
+#undef MOTORSTORM_SHADER
+    for (const auto &shader : shaders)
+        if (shader.entry == entry)
+            return &shader;
+    throw std::runtime_error(std::string("MotorStorm shader not compiled: ") + entry);
 }
 void create_pipeline(State &s) {
     D3D12_DESCRIPTOR_RANGE range{};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     range.NumDescriptors = 1;
     range.BaseShaderRegister = 0;
-    D3D12_ROOT_PARAMETER params[7]{};
+    D3D12_DESCRIPTOR_RANGE replacement_range = range;
+    replacement_range.BaseShaderRegister = 3;  // t3: texture-pack image
+    D3D12_ROOT_PARAMETER params[8]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     params[1].Descriptor.ShaderRegister = 0;
@@ -366,10 +448,12 @@ void create_pipeline(State &s) {
     params[5].Descriptor.ShaderRegister = 2;
     params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     params[6].Descriptor.ShaderRegister = 2;
+    params[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[7].DescriptorTable = {1, &replacement_range};
     D3D12_ROOT_SIGNATURE_DESC desc{};
-    desc.NumParameters = 7;
+    desc.NumParameters = 8;
     desc.pParameters = params;
-    D3D12_STATIC_SAMPLER_DESC samplers[4]{};
+    D3D12_STATIC_SAMPLER_DESC samplers[8]{};
     for (UINT i = 0u; i < 4u; ++i) {
         samplers[i].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         samplers[i].AddressU = (i & 1u) ? D3D12_TEXTURE_ADDRESS_MODE_CLAMP : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -381,7 +465,15 @@ void create_pipeline(State &s) {
         samplers[i].ShaderRegister = i;
         samplers[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     }
-    desc.NumStaticSamplers = 4u;
+    // s4..s7: the same wrap/clamp combinations with 8x anisotropic filtering,
+    // used only for texture-pack replacements (upscaled art at grazing angles).
+    for (UINT i = 4; i < 8; ++i) {
+        samplers[i] = samplers[i - 4];
+        samplers[i].Filter = D3D12_FILTER_ANISOTROPIC;
+        samplers[i].MaxAnisotropy = 8u;
+        samplers[i].ShaderRegister = i;
+    }
+    desc.NumStaticSamplers = 8u;
     desc.pStaticSamplers = samplers;
     desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> serialized, errors;
@@ -438,6 +530,8 @@ void create_pipeline(State &s) {
     create_compute("ExpandCS", s.expand_pipeline);
     create_compute("ResolveCS", s.resolve_pipeline);
     create_compute("CaptureCS", s.capture_pipeline);
+    create_compute("DecodeCS", s.decode_pipeline);
+    create_compute("MipCS", s.mip_pipeline);
 }
 void compute(State &s, ID3D12PipelineState *pipeline, const Constants &constants,
              D3D12_GPU_VIRTUAL_ADDRESS source, D3D12_GPU_VIRTUAL_ADDRESS destination, UINT width,
@@ -466,15 +560,15 @@ void native_transition(State &s, Surface &surface, D3D12_RESOURCE_STATES next) {
     surface.native_state = next;
 }
 ID3D12Resource *resolve_surface(State &s, Surface &surface) {
-    if (surface.raster_scale == 1)
+    if (surface.raster_half == 2)
         return surface.image.Get();
     if (surface.native_version != surface.version) {
         transition(s, surface, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         native_transition(s, surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         Constants constants{};
-        constants.surface = {surface.stride, surface.height, surface.stride * surface.raster_scale, 0};
+        constants.surface = {surface.stride, surface.height, surface.raster_stride(), 0};
         constants.mode[0] = surface.format;
-        constants.render[0] = surface.raster_scale;
+        constants.render[0] = surface.raster_half;
         compute(s, s.resolve_pipeline.Get(), constants, surface.image->GetGPUVirtualAddress(),
                 surface.native->GetGPUVirtualAddress(), surface.stride, surface.height);
         transition(s, surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -515,18 +609,17 @@ void load_surface(State &s, Surface &surface, const psprecomp::GuestMemory &memo
             std::memcpy(&value, surface.guest_shadow.data() + i * 2, 2);
             destination[i] = value;
         }
-    if (surface.raster_scale == 1) {
+    if (surface.raster_half == 2) {
         transition(s, surface, D3D12_RESOURCE_STATE_COPY_DEST);
         s.list->CopyBufferRegion(surface.image.Get(), 0, s.upload.Get(), offset, surface.bytes());
         transition(s, surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     } else {
         transition(s, surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         Constants constants{};
-        constants.surface = {surface.stride, surface.height, surface.stride * surface.raster_scale, 0};
-        constants.render[0] = surface.raster_scale;
+        constants.surface = {surface.stride, surface.height, surface.raster_stride(), 0};
+        constants.render[0] = surface.raster_half;
         compute(s, s.expand_pipeline.Get(), constants, s.upload->GetGPUVirtualAddress() + offset,
-                surface.image->GetGPUVirtualAddress(), surface.stride * surface.raster_scale,
-                surface.height * surface.raster_scale);
+                surface.image->GetGPUVirtualAddress(), surface.raster_stride(), surface.raster_height());
     }
     surface.loaded = true;
     ++surface.version;
@@ -565,12 +658,12 @@ Surface &get_surface(State &s, psprecomp::GuestMemory &memory, std::uint32_t add
     target->stride = stride;
     target->height = height;
     target->bpp = bpp;
-    target->raster_scale = s.raster_scale;
+    target->raster_half = s.raster_half;
     target->format = format;
     target->image = buffer(s, target->bytes(), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, true);
     target->readback =
         buffer(s, target->native_bytes(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-    if (s.raster_scale > 1)
+    if (s.raster_half > 2)
         target->native = buffer(s, target->native_bytes(), D3D12_HEAP_TYPE_DEFAULT,
                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
     s.surfaces.push_back(std::move(target));
@@ -582,10 +675,141 @@ D3D12_GPU_DESCRIPTOR_HANDLE srv_handle(State &s, UINT index) {
     handle.ptr += static_cast<UINT64>(index) * s.descriptor_size;
     return handle;
 }
+// Scratch buffers for GPU texture decoding: decode output (and mip input).
+constexpr UINT64 kDecodeScratchBytes = 4ull * 1024 * 1024 + 64 * 1024;
+void scratch_state(State &s, UINT index, D3D12_RESOURCE_STATES next) {
+    if (s.decode_state[index] == next)
+        return;
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {s.decode_scratch[index].Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          s.decode_state[index], next};
+    s.list->ResourceBarrier(1, &barrier);
+    s.decode_state[index] = next;
+}
+UINT decode_pitch(UINT width) { return ((width * 4u + 255u) & ~255u) / 4u; }
+// Copies scratch[index] (pitch-aligned RGBA rows) into one texture mip.
+void copy_scratch_to_mip(State &s, UINT index, ID3D12Resource *image, UINT mip, UINT width, UINT height) {
+    scratch_state(s, index, D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    D3D12_TEXTURE_COPY_LOCATION source{};
+    source.pResource = s.decode_scratch[index].Get();
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, width, height, 1, decode_pitch(width) * 4u};
+    D3D12_TEXTURE_COPY_LOCATION destination{};
+    destination.pResource = image;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destination.SubresourceIndex = mip;
+    s.list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+}
+constexpr UINT64 kIdentifyRingBytes = 48ull * 1024 * 1024;
+// Copies the decoded base level (scratch[0], in a copy-source state) to the
+// identification ring. A full ring hands the key back for a CPU fallback.
+void queue_identify_copy(State &s, std::uint64_t key, UINT width, UINT height) {
+    const UINT pitch = decode_pitch(width);
+    const UINT64 bytes = static_cast<UINT64>(pitch) * 4u * height;
+    if (!s.identify_ring) {
+        s.identify_ring = buffer(s, kIdentifyRingBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        void *mapped{};
+        check(s.identify_ring->Map(0, nullptr, &mapped), "map identify ring");
+        s.identify_mapped = static_cast<const std::uint8_t *>(mapped);
+    }
+    UINT64 start = s.identify_head;
+    if (start % kIdentifyRingBytes + bytes > kIdentifyRingBytes)
+        start += kIdentifyRingBytes - start % kIdentifyRingBytes;  // keep each copy contiguous
+    if (bytes > kIdentifyRingBytes || start + bytes - s.identify_tail > kIdentifyRingBytes) {
+        s.identify_failed.push_back(key);
+        return;
+    }
+    s.list->CopyBufferRegion(s.identify_ring.Get(), start % kIdentifyRingBytes, s.decode_scratch[0].Get(), 0, bytes);
+    s.identify_copies.push_back({key, width, height, pitch, start, start + bytes, s.executions, 0});
+    s.identify_head = start + bytes;
+}
+// Decodes one raw PSP level into scratch[index] with DecodeCS.
+void decode_level(State &s, const GpuTexture &texture, UINT level, UINT index) {
+    const auto &raw = texture.raw[level];
+    const auto padded = (raw.bytes.size() + 3u) & ~std::size_t{3};
+    const auto offset = allocate(s, padded + 4u, 4);
+    std::memcpy(s.mapped + offset, raw.bytes.data(), raw.bytes.size());
+    std::memset(s.mapped + offset + raw.bytes.size(), 0, padded + 4u - raw.bytes.size());
+    Constants constants{};
+    std::copy(texture.clut.begin(), texture.clut.end(), constants.commands.begin());
+    constants.surface = {raw.width, raw.height, decode_pitch(raw.width), raw.stride};
+    constants.mode = {texture.format, (texture.texture_mode & 1u) != 0u ? 1u : 0u, texture.clut_mode, level};
+    constants.feedback = {texture.texture_mode, 0, 0, 0};
+    scratch_state(s, index, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    compute(s, s.decode_pipeline.Get(), constants, s.upload->GetGPUVirtualAddress() + offset,
+            s.decode_scratch[index]->GetGPUVirtualAddress(), raw.width, raw.height);
+}
+// Fills every mip of `image` from the raw levels; extra mips (enhanced
+// filtering) are box-filtered from the previous level on the GPU.
+void decode_into(State &s, const GpuTexture &texture, ID3D12Resource *image, UINT mips) {
+    UINT width = texture.raw[0].width, height = texture.raw[0].height, current = 0;
+    for (UINT mip = 0; mip < mips; ++mip) {
+        if (mip < texture.raw.size()) {
+            decode_level(s, texture, mip, 0);
+            current = 0;
+            width = texture.raw[mip].width;
+            height = texture.raw[mip].height;
+        } else {
+            const UINT next_width = std::max(1u, width / 2u), next_height = std::max(1u, height / 2u);
+            const UINT target = current ^ 1u;
+            Constants constants{};
+            constants.surface = {next_width, next_height, decode_pitch(next_width), decode_pitch(width)};
+            constants.mode = {width, height, 0, 0};
+            scratch_state(s, current, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                          D3D12_RESOURCE_STATE_COPY_SOURCE);
+            scratch_state(s, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            compute(s, s.mip_pipeline.Get(), constants, s.decode_scratch[current]->GetGPUVirtualAddress(),
+                    s.decode_scratch[target]->GetGPUVirtualAddress(), next_width, next_height);
+            current = target;
+            width = next_width;
+            height = next_height;
+        }
+        copy_scratch_to_mip(s, current, image, mip, width, height);
+        if (mip == 0u && texture.identify)
+            queue_identify_copy(s, texture.key, width, height);
+    }
+}
+UINT mip_count_for(const State &s, const GpuTexture &texture) {
+    if (texture.raw.empty())
+        return static_cast<UINT>(texture.levels.size());
+    // Enhanced filtering gives single-level textures a full chain.
+    if (!s.enhanced_filtering || texture.raw.size() > 1u || texture.streaming)
+        return static_cast<UINT>(texture.raw.size());
+    UINT count = 1, size = std::max(texture.width, texture.height);
+    while (size > 1u) { size /= 2u; ++count; }
+    return count;
+}
+void transition_image(State &s, ID3D12Resource *image, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {image, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, from, to};
+    s.list->ResourceBarrier(1, &barrier);
+}
 Texture &get_texture(State &s, const GpuTexture &texture) {
     if (auto found = s.textures.find(texture.key); found != s.textures.end()) {
-        found->second.last_used = s.fence_value;
-        return found->second;
+        auto &cached = found->second;
+        cached.last_used = s.fence_value;
+        // Streaming textures (video) re-decode into the same GPU texture.
+        if (texture.streaming && cached.generation != texture.generation && !texture.raw.empty() &&
+            cached.width == texture.width && cached.height == texture.height &&
+            cached.mips == mip_count_for(s, texture)) {
+            transition_image(s, cached.image.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                             D3D12_RESOURCE_STATE_COPY_DEST);
+            decode_into(s, texture, cached.image.Get(), cached.mips);
+            transition_image(s, cached.image.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            cached.generation = texture.generation;
+            ++report.streamed_texture_updates;
+            return cached;
+        }
+        if (!texture.streaming || cached.generation == texture.generation)
+            return cached;
+        // Shape changed: drop the old texture and create a new one below.
+        s.texture_bytes -= cached.bytes;
+        s.free_descriptors.push_back(cached.descriptor);
+        s.transient.push_back(std::move(cached.image));
+        s.textures.erase(found);
     }
     if (s.free_descriptors.empty() && s.next_descriptor >= kDescriptors)
         throw std::runtime_error("MotorStorm D3D12 texture descriptor heap exhausted");
@@ -604,39 +828,51 @@ Texture &get_texture(State &s, const GpuTexture &texture) {
     desc.Width = texture.width;
     desc.Height = texture.height;
     desc.DepthOrArraySize = 1;
-    desc.MipLevels = static_cast<UINT16>(texture.levels.size());
+    desc.MipLevels = static_cast<UINT16>(mip_count_for(s, texture));
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.SampleDesc.Count = 1;
     check(s.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                             IID_PPV_ARGS(&target.image)),
           "create texture");
-    for (UINT mip = 0; mip < desc.MipLevels; ++mip) {
-        target.bytes += texture.levels[mip].size() * 4;
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
-        UINT rows{};
-        UINT64 row_bytes{}, bytes{};
-        s.device->GetCopyableFootprints(&desc, mip, 1, 0, &footprint, &rows, &row_bytes, &bytes);
-        footprint.Offset = allocate(s, bytes, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
-        for (UINT y = 0; y < rows; ++y)
-            std::memcpy(s.mapped + footprint.Offset + y * footprint.Footprint.RowPitch,
-                        texture.levels[mip].data() + y * (row_bytes / 4),
-                        static_cast<std::size_t>(row_bytes));
-        D3D12_TEXTURE_COPY_LOCATION source{};
-        source.pResource = s.upload.Get();
-        source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        source.PlacedFootprint = footprint;
-        D3D12_TEXTURE_COPY_LOCATION destination{};
-        destination.pResource = target.image.Get();
-        destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        destination.SubresourceIndex = mip;
-        s.list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    target.width = texture.width;
+    target.height = texture.height;
+    target.mips = desc.MipLevels;
+    target.generation = texture.generation;
+    if (!texture.raw.empty()) {
+        // Raw PSP data: decoded by DecodeCS on the GPU.
+        decode_into(s, texture, target.image.Get(), desc.MipLevels);
+        UINT w = texture.width, h = texture.height;
+        for (UINT mip = 0; mip < desc.MipLevels; ++mip) {
+            target.bytes += static_cast<UINT64>(w) * h * 4u;
+            w = std::max(1u, w / 2u);
+            h = std::max(1u, h / 2u);
+        }
+    } else {
+        for (UINT mip = 0; mip < desc.MipLevels; ++mip) {
+            target.bytes += texture.levels[mip].size() * 4;
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+            UINT rows{};
+            UINT64 row_bytes{}, bytes{};
+            s.device->GetCopyableFootprints(&desc, mip, 1, 0, &footprint, &rows, &row_bytes, &bytes);
+            footprint.Offset = allocate(s, bytes, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+            for (UINT y = 0; y < rows; ++y)
+                std::memcpy(s.mapped + footprint.Offset + y * footprint.Footprint.RowPitch,
+                            texture.levels[mip].data() + y * (row_bytes / 4),
+                            static_cast<std::size_t>(row_bytes));
+            D3D12_TEXTURE_COPY_LOCATION source{};
+            source.pResource = s.upload.Get();
+            source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            source.PlacedFootprint = footprint;
+            D3D12_TEXTURE_COPY_LOCATION destination{};
+            destination.pResource = target.image.Get();
+            destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            destination.SubresourceIndex = mip;
+            s.list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        }
     }
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition = {target.image.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                          D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
-    s.list->ResourceBarrier(1, &barrier);
+    transition_image(s, target.image.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
     view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -646,8 +882,133 @@ Texture &get_texture(State &s, const GpuTexture &texture) {
     handle.ptr += static_cast<SIZE_T>(target.descriptor) * s.descriptor_size;
     s.device->CreateShaderResourceView(target.image.Get(), &view, handle);
     ++report.texture_uploads;
+    s.has_commands = true;
     s.texture_bytes += target.bytes;
     return s.textures.emplace(texture.key, std::move(target)).first->second;
+}
+DXGI_FORMAT replacement_format(textures::Format format) {
+    switch (format) {
+    case textures::Format::Bc1: return DXGI_FORMAT_BC1_UNORM;
+    case textures::Format::Bc2: return DXGI_FORMAT_BC2_UNORM;
+    case textures::Format::Bc3: return DXGI_FORMAT_BC3_UNORM;
+    case textures::Format::Bc7: return DXGI_FORMAT_BC7_UNORM;
+    default: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
+}
+// Most texture-pack bytes one GE list may upload; the rest waits a list so a
+// burst of new replacements (a level load) cannot hitch a single frame.
+// Per GE list (about one frame): a scene load can make hundreds of
+// replacements ready at once. Uploading them all in one frame stalled the
+// guest for a quarter second (audible audio gaps); spread them instead.
+constexpr UINT64 kReplacementUploadsPerList = 16ull * 1024 * 1024;
+constexpr UINT kReplacementCountPerList = 8;
+
+// Returns the GPU replacement for a content hash, uploading a decoded image
+// once it is ready. Never blocks on file I/O or decoding.
+const State::Replacement *get_replacement(State &s, std::uint64_t hash) {
+    if (auto found = s.replacements.find(hash); found != s.replacements.end()) {
+        if (!found->second.image)
+            return nullptr;
+        found->second.last_used = s.fence_value;
+        return &found->second;
+    }
+    auto pending = s.pending_replacements.find(hash);
+    std::unique_ptr<textures::Image> image;
+    if (pending != s.pending_replacements.end()) {
+        image = std::move(pending->second);
+        s.pending_replacements.erase(pending);
+    } else {
+        image = textures::take_replacement(hash);
+    }
+    if (!image || image->levels.empty())
+        return nullptr;
+    const UINT64 bytes = image->bytes();
+    if (s.replacement_count_in_list >= kReplacementCountPerList ||
+        (s.replacement_uploaded_in_list != 0u && s.replacement_uploaded_in_list + bytes > kReplacementUploadsPerList)) {
+        s.pending_replacements.emplace(hash, std::move(image));
+        return nullptr;
+    }
+    const auto &base = image->levels[0];
+    const bool block = image->format != textures::Format::Rgba8;
+    if (block && ((base.width & 3u) != 0u || (base.height & 3u) != 0u)) {
+        log_line("TEXTURE", "replacement rejected: " + image->source.string() +
+                                " (block-compressed size must be a multiple of 4)");
+        s.replacements.emplace(hash, State::Replacement{});
+        return nullptr;
+    }
+    if (s.free_descriptors.empty() && s.next_descriptor >= kDescriptors)
+        return nullptr;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = base.width;
+    desc.Height = base.height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = static_cast<UINT16>(image->levels.size());
+    desc.Format = replacement_format(image->format);
+    desc.SampleDesc.Count = 1;
+    // A dedicated staging buffer keeps replacements out of the shared upload
+    // arena, whose flush mark forces a GPU wait mid-frame.
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(desc.MipLevels);
+    std::vector<UINT> rows(desc.MipLevels);
+    std::vector<UINT64> row_bytes(desc.MipLevels);
+    UINT64 staging_bytes{};
+    s.device->GetCopyableFootprints(&desc, 0, desc.MipLevels, 0, footprints.data(), rows.data(), row_bytes.data(),
+                                    &staging_bytes);
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    State::Replacement target;
+    check(s.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                            nullptr, IID_PPV_ARGS(&target.image)),
+          "create replacement texture");
+    auto staging = buffer(s, staging_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    std::uint8_t *mapped{};
+    check(staging->Map(0, nullptr, reinterpret_cast<void **>(&mapped)), "map replacement staging");
+    for (UINT mip = 0; mip < desc.MipLevels; ++mip) {
+        const auto &level = image->levels[mip];
+        const auto copy = static_cast<std::size_t>(std::min<UINT64>(row_bytes[mip], level.row_pitch));
+        for (UINT y = 0; y < rows[mip] && y < level.rows; ++y)
+            std::memcpy(mapped + footprints[mip].Offset + static_cast<UINT64>(y) * footprints[mip].Footprint.RowPitch,
+                        level.data.data() + static_cast<std::size_t>(y) * level.row_pitch, copy);
+        D3D12_TEXTURE_COPY_LOCATION source{};
+        source.pResource = staging.Get();
+        source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        source.PlacedFootprint = footprints[mip];
+        D3D12_TEXTURE_COPY_LOCATION destination{};
+        destination.pResource = target.image.Get();
+        destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        destination.SubresourceIndex = mip;
+        s.list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    }
+    staging->Unmap(0, nullptr);
+    s.transient.push_back(std::move(staging));  // released after the list's fence
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {target.image.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+    s.list->ResourceBarrier(1, &barrier);
+    if (s.free_descriptors.empty())
+        target.descriptor = s.next_descriptor++;
+    else {
+        target.descriptor = s.free_descriptors.back();
+        s.free_descriptors.pop_back();
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Format = desc.Format;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Texture2D.MipLevels = desc.MipLevels;
+    auto handle = s.srv->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<SIZE_T>(target.descriptor) * s.descriptor_size;
+    s.device->CreateShaderResourceView(target.image.Get(), &view, handle);
+    target.bytes = bytes;
+    target.no_alpha = image->no_alpha;
+    target.last_used = s.fence_value;
+    s.replacement_bytes += bytes;
+    s.replacement_uploaded_in_list += bytes;
+    ++s.replacement_count_in_list;
+    s.has_commands = true;
+    ++report.replacement_uploads;
+    return &s.replacements.emplace(hash, std::move(target)).first->second;
 }
 ID3D12Resource *feedback_snapshot(State &s, const psprecomp::GuestMemory &memory, const GpuTexture &texture,
                                   std::array<std::uint32_t, 4> &constants) {
@@ -662,16 +1023,29 @@ ID3D12Resource *feedback_snapshot(State &s, const psprecomp::GuestMemory &memory
             break;
         }
     const UINT64 first = source ? (address - source->address) / bpp : 0;
-    const UINT scale = source ? source->raster_scale : 1;
+    const UINT half = source ? source->raster_half : 2u;
+    const bool scaled = half > 2u;
     UINT64 bytes = std::max(source ? source->native_bytes() : 0ull,
                             (first + static_cast<UINT64>(texture.feedback_stride) * texture.height) * 4);
-    if (scale > 1)
-        bytes = ((bytes + texture.feedback_stride * 4 - 1) / (texture.feedback_stride * 4)) *
-                texture.feedback_stride * 4 * scale * scale;
+    // Scaled snapshots hold whole raster rows of the source surface.
+    const UINT raster_pitch = scaled ? source->raster_stride() : 0u;
+    if (scaled) {
+        const auto rows = static_cast<UINT>((bytes + texture.feedback_stride * 4 - 1) / (texture.feedback_stride * 4));
+        bytes = static_cast<UINT64>(raster_pitch) * raster_extent(rows, half) * 4;
+    }
     auto initialize_tail = [&](ID3D12Resource *destination, UINT64 from) {
         if (from >= bytes)
             return;
-        const auto native_from = from / (scale * scale), native_bytes = (bytes - from) / (scale * scale);
+        UINT64 native_from = from, native_bytes = bytes - from;
+        if (scaled) {
+            // Raster rows [from, bytes) cover these native rows.
+            const UINT first_row = native_row_of_boundary(static_cast<UINT>(from / (raster_pitch * 4ull)), half);
+            const UINT end_row = native_row_of_boundary(static_cast<UINT>(bytes / (raster_pitch * 4ull)), half);
+            native_from = static_cast<UINT64>(first_row) * source->stride * 4;
+            native_bytes = static_cast<UINT64>(end_row - std::min(end_row, first_row)) * source->stride * 4;
+            if (native_bytes == 0)
+                return;
+        }
         const auto offset = allocate(s, native_bytes, 4);
         auto *out = reinterpret_cast<std::uint32_t *>(s.mapped + offset);
         const auto base = source ? source->address : address;
@@ -695,7 +1069,7 @@ ID3D12Resource *feedback_snapshot(State &s, const psprecomp::GuestMemory &memory
                     memory.contains(at, bpp) ? (bpp == 4 ? memory.aot_load32(at) : memory.aot_load16(at)) : 0;
             }
         }
-        if (scale == 1)
+        if (!scaled)
             s.list->CopyBufferRegion(destination, from, s.upload.Get(), offset, native_bytes);
         else {
             D3D12_RESOURCE_BARRIER barrier{};
@@ -705,21 +1079,22 @@ ID3D12Resource *feedback_snapshot(State &s, const psprecomp::GuestMemory &memory
             s.list->ResourceBarrier(1, &barrier);
             Constants constants{};
             constants.surface = {source->stride, static_cast<UINT>(native_bytes / 4 / source->stride),
-                                 source->stride * scale, 0};
-            constants.render[0] = scale;
+                                 raster_pitch, 0};
+            constants.render[0] = half;
             compute(s, s.expand_pipeline.Get(), constants, s.upload->GetGPUVirtualAddress() + offset,
-                    destination->GetGPUVirtualAddress() + from, source->stride * scale,
-                    constants.surface[1] * scale);
+                    destination->GetGPUVirtualAddress() + from, raster_pitch,
+                    raster_extent(constants.surface[1], half));
             std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
             s.list->ResourceBarrier(1, &barrier);
         }
     };
     constants = {1, static_cast<UINT>(first), texture.feedback_stride, texture.feedback_format};
-    if (scale > 1)
+    if (scaled)
         constants = {2,
-                     static_cast<UINT>((first / source->stride) * scale * source->stride * scale +
-                                       (first % source->stride) * scale),
-                     source->stride * scale, texture.feedback_format};
+                     static_cast<UINT>(static_cast<UINT64>(raster_extent(static_cast<UINT>(first / source->stride), half)) *
+                                           raster_pitch +
+                                       raster_extent(static_cast<UINT>(first % source->stride), half)),
+                     raster_pitch, texture.feedback_format};
     if (!source) {
         // Alias switching has already synchronized the previous interpretation.
         auto image = buffer(s, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -737,7 +1112,7 @@ ID3D12Resource *feedback_snapshot(State &s, const psprecomp::GuestMemory &memory
         if (source->snapshot)
             s.transient.push_back(std::move(source->snapshot));
         source->snapshot =
-            buffer(s, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, scale > 1);
+            buffer(s, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, scaled);
         source->snapshot_bytes = bytes;
         source->snapshot_version = ~0ull;
     }
@@ -768,6 +1143,67 @@ ID3D12Resource *feedback_snapshot(State &s, const psprecomp::GuestMemory &memory
 #endif
 } // namespace
 
+std::vector<GpuDecodedTexture> gpu_take_decoded() {
+    std::vector<GpuDecodedTexture> result;
+#if defined(_WIN32)
+    if (!state)
+        return result;
+    auto &s = *state;
+    for (const auto key : s.identify_failed)
+        result.push_back({key, 0, 0, {}});
+    s.identify_failed.clear();
+    if (s.identify_copies.empty())
+        return result;
+    const UINT64 completed = s.fence->GetCompletedValue();
+    while (!s.identify_copies.empty()) {
+        const auto &copy = s.identify_copies.front();
+        if (copy.fence == 0u || copy.fence > completed)
+            break;
+        GpuDecodedTexture decoded{copy.key, copy.width, copy.height, {}};
+        decoded.rgba.resize(static_cast<std::size_t>(copy.width) * copy.height);
+        const auto *source = s.identify_mapped + copy.start % kIdentifyRingBytes;
+        for (UINT y = 0; y < copy.height; ++y)
+            std::memcpy(decoded.rgba.data() + static_cast<std::size_t>(y) * copy.width,
+                        source + static_cast<std::size_t>(y) * copy.pitch * 4u, copy.width * 4u);
+        result.push_back(std::move(decoded));
+        s.identify_tail = copy.end;
+        s.identify_copies.pop_front();
+    }
+#endif
+    return result;
+}
+std::vector<std::uint32_t> gpu_debug_decode(const GpuTexture &texture, std::size_t level) {
+    std::vector<std::uint32_t> result;
+#if defined(_WIN32)
+    if (!state || state->recording || level >= texture.raw.size())
+        return result;
+    auto &s = *state;
+    const auto &raw = texture.raw[level];
+    const UINT64 bytes = static_cast<UINT64>(decode_pitch(raw.width)) * 4u * raw.height;
+    auto readback = buffer(s, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    begin(s);
+    decode_level(s, texture, static_cast<UINT>(level), 0);
+    scratch_state(s, 0, D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    s.list->CopyBufferRegion(readback.Get(), 0, s.decode_scratch[0].Get(), 0, bytes);
+    check(s.list->Close(), "close decode test list");
+    s.recording = false;
+    ID3D12CommandList *lists[]{s.list.Get()};
+    s.queue->ExecuteCommandLists(1, lists);
+    ++s.executions;
+    wait(s);
+    void *mapped{};
+    D3D12_RANGE range{0, static_cast<SIZE_T>(bytes)};
+    check(readback->Map(0, &range, &mapped), "map decode test");
+    result.resize(static_cast<std::size_t>(raw.width) * raw.height);
+    for (UINT y = 0; y < raw.height; ++y)
+        std::memcpy(result.data() + static_cast<std::size_t>(y) * raw.width,
+                    static_cast<const std::uint8_t *>(mapped) + static_cast<std::size_t>(y) * decode_pitch(raw.width) * 4u,
+                    raw.width * 4u);
+    D3D12_RANGE none{};
+    readback->Unmap(0, &none);
+#endif
+    return result;
+}
 bool gpu_requested() noexcept {
     const char *backend = std::getenv("PSPRECOMP_MOTORSTORM_RENDERER");
     return backend && (std::strcmp(backend, "d3d12") == 0 || std::strcmp(backend, "auto") == 0);
@@ -804,12 +1240,20 @@ bool gpu_initialize() {
                 s.antialiasing = 1;
             else if (choice == "ssaa4x" || choice == "SSAA4x")
                 s.antialiasing = 2;
+            else if (choice == "ssaa2x" || choice == "SSAA2x")
+                s.antialiasing = 3;
             else
-                throw std::runtime_error("MotorStorm antialiasing must be none, fxaa or ssaa4x");
+                throw std::runtime_error("MotorStorm antialiasing must be none, fxaa, ssaa2x or ssaa4x");
         }
-        s.raster_scale = s.output_scale * (s.antialiasing == 2 ? 2 : 1);
+        // SSAA4x: 2x2 samples per output pixel. SSAA2x: 1.5x per axis (about
+        // 2.25 samples), area-weighted on output: the middle ground in cost.
+        s.raster_half = s.antialiasing == 2 ? s.output_scale * 4
+                      : s.antialiasing == 3 ? s.output_scale * 3
+                                            : s.output_scale * 2;
+        if (const char *filter = std::getenv("PSPRECOMP_MOTORSTORM_TEXTURE_FILTER"))
+            s.enhanced_filtering = std::string_view(filter) == "enhanced";
         report.resolution_scale = s.output_scale;
-        report.raster_scale = s.raster_scale;
+        report.raster_half = s.raster_half;
         report.antialiasing = s.antialiasing;
         UINT flags = 0;
         if (std::getenv("PSPRECOMP_MOTORSTORM_D3D12_DEBUG")) {
@@ -870,6 +1314,8 @@ bool gpu_initialize() {
         check(s.device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&s.srv)), "create SRV heap");
         s.descriptor_size = s.device->GetDescriptorHandleIncrementSize(heap.Type);
         s.upload = buffer(s, kUploadBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        for (auto &scratch : s.decode_scratch)
+            scratch = buffer(s, kDecodeScratchBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
         D3D12_RANGE none{};
         check(s.upload->Map(0, &none, reinterpret_cast<void **>(&s.mapped)), "map upload arena");
         create_pipeline(s);
@@ -877,7 +1323,7 @@ bool gpu_initialize() {
         report.active = true;
         std::cerr << "[D3D12] hardware GE adapter=" << report.adapter
                   << " ROV=1 GPU_transform=1 output=" << s.output_scale * 480 << 'x' << s.output_scale * 272
-                  << " raster=" << s.raster_scale * 480 << 'x' << s.raster_scale * 272
+                  << " raster=" << raster_extent(480, s.raster_half) << 'x' << raster_extent(272, s.raster_half)
                   << " AA=" << s.antialiasing << '\n';
         return true;
     } catch (const std::exception &error) {
@@ -946,7 +1392,7 @@ void gpu_submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<c
         load_surface(s, *depth, memory);
     }
     ID3D12Resource *feedback = nullptr;
-    Texture *image = nullptr;
+    UINT descriptor = 0, replacement_descriptor = 0;
     UINT cb_offset = 0;
     UINT vertex_offset = 0;
     UINT vertex_bytes = 0;
@@ -960,20 +1406,46 @@ void gpu_submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<c
                             draw.model_to_view_z,
                             draw.scale,
                             draw.center,
-                            {draw.stride * s.raster_scale, height * s.raster_scale, draw.stride * s.raster_scale,
-                             (valid_depth ? draw.depth_stride : draw.stride) * s.raster_scale},
+                            {raster_extent(draw.stride, s.raster_half), raster_extent(height, s.raster_half),
+                             raster_extent(draw.stride, s.raster_half),
+                             raster_extent(valid_depth ? draw.depth_stride : draw.stride, s.raster_half)},
                             {draw.format, draw.hardware_transform ? 1u : 0u,
                              (draw.depth_clip ? 1u : 0u) | (draw.primitive == 0 ? 2u : 0u),
                              valid_depth ? 1u : 0u}};
-        constants.render = {s.raster_scale, s.output_scale, s.antialiasing, 0};
+        constants.render = {s.raster_half, s.output_scale, s.antialiasing, s.enhanced_filtering ? 1u : 0u};
+        if (s.enhanced_filtering && texture && !texture->feedback_address && (draw.commands[0x1E] & 1u)) {
+            // Region of the texture this draw samples: limits generated-mip
+            // blending to it (texture atlases), see sampleEnhanced.
+            float lo_u = 3.0e38f, lo_v = 3.0e38f, hi_u = -3.0e38f, hi_v = -3.0e38f;
+            for (const auto &vertex : vertices) {
+                const float q = vertex.q != 0.0f ? vertex.q : 1.0f, u = vertex.u / q, v = vertex.v / q;
+                lo_u = std::min(lo_u, u); hi_u = std::max(hi_u, u);
+                lo_v = std::min(lo_v, v); hi_v = std::max(hi_v, v);
+            }
+            if (std::isfinite(lo_u) && std::isfinite(hi_u) && std::isfinite(lo_v) && std::isfinite(hi_v))
+                constants.uv_range = {lo_u, lo_v, hi_u, hi_v};
+        }
         if (texture && texture->feedback_address) {
             feedback = feedback_snapshot(s, memory, *texture, constants.feedback);
             ++report.feedback_draws;
         }
+        const State::Replacement *replacement = nullptr;
+        if (texture && !feedback && texture->replacement_hash != 0u)
+            replacement = get_replacement(s, texture->replacement_hash);
+        if (replacement) {
+            constants.replace = {1u, texture->replacement_width ? texture->replacement_width : texture->width,
+                                 texture->replacement_rows,
+                                 (replacement->no_alpha ? 1u : 0u) | (texture->opaque ? 2u : 0u)};  // see shade()
+            replacement_descriptor = replacement->descriptor;
+            ++report.replaced_draws;
+        }
         cb_offset = static_cast<UINT>(allocate(s, sizeof(constants), 256));
         std::memcpy(s.mapped + cb_offset, &constants, sizeof(constants));
         static const GpuTexture white{0, 1, 1, {{0xFFFFFFFFu}}};
-        image = &get_texture(s, texture && !feedback ? *texture : white);
+        // The original stays bound: it supplies the game's runtime alpha.
+        descriptor = get_texture(s, texture && !feedback ? *texture : white).descriptor;
+        if (!replacement)
+            replacement_descriptor = descriptor;
     }
     {
     perf::Scope record_profile(perf::kGpuRecord);
@@ -988,17 +1460,20 @@ void gpu_submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<c
     s.list->SetGraphicsRootConstantBufferView(0, s.upload->GetGPUVirtualAddress() + cb_offset);
     s.list->SetGraphicsRootUnorderedAccessView(1, color.image->GetGPUVirtualAddress());
     s.list->SetGraphicsRootUnorderedAccessView(2, depth->image->GetGPUVirtualAddress());
-    s.list->SetGraphicsRootDescriptorTable(3, srv_handle(s, image->descriptor));
+    s.list->SetGraphicsRootDescriptorTable(3, srv_handle(s, descriptor));
+    s.list->SetGraphicsRootDescriptorTable(7, srv_handle(s, replacement_descriptor));
     s.list->SetGraphicsRootShaderResourceView(5, feedback ? feedback->GetGPUVirtualAddress()
                                                           : s.upload->GetGPUVirtualAddress());
     D3D12_VIEWPORT viewport{
-        0, 0, static_cast<float>(draw.stride * s.raster_scale), static_cast<float>(height * s.raster_scale),
-        0, 1};
+        0, 0, static_cast<float>(raster_extent(draw.stride, s.raster_half)),
+        static_cast<float>(raster_extent(height, s.raster_half)), 0, 1};
     s.list->RSSetViewports(1, &viewport);
-    D3D12_RECT scissor{std::clamp(draw.left, 0, static_cast<int>(draw.stride)) * static_cast<int>(s.raster_scale),
-                       std::clamp(draw.top, 0, static_cast<int>(height)) * static_cast<int>(s.raster_scale),
-                       std::clamp(draw.right, 0, static_cast<int>(draw.stride)) * static_cast<int>(s.raster_scale),
-                       std::clamp(draw.bottom, 0, static_cast<int>(height)) * static_cast<int>(s.raster_scale)};
+    const auto raster = [&](int native, int limit) {
+        return static_cast<LONG>(raster_extent(static_cast<UINT>(std::clamp(native, 0, limit)), s.raster_half));
+    };
+    D3D12_RECT scissor{raster(draw.left, static_cast<int>(draw.stride)), raster(draw.top, static_cast<int>(height)),
+                       raster(draw.right, static_cast<int>(draw.stride)),
+                       raster(draw.bottom, static_cast<int>(height))};
     s.list->RSSetScissorRects(1, &scissor);
     s.list->IASetPrimitiveTopology(topology);
     D3D12_VERTEX_BUFFER_VIEW view{s.upload->GetGPUVirtualAddress() + vertex_offset,
@@ -1038,12 +1513,12 @@ void finish_list(State &s) {
     for (const auto &surface : s.surfaces) {
         if (surface->dirty) {
             auto *resolved = resolve_surface(s, *surface);
-            if (surface->raster_scale == 1)
+            if (surface->raster_half == 2)
                 transition(s, *surface, D3D12_RESOURCE_STATE_COPY_SOURCE);
             else
                 native_transition(s, *surface, D3D12_RESOURCE_STATE_COPY_SOURCE);
             s.list->CopyBufferRegion(surface->readback.Get(), 0, resolved, 0, surface->native_bytes());
-            if (surface->raster_scale == 1)
+            if (surface->raster_half == 2)
                 transition(s, *surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             else
                 native_transition(s, *surface, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1060,6 +1535,8 @@ void finish_list(State &s) {
     }
     s.readback_fence = std::max(s.readback_fence, s.frame_fence);
     s.frame_fence = 0u;
+    s.replacement_uploaded_in_list = 0u;
+    s.replacement_count_in_list = 0u;
 }
 // Wait for submitted GE work and copy its pixels into guest memory. Bytes the
 // CPU changed after the list ended keep the CPU's value, exactly as if the
@@ -1112,6 +1589,22 @@ void publish_readbacks(State &s, psprecomp::GuestMemory &memory) {
     if (s.recording)
         return;
     s.transient.clear();
+    if (s.replacement_bytes > textures::budget_bytes()) {
+        std::vector<std::pair<UINT64, std::uint64_t>> oldest;
+        for (const auto &[hash, replacement] : s.replacements)
+            if (replacement.image)
+                oldest.emplace_back(replacement.last_used, hash);
+        std::sort(oldest.begin(), oldest.end());
+        for (const auto &[last_used, hash] : oldest) {
+            if (s.replacement_bytes <= textures::budget_bytes() / 10u * 9u)
+                break;
+            const auto found = s.replacements.find(hash);
+            s.replacement_bytes -= found->second.bytes;
+            s.free_descriptors.push_back(found->second.descriptor);
+            s.replacements.erase(found);  // reloaded from disk if drawn again
+            ++report.replacements_evicted;
+        }
+    }
     // Retire caches only after the fence, never while recorded draws use them.
     if (s.textures.size() > 4096 || s.texture_bytes > 256ull * 1024 * 1024) {
         std::vector<std::pair<UINT64, UINT64>> oldest;
@@ -1226,9 +1719,9 @@ GpuImage gpu_capture(psprecomp::GuestMemory &memory, std::uint32_t framebuffer, 
     load_surface(s, *color, memory);
     transition(s, *color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     Constants constants{};
-    constants.surface = {width, height, stride * s.raster_scale, 0};
+    constants.surface = {width, height, raster_extent(stride, s.raster_half), 0};
     constants.mode[0] = format;
-    constants.render = {s.raster_scale, s.output_scale, s.antialiasing, 0};
+    constants.render = {s.raster_half, s.output_scale, s.antialiasing, 0};
     compute(s, s.capture_pipeline.Get(), constants, color->image->GetGPUVirtualAddress(),
             output->GetGPUVirtualAddress(), result.width, result.height);
     D3D12_RESOURCE_BARRIER barrier{};
@@ -1242,6 +1735,7 @@ GpuImage gpu_capture(psprecomp::GuestMemory &memory, std::uint32_t framebuffer, 
     s.recording = false;
     ID3D12CommandList *lists[]{s.list.Get()};
     s.queue->ExecuteCommandLists(1, lists);
+    ++s.executions;
     wait(s);
     void *mapped{};
     D3D12_RANGE range{0, static_cast<SIZE_T>(bytes)};
@@ -1278,6 +1772,7 @@ void create_present_queue(State &s) {
     }
 }
 // Wait until the present queue has finished everything submitted to it.
+// Only the presenter thread (or the owner once it has stopped) calls this.
 void drain_present_queue(State &s) {
     if (!s.present_queue)
         return;
@@ -1287,6 +1782,254 @@ void drain_present_queue(State &s) {
         check(s.present_fence->SetEventOnCompletion(value, s.present_event), "arm present fence");
         WaitForSingleObject(s.present_event, 30000);
     }
+}
+void create_backbuffer_views(State &s) {
+    for (UINT i = 0; i < State::kBackBuffers; ++i) {
+        check(s.swapchain->GetBuffer(i, IID_PPV_ARGS(&s.backbuffers[i])), "get swapchain buffer");
+        auto handle = s.rtv->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += i * s.rtv_size;
+        s.device->CreateRenderTargetView(s.backbuffers[i].Get(), nullptr, handle);
+    }
+}
+void create_swapchain(State &s, HWND window) {
+    RECT client{};
+    GetClientRect(window, &client);
+    const UINT w = std::max<LONG>(1, client.right), h = std::max<LONG>(1, client.bottom);
+    if (const char *value = std::getenv("PSPRECOMP_MOTORSTORM_VSYNC"))
+        s.vsync = std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0;
+    if (const char *value = std::getenv("PSPRECOMP_MOTORSTORM_FULLSCREEN_MODE"))
+        s.exclusive_fullscreen = std::strcmp(value, "exclusive") == 0;
+    if (const char *value = std::getenv("PSPRECOMP_MOTORSTORM_FULLSCREEN_REFRESH"))
+        s.refresh_hz = static_cast<UINT>(std::strtoul(value, nullptr, 10));
+    BOOL tearing = FALSE;
+    s.tearing = SUCCEEDED(s.factory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing,
+                                                          sizeof(tearing))) && tearing;
+    s.swap_flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
+                   (s.tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u);
+    DXGI_SWAP_CHAIN_DESC1 desc{};
+    desc.Width = w;
+    desc.Height = h;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount = State::kBackBuffers;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    desc.Flags = s.swap_flags;
+    ComPtr<IDXGISwapChain1> chain;
+    create_present_queue(s);
+    check(s.factory->CreateSwapChainForHwnd(s.present_queue.Get(), window, &desc, nullptr, nullptr, &chain),
+          "create swapchain");
+    check(chain.As(&s.swapchain), "query swapchain");
+    // Two queued frames; the presenter waits for room on its own thread.
+    check(s.swapchain->SetMaximumFrameLatency(2), "set frame latency");
+    s.frame_latency = s.swapchain->GetFrameLatencyWaitableObject();
+    s.factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER);
+    D3D12_DESCRIPTOR_HEAP_DESC heap{};
+    heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    heap.NumDescriptors = State::kBackBuffers;
+    check(s.device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&s.rtv)), "create RTV heap");
+    s.rtv_size = s.device->GetDescriptorHandleIncrementSize(heap.Type);
+    create_backbuffer_views(s);
+    s.window = window;
+    s.present_width = w;
+    s.present_height = h;
+    s.latency_token = false;
+    log_line("GE", std::string("presentation: vsync=") + (s.vsync ? "on" : "off") +
+                       " tearing=" + (s.tearing ? "supported" : "unsupported") +
+                       " fullscreen_mode=" + (s.exclusive_fullscreen ? "exclusive" : "borderless"));
+}
+// True when the window covers its whole monitor (borderless fullscreen).
+bool covers_monitor(HWND window) {
+    RECT rect{};
+    if (!GetWindowRect(window, &rect))
+        return false;
+    MONITORINFO info{sizeof(info)};
+    if (!GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &info))
+        return false;
+    return rect.left <= info.rcMonitor.left && rect.top <= info.rcMonitor.top &&
+           rect.right >= info.rcMonitor.right && rect.bottom >= info.rcMonitor.bottom;
+}
+// Presenter thread: follows the window size and exclusive fullscreen.
+void update_present_target(State &s) {
+    bool resize = false;
+    if (s.exclusive_fullscreen) {
+        BOOL active = FALSE;
+        s.swapchain->GetFullscreenState(&active, nullptr);
+        // The window thread marks fullscreen with a caption-less popup style;
+        // F11 / Alt+Enter restore the caption.
+        const bool borderless = (GetWindowLongPtrW(s.window, GWL_STYLE) & WS_CAPTION) == 0;
+        const bool focused = GetForegroundWindow() == s.window;
+        const bool want = !s.exclusive_failed && borderless && focused && covers_monitor(s.window);
+        // While exclusive, DXGI owns the display mode; leave it when the
+        // window loses focus or the user toggles back to a window.
+        const bool leave = active && (!focused || !borderless);
+        if (!active && want) {
+            if (s.refresh_hz) {
+                ComPtr<IDXGIOutput> output;
+                if (SUCCEEDED(s.swapchain->GetContainingOutput(&output))) {
+                    MONITORINFO info{sizeof(info)};
+                    GetMonitorInfoW(MonitorFromWindow(s.window, MONITOR_DEFAULTTONEAREST), &info);
+                    DXGI_MODE_DESC wanted{};
+                    wanted.Width = static_cast<UINT>(info.rcMonitor.right - info.rcMonitor.left);
+                    wanted.Height = static_cast<UINT>(info.rcMonitor.bottom - info.rcMonitor.top);
+                    wanted.RefreshRate = {s.refresh_hz, 1};
+                    wanted.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    DXGI_MODE_DESC mode{};
+                    if (SUCCEEDED(output->FindClosestMatchingMode(&wanted, &mode, nullptr)))
+                        s.swapchain->ResizeTarget(&mode);
+                }
+            }
+            const HRESULT hr = s.swapchain->SetFullscreenState(TRUE, nullptr);
+            if (FAILED(hr)) {
+                s.exclusive_failed = true;  // e.g. not available on this output: stay borderless
+                log_line("GE", "exclusive fullscreen unavailable; using borderless");
+            } else {
+                s.exclusive_active = true;
+                resize = true;  // flip model: buffers must be resized after the switch
+                log_line("GE", "exclusive fullscreen enabled");
+            }
+        } else if (leave) {
+            s.swapchain->SetFullscreenState(FALSE, nullptr);
+            s.exclusive_active = false;
+            resize = true;
+            log_line("GE", "exclusive fullscreen left");
+        }
+    }
+    RECT client{};
+    GetClientRect(s.window, &client);
+    const UINT w = std::max<LONG>(1, client.right), h = std::max<LONG>(1, client.bottom);
+    if (!resize && w == s.present_width && h == s.present_height)
+        return;
+    drain_present_queue(s);
+    for (auto &back : s.backbuffers)
+        back.Reset();
+    check(s.swapchain->ResizeBuffers(State::kBackBuffers, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, s.swap_flags),
+          "resize swapchain");
+    create_backbuffer_views(s);
+    s.present_width = w;
+    s.present_height = h;
+}
+void present_snapshot(State &s, State::PresentFrame &frame) {
+    check(frame.allocator->Reset(), "reset present allocator");
+    check(frame.list->Reset(frame.allocator.Get(), s.present_pipeline.Get()), "reset present list");
+    auto *list = frame.list.Get();
+    list->SetGraphicsRootSignature(s.root.Get());
+    ID3D12DescriptorHeap *heaps[]{s.srv.Get()};
+    list->SetDescriptorHeaps(1, heaps);
+    Constants constants{};
+    constants.surface = {frame.width, frame.height, raster_extent(frame.stride, s.raster_half), 0};
+    constants.mode[0] = frame.format;
+    constants.render = {s.raster_half, s.output_scale, s.antialiasing, 0};
+    std::memcpy(frame.mapped, &constants, sizeof(constants));
+    list->SetGraphicsRootConstantBufferView(0, frame.constants->GetGPUVirtualAddress());
+    list->SetGraphicsRootShaderResourceView(4, frame.image->GetGPUVirtualAddress());
+    const UINT index = s.swapchain->GetCurrentBackBufferIndex();
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {s.backbuffers[index].Get(), 0, D3D12_RESOURCE_STATE_PRESENT,
+                          D3D12_RESOURCE_STATE_RENDER_TARGET};
+    list->ResourceBarrier(1, &barrier);
+    auto rtv = s.rtv->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += index * s.rtv_size;
+    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    constexpr float black[]{0, 0, 0, 1};
+    list->ClearRenderTargetView(rtv, black, 0, nullptr);
+    const auto fitted = fit_presentation(s.present_width, s.present_height, frame.width, frame.height);
+    D3D12_VIEWPORT viewport{static_cast<float>(fitted.left), static_cast<float>(fitted.top),
+        static_cast<float>(fitted.width), static_cast<float>(fitted.height), 0, 1};
+    D3D12_RECT rect{static_cast<LONG>(fitted.left), static_cast<LONG>(fitted.top),
+        static_cast<LONG>(fitted.left + fitted.width), static_cast<LONG>(fitted.top + fitted.height)};
+    list->RSSetViewports(1, &viewport);
+    list->RSSetScissorRects(1, &rect);
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list->DrawInstanced(3, 1, 0, 0);
+    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    list->ResourceBarrier(1, &barrier);
+    check(list->Close(), "close presentation list");
+    // GPU-side wait for the snapshot copy on the GE queue.
+    check(s.present_queue->Wait(s.fence.Get(), frame.copy_fence), "present queue wait");
+    ID3D12CommandList *present_lists[]{list};
+    s.present_queue->ExecuteCommandLists(1, present_lists);
+    const bool tear = !s.vsync && s.tearing && !s.exclusive_active;
+    const HRESULT result = s.swapchain->Present(s.vsync ? 1u : 0u, tear ? DXGI_PRESENT_ALLOW_TEARING : 0u);
+    if (FAILED(result) && result != DXGI_ERROR_WAS_STILL_DRAWING)
+        check(result, "present");
+}
+// Presents the newest published snapshot whenever the display has room.
+// Emulation never waits for it: a newer snapshot replaces an unshown one.
+void presenter_main(State &s) {
+    std::unique_lock lock(s.present_mutex);
+    for (;;) {
+        s.present_cv.wait(lock, [&] { return s.ready_frame >= 0 || s.presenter_stop; });
+        if (s.presenter_stop)
+            break;
+        lock.unlock();
+        // The latency object is a semaphore: keep a token taken while no frame
+        // was ready so the next frame does not wait for a present that never came.
+        if (!s.latency_token && s.frame_latency)
+            WaitForSingleObject(s.frame_latency, 100);
+        s.latency_token = true;
+        HRESULT failure = S_OK;
+        try {
+            update_present_target(s);
+        } catch (const std::exception &error) {
+            log_line("GE", std::string("presenter: ") + error.what());
+            failure = E_FAIL;
+        }
+        lock.lock();
+        const int index = s.ready_frame;
+        if (index < 0 || FAILED(failure)) {
+            if (FAILED(failure))
+                s.present_result = failure;
+            continue;
+        }
+        s.ready_frame = -1;
+        auto &frame = s.present_frames[index];
+        frame.state = State::FrameState::Presenting;
+        lock.unlock();
+        try {
+            present_snapshot(s, frame);
+            s.latency_token = false;
+        } catch (const std::exception &error) {
+            log_line("GE", std::string("presenter: ") + error.what());
+            failure = E_FAIL;
+        }
+        UINT64 value = 0;
+        try {
+            value = ++s.present_fence_value;
+            check(s.present_queue->Signal(s.present_fence.Get(), value), "signal present fence");
+        } catch (const std::exception &error) {
+            log_line("GE", std::string("presenter: ") + error.what());
+            failure = E_FAIL;
+        }
+        lock.lock();
+        frame.fence = value;
+        frame.state = State::FrameState::Free;
+        if (FAILED(failure))
+            s.present_result = failure;
+        ++s.displayed;
+        s.present_cv.notify_all();
+    }
+    lock.unlock();
+    if (s.swapchain && s.exclusive_active) {
+        s.swapchain->SetFullscreenState(FALSE, nullptr);
+        s.exclusive_active = false;
+    }
+}
+void release_swapchain(State &s) {
+    s.stop_presenter();
+    drain_present_queue(s);
+    for (auto &back : s.backbuffers)
+        back.Reset();
+    s.swapchain.Reset();
+    s.rtv.Reset();
+    if (s.frame_latency) {
+        CloseHandle(s.frame_latency);
+        s.frame_latency = nullptr;
+    }
+    for (auto &frame : s.present_frames)
+        frame.state = State::FrameState::Free;
+    s.ready_frame = -1;
 }
 } // namespace
 #endif
@@ -1314,98 +2057,41 @@ bool gpu_present(psprecomp::GuestMemory &memory, void *window, std::uint32_t fra
     // list ended (any access publishes it through the VRAM hook), so the GPU
     // image is the current frame: present it without waiting.
     const bool current_on_gpu = color->readback_pending;
-    RECT client{};
-    GetClientRect(static_cast<HWND>(window), &client);
-    const UINT w = std::max<LONG>(1, client.right), h = std::max<LONG>(1, client.bottom);
-    if (s.swapchain && (s.window != window || s.present_width != w || s.present_height != h)) {
-        s.wait_presenter_idle();
-        wait(s);
-        drain_present_queue(s);
-        for (auto &back : s.backbuffers)
-            back.Reset();
-        s.swapchain.Reset();
-        s.rtv.Reset();
-        if (s.frame_latency) {
-            CloseHandle(s.frame_latency);
-            s.frame_latency = nullptr;
-        }
+    if (s.swapchain && s.window != window)
+        release_swapchain(s);
+    if (!s.swapchain)
+        create_swapchain(s, static_cast<HWND>(window));
+    if (!s.presenter.joinable()) {
+        s.presenter_stop = false;
+        s.presenter = std::thread([&s] { presenter_main(s); });
     }
-    if (!s.swapchain) {
-        DXGI_SWAP_CHAIN_DESC1 desc{};
-        desc.Width = w;
-        desc.Height = h;
-        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        desc.SampleDesc.Count = 1;
-        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        desc.BufferCount = State::kBackBuffers;
-        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-        ComPtr<IDXGISwapChain1> chain;
-        create_present_queue(s);
-        check(s.factory->CreateSwapChainForHwnd(s.present_queue.Get(), static_cast<HWND>(window), &desc, nullptr,
-                                                nullptr, &chain),
-              "create swapchain");
-        check(chain.As(&s.swapchain), "query swapchain");
-        // Two queued frames; beyond that the display cannot show more and
-        // presenting would block the guest (see the skip below).
-        check(s.swapchain->SetMaximumFrameLatency(2), "set frame latency");
-        s.frame_latency = s.swapchain->GetFrameLatencyWaitableObject();
-        s.factory->MakeWindowAssociation(static_cast<HWND>(window), DXGI_MWA_NO_ALT_ENTER);
-        D3D12_DESCRIPTOR_HEAP_DESC heap{};
-        heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        heap.NumDescriptors = State::kBackBuffers;
-        check(s.device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&s.rtv)), "create RTV heap");
-        s.rtv_size = s.device->GetDescriptorHandleIncrementSize(heap.Type);
-        for (UINT i = 0; i < State::kBackBuffers; ++i) {
-            check(s.swapchain->GetBuffer(i, IID_PPV_ARGS(&s.backbuffers[i])), "get swapchain buffer");
-            auto handle = s.rtv->GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += i * s.rtv_size;
-            s.device->CreateRenderTargetView(s.backbuffers[i].Get(), nullptr, handle);
-        }
-        s.window = static_cast<HWND>(window);
-        s.present_width = w;
-        s.present_height = h;
-    }
-    // When the presenter is still inside the previous Present, or the display
-    // has two frames queued, drop this presentation instead of stalling
-    // emulation; a newer frame follows shortly.
+    // Pick a snapshot slot: one the display is done with, else the unshown
+    // published one (superseded by this newer frame). Never wait for vblank.
+    int index = -1;
     {
-        // Present usually returns within a few milliseconds of the request; a
-        // short bounded wait avoids dropping a frame at a vblank boundary.
-        std::unique_lock lock(s.present_mutex);
+        std::lock_guard lock(s.present_mutex);
         check(s.present_result, "present");
-        if (!s.present_cv.wait_for(lock, std::chrono::milliseconds(3), [&] { return !s.present_busy; })) {
-            ++report.skipped_presents;
+        const UINT64 completed = s.present_fence->GetCompletedValue();
+        for (UINT i = 0; i < State::kPresentFrames; ++i) {
+            const auto &frame = s.present_frames[i];
+            if (frame.state == State::FrameState::Free && completed >= frame.fence &&
+                static_cast<int>(i) != s.ready_frame) {
+                index = static_cast<int>(i);
+                break;
+            }
+        }
+        if (index < 0 && s.ready_frame >= 0) {
+            index = s.ready_frame;
+            s.ready_frame = -1;
+            ++report.superseded_presents;
+        }
+        if (index < 0) {
+            ++report.skipped_presents;  // every snapshot is still in flight to the display
             return true;
         }
+        s.present_frames[index].state = State::FrameState::Writing;
     }
-    if (s.frame_latency && WaitForSingleObject(s.frame_latency, 0) == WAIT_TIMEOUT) {
-        ++report.skipped_presents;
-        return true;
-    }
-    if (!s.presenter.joinable()) {
-        s.presenter = std::thread([&s] {
-            std::unique_lock lock(s.present_mutex);
-            for (;;) {
-                s.present_cv.wait(lock, [&] { return s.present_requested || s.presenter_stop; });
-                if (s.presenter_stop)
-                    return;
-                s.present_requested = false;
-                lock.unlock();
-                const HRESULT result = s.swapchain->Present(0, 0);
-                lock.lock();
-                if (FAILED(result))
-                    s.present_result = result;
-                s.present_busy = false;
-                s.present_cv.notify_all();
-            }
-        });
-    }
-    State::PresentFrame &frame = s.present_frames[s.present_frame];
-    if (frame.fence != 0u && s.present_fence->GetCompletedValue() < frame.fence) {
-        ++report.skipped_presents;  // every snapshot is still queued for display
-        return true;
-    }
+    State::PresentFrame &frame = s.present_frames[index];
     begin(s, kPresentSlot);
     // Movies and CPU writes may update a displayed buffer without any GE draw.
     // Reload the synchronized guest bytes before direct presentation.
@@ -1425,59 +2111,25 @@ bool gpu_present(psprecomp::GuestMemory &memory, void *window, std::uint32_t fra
     s.recording = false;
     ID3D12CommandList *copy_lists[]{s.list.Get()};
     s.queue->ExecuteCommandLists(1, copy_lists);
+    ++s.executions;
     CommandSlot &slot = s.slots[s.slot_index];
     slot.fence_value = signal_fence(s);
     slot.pending = true;
     s.arena_fence = slot.fence_value;
     color->loaded = false;
-
-    check(frame.allocator->Reset(), "reset present allocator");
-    check(frame.list->Reset(frame.allocator.Get(), s.present_pipeline.Get()), "reset present list");
-    auto *list = frame.list.Get();
-    list->SetGraphicsRootSignature(s.root.Get());
-    ID3D12DescriptorHeap *heaps[]{s.srv.Get()};
-    list->SetDescriptorHeaps(1, heaps);
-    Constants constants{};
-    constants.surface = {width, height, stride * s.raster_scale, 0};
-    constants.mode[0] = format;
-    constants.render = {s.raster_scale, s.output_scale, s.antialiasing, 0};
-    std::memcpy(frame.mapped, &constants, sizeof(constants));
-    list->SetGraphicsRootConstantBufferView(0, frame.constants->GetGPUVirtualAddress());
-    list->SetGraphicsRootShaderResourceView(4, frame.image->GetGPUVirtualAddress());
-    const UINT index = s.swapchain->GetCurrentBackBufferIndex();
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition = {s.backbuffers[index].Get(), 0, D3D12_RESOURCE_STATE_PRESENT,
-                          D3D12_RESOURCE_STATE_RENDER_TARGET};
-    list->ResourceBarrier(1, &barrier);
-    auto rtv = s.rtv->GetCPUDescriptorHandleForHeapStart();
-    rtv.ptr += index * s.rtv_size;
-    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-    constexpr float black[]{0, 0, 0, 1};
-    list->ClearRenderTargetView(rtv, black, 0, nullptr);
-    const auto fitted = fit_presentation(w, h, width, height);
-    D3D12_VIEWPORT viewport{static_cast<float>(fitted.left), static_cast<float>(fitted.top),
-        static_cast<float>(fitted.width), static_cast<float>(fitted.height), 0, 1};
-    D3D12_RECT rect{static_cast<LONG>(fitted.left), static_cast<LONG>(fitted.top),
-        static_cast<LONG>(fitted.left + fitted.width), static_cast<LONG>(fitted.top + fitted.height)};
-    list->RSSetViewports(1, &viewport);
-    list->RSSetScissorRects(1, &rect);
-    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    list->DrawInstanced(3, 1, 0, 0);
-    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
-    list->ResourceBarrier(1, &barrier);
-    check(list->Close(), "close presentation list");
-    // GPU-side wait for the snapshot copy; the CPU never blocks here.
-    check(s.present_queue->Wait(s.fence.Get(), slot.fence_value), "present queue wait");
-    ID3D12CommandList *present_lists[]{list};
-    s.present_queue->ExecuteCommandLists(1, present_lists);
-    frame.fence = ++s.present_fence_value;
-    check(s.present_queue->Signal(s.present_fence.Get(), frame.fence), "signal present fence");
-    s.present_frame = (s.present_frame + 1u) % State::kPresentFrames;
+    frame.copy_fence = slot.fence_value;
+    frame.width = width;
+    frame.height = height;
+    frame.stride = stride;
+    frame.format = format;
     {
         std::lock_guard lock(s.present_mutex);
-        s.present_busy = true;
-        s.present_requested = true;
+        if (s.ready_frame >= 0 && s.ready_frame != index) {
+            s.present_frames[s.ready_frame].state = State::FrameState::Free;
+            ++report.superseded_presents;
+        }
+        s.ready_frame = index;
+        frame.state = State::FrameState::Ready;
     }
     s.present_cv.notify_all();
     ++report.presents;

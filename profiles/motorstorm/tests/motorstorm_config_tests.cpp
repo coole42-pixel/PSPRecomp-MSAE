@@ -105,25 +105,34 @@ int main() {
             using Decision = motorstorm::FrameRateGovernor::Decision;
             motorstorm::FrameRateGovernor governor;
             // Real-time at the target: keep it.
-            for (int i = 0; i < 10; ++i)
-                check(governor.update(1.0, 1.0, 0.3, true, 2.0) == Decision::Keep, "Real-time target is kept");
-            // One slow second (a load hitch) is tolerated; two in a row fall back.
-            check(governor.update(1.0, 0.8, 0.0, true, 2.0) == Decision::Keep, "A single slow sample is tolerated");
-            check(governor.update(1.0, 1.0, 0.0, true, 2.0) == Decision::Keep, "Recovery resets the slow count");
-            check(governor.update(1.0, 0.8, 0.0, true, 2.0) == Decision::Keep &&
-                  governor.update(1.0, 0.8, 0.0, true, 2.0) == Decision::Fallback,
+            for (int i = 0; i < 20; ++i)
+                check(governor.update(0.5, 0.5, 0.15, true, 2.0) == Decision::Keep, "Real-time target is kept");
+            // A hitch (up to 1.5 s slow) is tolerated; 2 s in a row fall back.
+            for (int i = 0; i < 3; ++i)
+                check(governor.update(0.5, 0.4, 0.0, true, 2.0) == Decision::Keep, "A short hitch is tolerated");
+            check(governor.update(0.5, 0.5, 0.0, true, 2.0) == Decision::Keep, "Recovery resets the slow count");
+            for (int i = 0; i < 3; ++i)
+                check(governor.update(0.5, 0.4, 0.0, true, 2.0) == Decision::Keep, "Slow samples accumulate");
+            check(governor.update(0.5, 0.4, 0.0, true, 2.0) == Decision::Fallback,
                   "Sustained slow motion falls back to 30 fps");
             // At 30 fps, 60% busy would need 120% at 60 fps: stay.
-            for (int i = 0; i < 30; ++i)
-                check(governor.update(1.0, 1.0, 0.4, false, 2.0) == Decision::Keep, "No headroom keeps the fallback");
+            for (int i = 0; i < 60; ++i)
+                check(governor.update(0.5, 0.5, 0.2, false, 2.0) == Decision::Keep, "No headroom keeps the fallback");
+            check(governor.restore_due(), "The back-off has passed: the next scene boundary restores");
+            // Loading work never counts as slowness, nor does the quiet time after it.
+            motorstorm::FrameRateGovernor loading;
+            for (int i = 0; i < 20; ++i)
+                check(loading.update(0.5, 0.2, 0.0, true, 2.0, true) == Decision::Keep, "Loading samples are ignored");
+            for (int i = 0; i < 6; ++i)
+                check(loading.update(0.5, 0.4, 0.0, true, 2.0) == Decision::Keep, "Quiet period after loading");
             motorstorm::FrameRateGovernor idle;
-            (void)idle.update(1.0, 0.8, 0.0, true, 2.0);
-            (void)idle.update(1.0, 0.8, 0.0, true, 2.0);
-            int seconds = 0;
-            while (idle.update(1.0, 1.0, 0.7, false, 2.0) == Decision::Keep && seconds < 100) ++seconds;
-            check(seconds >= 10 && seconds < 20, "Headroom restores the target after the back-off");
-            (void)idle.update(1.0, 0.8, 0.0, true, 2.0);
-            check(idle.update(1.0, 0.8, 0.0, true, 2.0) == Decision::Fallback && idle.backoff_seconds() == 20.0,
+            for (int i = 0; i < 4; ++i) (void)idle.update(0.5, 0.4, 0.0, true, 2.0);
+            check(!idle.restore_due(), "No restore inside the back-off");
+            int samples = 0;
+            while (idle.update(0.5, 0.5, 0.35, false, 2.0) == Decision::Keep && samples < 200) ++samples;
+            check(samples >= 20 && samples < 40, "Clear headroom restores the target after the back-off");
+            for (int i = 0; i < 3; ++i) (void)idle.update(0.5, 0.4, 0.0, true, 2.0);
+            check(idle.update(0.5, 0.4, 0.0, true, 2.0) == Decision::Fallback && idle.backoff_seconds() == 20.0,
                   "Falling back right after a restore doubles the back-off");
         }
         {

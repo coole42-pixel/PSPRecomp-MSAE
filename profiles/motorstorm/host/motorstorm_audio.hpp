@@ -16,6 +16,7 @@ struct AudioReport {
     std::uint64_t underruns{}, longest_gap_us{}, buffered_frames{}, silent_frames{};
     bool playing{};
     bool mmcss{};
+    std::uint64_t device_dry{};  // WASAPI: device buffer found empty (audible glitch)
 };
 AudioReport audio_report();
 

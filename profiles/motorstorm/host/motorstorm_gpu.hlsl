@@ -1,7 +1,11 @@
 // Native-resolution PSP pixel operations. ROV ordering lets the hardware
 // rasterizer implement stencil-in-framebuffer-alpha and bit write masks exactly,
 // including operations D3D12's fixed blend unit cannot express.
-static constexpr char kGeShader[] = R"HLSL(
+// Compiled at build time by fxc (see CMakeLists.txt, motorstorm_shaders); the
+// renderer embeds the bytecode, so no shader compiler runs at startup.
+// X4000: fxc's false "uninitialized variable" for functions with early
+// returns. X3556: signed modulus is needed for negative wrap coordinates.
+#pragma warning(disable : 3556 4000)
 cbuffer DrawState : register(b0) {
     uint4 commands[64];
     float4 clipRows[4];
@@ -9,9 +13,15 @@ cbuffer DrawState : register(b0) {
     uint4 surface; // width, height, color stride, depth stride
     uint4 mode; // format, hardware transform, clip/isPoint flags, valid depth
     uint4 feedback; // use, base index, texture stride, packed format
-    uint4 render; // raster scale, output scale, AA (0 none, 1 FXAA, 2 SSAA4x), reserved
+    uint4 render; // raster scale in half units (2 = 1x, 3 = 1.5x), output scale, AA mode, flags (bit0 enhanced filtering)
+    uint4 replace; // texture pack: active, covered PSP width, covered rows
+    float4 uvRange; // enhanced filtering: texel range of the draw (min uv, max uv); 0 = unknown
 };
 uint C(uint i) { return commands[i >> 2][i & 3]; }
+// Native <-> raster mapping (see raster_extent in motorstorm_gpu.cpp).
+float rasterScale() { return render.x*0.5; }
+uint rasterExtent(uint native) { return native*render.x/2; }
+uint nativeOf(uint raster) { return (2*raster+1)/render.x; }
 RasterizerOrderedStructuredBuffer<uint> colorTarget : register(u0);
 RasterizerOrderedStructuredBuffer<uint> depthTarget : register(u1);
 Texture2D<float4> textureImage : register(t0);
@@ -19,7 +29,12 @@ SamplerState samplerWrapWrap : register(s0);
 SamplerState samplerClampWrap : register(s1);
 SamplerState samplerWrapClamp : register(s2);
 SamplerState samplerClampClamp : register(s3);
+SamplerState anisoWrapWrap : register(s4);
+SamplerState anisoClampWrap : register(s5);
+SamplerState anisoWrapClamp : register(s6);
+SamplerState anisoClampClamp : register(s7);
 StructuredBuffer<uint> feedbackImage : register(t2);
+Texture2D<float4> replacementImage : register(t3);
 struct Input {
     float3 position : POSITION;
     uint color : COLOR0;
@@ -67,7 +82,7 @@ Varying VS(Input i) {
     float2 xy = mode.y ? clip.xy * viewportScale.xy + viewportCenter.xy * w : i.position.xy;
     bool isPoint = (mode.z&2)!=0;
     if(isPoint) xy=(floor(xy/w)+0.5)*w;
-    xy *= render.x;
+    xy *= rasterScale();
     o.position = float4(xy.x * (2.0/surface.x) - w, w - xy.y * (2.0/surface.y), 0.5*w, w);
     o.clipXY = mode.y && !isPoint ? float4(w+clip.x,w-clip.x,w+clip.y,w-clip.y) : 1;
     o.clipZ = mode.y && (mode.z&1) && !isPoint ? float2(w+clip.z,w-clip.z) : 1;
@@ -81,7 +96,7 @@ Varying VS(Input i) {
 [maxvertexcount(4)]
 void PointGS(point Varying inputVertices[1], inout TriangleStream<Varying> outputVertices) {
     Varying a=inputVertices[0];
-    float2 radius=float2(render.x,render.x)/surface.xy*a.position.w;
+    float2 radius=rasterScale()/float2(surface.xy)*a.position.w;
     Varying v=a; v.position.xy=a.position.xy+radius*float2(-1,1); outputVertices.Append(v);
     v=a; v.position.xy=a.position.xy+radius*float2(1,1); outputVertices.Append(v);
     v=a; v.position.xy=a.position.xy+radius*float2(-1,-1); outputVertices.Append(v);
@@ -114,7 +129,7 @@ uint4 texel(int2 p, uint level) {
     uint w,h,n;
     if(feedback.x) {
         w=1u<<(C(0xb8)&15); h=1u<<((C(0xb8)>>8)&15);
-        if(feedback.x==2) { w*=render.x; h*=render.x; }
+        if(feedback.x==2) { w=rasterExtent(w); h=rasterExtent(h); }
     }
     else textureImage.GetDimensions(level,w,h,n);
     p = int2(wrap(p.x,w,(C(0xc7)&1)!=0),wrap(p.y,h,(C(0xc7)&256)!=0));
@@ -149,8 +164,55 @@ uint4 sampleLevel(float2 uv, uint level, bool filterLinear) {
     uint4 b = texel(p+int2(0,1),level)*(16-f.x)+texel(p+1,level)*f.x;
     return (a*(16-f.y)+b*f.y)>>8;
 }
+
+// Texture-pack replacement: any resolution and its own full mip chain. The
+// covered PSP size maps texel-space UVs to normalized coordinates, so
+// wrap/clamp and the game's nearest/linear choice are preserved.
+uint4 sampleReplacement(float2 st, float2 gx, float2 gy, bool filterLinear) {
+    bool clampU=(C(0xc7)&1)!=0, clampV=(C(0xc7)&256)!=0;
+    if(!filterLinear) {
+        uint w,h,n; replacementImage.GetDimensions(0,w,h,n);
+        int2 p = int2(floor(st*float2(w,h)));
+        p = int2(wrap(p.x,w,clampU),wrap(p.y,h,clampV));
+        return uint4(replacementImage.Load(int3(p,0))*255+0.5);
+    }
+    float4 c;
+    if(clampU && clampV) c=replacementImage.SampleGrad(anisoClampClamp,st,gx,gy);
+    else if(clampU) c=replacementImage.SampleGrad(anisoClampWrap,st,gx,gy);
+    else if(clampV) c=replacementImage.SampleGrad(anisoWrapClamp,st,gx,gy);
+    else c=replacementImage.SampleGrad(anisoWrapWrap,st,gx,gy);
+    return uint4(saturate(c)*255+0.5);
+}
+// Enhanced filtering of original textures: hardware anisotropic sampling over
+// the texture's mips (generated on the GPU when the game supplies none).
+// Not PSP exact; selected with [graphics] texture_filtering = enhanced.
+uint4 sampleEnhanced(float2 st, float2 gx, float2 gy, float2 size) {
+    // Atlases: a draw using a small region of the texture must not blend in
+    // its neighbours through coarse mips. Limit the level so one mip texel
+    // stays within a quarter of the region (axes that tile are unlimited).
+    float2 region = uvRange.zw-uvRange.xy;
+    if(any(region>0)) {
+        float extent = 1e9;
+        if(region.x>0 && region.x<size.x) extent = min(extent,region.x);
+        if(region.y>0 && region.y<size.y) extent = min(extent,region.y);
+        float cap = max(0,floor(log2(max(extent,1)))-2);
+        float lod = log2(max(max(length(gx*size),length(gy*size)),1e-8));
+        if(lod>cap) { float k = exp2(cap-lod); gx*=k; gy*=k; }
+    }
+    bool clampU=(C(0xc7)&1)!=0, clampV=(C(0xc7)&256)!=0;
+    float4 c;
+    if(clampU && clampV) c=textureImage.SampleGrad(anisoClampClamp,st,gx,gy);
+    else if(clampU) c=textureImage.SampleGrad(anisoClampWrap,st,gx,gy);
+    else if(clampV) c=textureImage.SampleGrad(anisoWrapClamp,st,gx,gy);
+    else c=textureImage.SampleGrad(anisoWrapWrap,st,gx,gy);
+    return uint4(saturate(c)*255+0.5);
+}
 uint4 shade(float2 uv, uint4 v, float clipW) {
-    if(feedback.x==2) uv*=render.x;
+    if(feedback.x==2) uv*=rasterScale();
+    // A replacement covers the first replace.z rows of the GE texture.
+    float2 st = uv/float2(max(replace.yz,1)), stdx = ddx(st), stdy = ddy(st);
+    uint baseW,baseH,baseLevels; textureImage.GetDimensions(0,baseW,baseH,baseLevels);
+    float2 st0 = uv/float2(max(baseW,1),max(baseH,1)), st0dx = ddx(st0), st0dy = ddy(st0);
     uint lodMode = C(0xc8)&3;
     float footprint = max(max(abs(ddx(uv.x)),abs(ddy(uv.x))),max(abs(ddx(uv.y)),abs(ddy(uv.y))));
     float delta = lodMode==0 ? footprint : lodMode==2 ? 2*clipW*asfloat(C(0xd0)<<8) : 1;
@@ -163,8 +225,23 @@ uint4 shade(float2 uv, uint4 v, float clipW) {
     uint lod = uint(clamp(detail,0,int(maxLevel*16)));
     bool linearMip = (C(0xc6)&2)!=0;
     uint level = linearMip ? lod>>4 : min(maxLevel,(lod+8)>>4);
-    uint4 t = sampleLevel(uv,level,filterLinear);
-    if(linearMip && level<maxLevel) t = (t*(16-(lod&15))+sampleLevel(uv,level+1,filterLinear)*(lod&15))>>4;
+    // replace.w: bit0 the pack image has no alpha (use the game's), bit1 the
+    // game's texture is opaque (the original need not be sampled at all).
+    bool needOriginal = replace.x==0 || (replace.w&1)!=0 || (replace.w&2)==0;
+    uint4 t = uint4(255,255,255,255);
+    if(needOriginal) {
+        if((render.w&1)!=0 && feedback.x==0 && filterLinear) t = sampleEnhanced(st0,st0dx,st0dy,float2(baseW,baseH));
+        else {
+            t = sampleLevel(uv,level,filterLinear);
+            if(linearMip && level<maxLevel) t = (t*(16-(lod&15))+sampleLevel(uv,level+1,filterLinear)*(lod&15))>>4;
+        }
+    }
+    if(replace.x) {
+        // Colour from the pack; alpha follows the game, which rewrites palette
+        // alpha at runtime (fades, generated alpha).
+        uint4 r = sampleReplacement(st,stdx,stdy,filterLinear);
+        t = uint4(r.rgb, (replace.w&1) ? t.a : min(r.a,t.a));
+    }
     bool alpha = (C(0xc9)&256)!=0;
     uint scale = (C(0xc9)&65536)!=0 ? 2 : 1;
     uint a = alpha ? t.a*(v.a+1)/256 : v.a;
@@ -233,21 +310,23 @@ RWStructuredBuffer<uint> computeOutput : register(u2);
 // happen on the GPU; high-resolution surfaces survive guest readback.
 [numthreads(8,8,1)]
 void ExpandCS(uint3 id : SV_DispatchThreadID) {
-    uint2 extent=surface.xy*render.x;
+    uint2 extent=uint2(rasterExtent(surface.x),rasterExtent(surface.y));
     if(any(id.xy>=extent)) return;
-    uint2 p=id.xy/render.x;
+    uint2 p=uint2(nativeOf(id.x),nativeOf(id.y));
     computeOutput[id.y*surface.z+id.x]=presentColor[p.y*surface.x+p.x];
 }
 [numthreads(8,8,1)]
 void ResolveCS(uint3 id : SV_DispatchThreadID) {
     if(any(id.xy>=surface.xy)) return;
-    uint2 base=id.xy*render.x;
-    uint center=presentColor[(base.y+render.x/2)*surface.z+base.x+render.x/2];
+    // The raster pixels whose centres lie inside this native pixel.
+    uint2 base=uint2(rasterExtent(id.x),rasterExtent(id.y));
+    uint2 size=uint2(rasterExtent(id.x+1),rasterExtent(id.y+1))-base;
+    uint center=presentColor[(base.y+size.y/2)*surface.z+base.x+size.x/2];
     if(mode.x==4) { computeOutput[id.y*surface.x+id.x]=center; return; }
     uint4 total=0;
-    for(uint y=0;y<render.x;++y) for(uint x=0;x<render.x;++x)
+    for(uint y=0;y<size.y;++y) for(uint x=0;x<size.x;++x)
         total+=bytes(unpackFrame(presentColor[(base.y+y)*surface.z+base.x+x]));
-    uint samples=render.x*render.x;
+    uint samples=size.x*size.y;
     uint4 c=(total+samples/2)/samples;
     c.a=bytes(unpackFrame(center)).a; // stencil is never averaged
     computeOutput[id.y*surface.x+id.x]=packFrame(pack(c));
@@ -255,7 +334,21 @@ void ResolveCS(uint3 id : SV_DispatchThreadID) {
 float3 outputPixel(int2 p) {
     uint2 extent=surface.xy*render.y;
     p=clamp(p,0,int2(extent)-1);
-    uint ratio=render.x/render.y;
+    if(render.z==3) {
+        // SSAA2x: 1.5 raster pixels per output pixel; each output pixel
+        // area-weights the raster samples it overlaps.
+        float r=rasterScale()/float(render.y);
+        float2 lo=float2(p)*r, hi=lo+r;
+        int2 first=int2(floor(lo));
+        int2 last=min(int2(ceil(hi))-1,int2(surface.z,rasterExtent(surface.y))-1);
+        float3 sum=0; float weight=0;
+        for(int y=first.y;y<=last.y;++y) for(int x=first.x;x<=last.x;++x) {
+            float w=(min(hi.x,x+1)-max(lo.x,x))*(min(hi.y,y+1)-max(lo.y,y));
+            sum+=w*channels(unpackFrame(presentColor[y*surface.z+x])).rgb; weight+=w;
+        }
+        return sum/(255.0*max(weight,1e-6));
+    }
+    uint ratio=render.x/(2*render.y);
     uint2 base=uint2(p)*ratio;
     if(render.z==2) {
         float3 sum=0;
@@ -303,4 +396,78 @@ PresentVarying PresentVS(uint id : SV_VertexID) {
 float4 PresentPS(PresentVarying i) : SV_Target {
     return float4(displayShade(i.uv),1);
 }
-)HLSL";
+
+// GPU texture decoding. presentColor holds the raw PSP texture bytes of one
+// level, commands[] the 1024 palette bytes. surface = {width, height, output
+// pitch in texels, stride (TBW) in texels}; mode = {format, swizzled, CLUT
+// mode (0xC5), level}; feedback.x = texture mode (0xC2). Bit-exact with the
+// CPU read_texel path.
+uint rawByte(uint off) { return (presentColor[off>>2] >> ((off&3)*8)) & 255; }
+uint rawHalf(uint off) { return rawByte(off) | (rawByte(off+1)<<8); }
+uint rawWord(uint off) { return rawHalf(off) | (rawHalf(off+2)<<16); }
+uint swizzledOffset(uint byteX, uint y, uint rowBytes) {
+    return ((y>>3)*((rowBytes+15)>>4) + (byteX>>4))*128 + (y&7)*16 + (byteX&15);
+}
+uint decodePacked(uint packed, uint type) {
+    if(type==4) { uint r=packed&31, g=(packed>>5)&63, b=(packed>>11)&31;
+        return 0xFF000000u | ((b<<3|b>>2)<<16) | ((g<<2|g>>4)<<8) | (r<<3|r>>2); }
+    if(type==5) { uint r=packed&31, g=(packed>>5)&31, b=(packed>>10)&31, a=(packed>>15)!=0 ? 255 : 0;
+        return (a<<24) | ((b<<3|b>>2)<<16) | ((g<<3|g>>2)<<8) | (r<<3|r>>2); }
+    if(type==6) { uint r=packed&15, g=(packed>>4)&15, b=(packed>>8)&15, a=(packed>>12)&15;
+        return ((a*17)<<24) | ((b*17)<<16) | ((g*17)<<8) | (r*17); }
+    return packed;
+}
+uint clutEntry(uint index) {
+    uint data=mode.z, format=data&3, shift=(data>>2)&31, mask=(data>>8)&255, start=((data>>16)&31)<<4;
+    uint wrapMask = format==3 ? 255 : 511;
+    uint wrapped = (((index>>shift)&mask) | (start&wrapMask)) & wrapMask;
+    uint entryBytes = format==3 ? 4 : 2;
+    uint mipOffset = (mode.x==4 && (feedback.x&0x100)!=0) ? mode.w*16 : 0;
+    uint off = ((wrapped+mipOffset)&wrapMask)*entryBytes;
+    // Entries never straddle a 32-bit word (16-bit entries are 2-aligned).
+    uint word = C(off>>2);
+    uint packed = entryBytes==4 ? word : (word >> ((off&2)*8)) & 0xFFFF;
+    return decodePacked(packed, format+4);
+}
+[numthreads(8,8,1)]
+void DecodeCS(uint3 id : SV_DispatchThreadID) {
+    if(any(id.xy>=surface.xy)) return;
+    uint x=id.x, y=id.y, stride=surface.w, format=mode.x;
+    bool swizzled=mode.y!=0;
+    uint texel=0xFFFFFFFFu;
+    if(format<=2) {
+        uint rowBytes=stride*2, off=swizzled ? swizzledOffset(x*2,y,rowBytes) : y*rowBytes+x*2;
+        texel=decodePacked(rawHalf(off),format+4);
+    } else if(format==3) {
+        uint rowBytes=stride*4, off=swizzled ? swizzledOffset(x*4,y,rowBytes) : y*rowBytes+x*4;
+        texel=rawWord(off);
+    } else if(format==4) {
+        uint rowBytes=(stride+1)/2, off=swizzled ? swizzledOffset(x>>1,y,rowBytes) : y*rowBytes+(x>>1);
+        uint packed=rawByte(off);
+        texel=clutEntry((x&1)!=0 ? packed>>4 : packed&15);
+    } else if(format==5) {
+        uint off=swizzled ? swizzledOffset(x,y,stride) : y*stride+x;
+        texel=clutEntry(rawByte(off));
+    } else if(format==6) {
+        uint rowBytes=stride*2, off=swizzled ? swizzledOffset(x*2,y,rowBytes) : y*rowBytes+x*2;
+        texel=clutEntry(rawHalf(off));
+    } else if(format==7) {
+        uint rowBytes=stride*4, off=swizzled ? swizzledOffset(x*4,y,rowBytes) : y*rowBytes+x*4;
+        texel=clutEntry(rawWord(off));
+    }
+    computeOutput[y*surface.z+x]=texel;
+}
+// Next mip level, alpha-weighted 2x2 box (same as texture packs). surface =
+// {width, height, output pitch, source pitch}; mode.xy = source size.
+[numthreads(8,8,1)]
+void MipCS(uint3 id : SV_DispatchThreadID) {
+    if(any(id.xy>=surface.xy)) return;
+    uint alpha=0; uint3 weighted=0, plain=0;
+    for(uint dy=0; dy<2; ++dy) for(uint dx=0; dx<2; ++dx) {
+        uint2 p=min(id.xy*2+uint2(dx,dy), mode.xy-1);
+        uint4 c=bytes(presentColor[p.y*surface.w+p.x]);
+        alpha+=c.a; weighted+=c.rgb*c.a; plain+=c.rgb;
+    }
+    uint3 rgb = alpha ? (weighted+alpha/2)/alpha : (plain+2)/4;
+    computeOutput[id.y*surface.z+id.x]=pack(uint4(rgb,(alpha+2)/4));
+}

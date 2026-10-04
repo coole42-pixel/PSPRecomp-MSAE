@@ -104,25 +104,48 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
                     invalid("must be d3d12, software or auto");
                 config.renderer = choice;
             } else if (key == "antialiasing") {
-                if (choice != "none" && choice != "fxaa" && choice != "ssaa4x")
-                    invalid("must be None, FXAA or SSAA4x");
+                if (choice != "none" && choice != "fxaa" && choice != "ssaa2x" && choice != "ssaa4x")
+                    invalid("must be None, FXAA, SSAA2x or SSAA4x");
                 config.antialiasing = choice;
+            } else if (key == "vsync") config.vsync = boolean();
+            else if (key == "texture_filtering") {
+                if (choice != "psp" && choice != "enhanced") invalid("must be psp or enhanced");
+                config.texture_filtering = choice;
             }
         }
         if (section == "window") {
             if (key == "enabled") config.window = boolean();
             else if (key == "fullscreen") config.fullscreen = boolean();
             else if (key == "scale") config.window_scale = static_cast<std::uint32_t>(number(1u, 8u));
+            else if (key == "fullscreen_mode") {
+                if (choice != "borderless" && choice != "exclusive") invalid("must be borderless or exclusive");
+                config.fullscreen_mode = choice;
+            } else if (key == "fullscreen_refresh")
+                config.fullscreen_refresh = static_cast<std::uint32_t>(number(0u, 500u));
         }
         if (section == "audio" && key == "enabled") config.audio = boolean();
+        if (section == "audio" && key == "api") {
+            if (choice != "wasapi" && choice != "waveout") invalid("must be wasapi or waveout");
+            config.audio_api = choice;
+        }
+        if (section == "textures") {
+            const auto resolve = [&] { return (path.parent_path() / value).lexically_normal(); };
+            if (key == "dump") config.texture_dump = boolean();
+            else if (key == "replace") config.texture_replace = boolean();
+            else if (key == "dump_dir") config.texture_dump_dir = resolve();
+            else if (key == "replace_dir") config.texture_replace_dir = resolve();
+            else if (key == "budget_mb") config.texture_budget_mb = static_cast<std::uint32_t>(number(64u, 65536u));
+        }
         static const std::map<std::string, std::set<std::string>> known{
             {"", {"eboot", "disc_root", "log_file", "trace_imports", "trace_filesystem", "verbose"}},
             {"paths", {"eboot", "disc_root"}},
             {"logging", {"log_file", "trace_imports", "trace_filesystem", "verbose"}},
             {"runtime", {"max_dispatches"}},
-            {"graphics", {"resolution", "renderer", "antialiasing", "fps", "dynamic_fps"}},
-            {"window", {"enabled", "fullscreen", "scale"}},
-            {"audio", {"enabled"}},
+            {"graphics", {"resolution", "renderer", "antialiasing", "fps", "dynamic_fps", "vsync",
+                          "texture_filtering"}},
+            {"window", {"enabled", "fullscreen", "scale", "fullscreen_mode", "fullscreen_refresh"}},
+            {"audio", {"enabled", "api"}},
+            {"textures", {"dump", "replace", "dump_dir", "replace_dir", "budget_mb"}},
             {"debug", {"profile", "trace_controller", "trace_music", "trace_atrac", "trace_display",
                        "d3d12_debug", "pc_sample", "frame_dump", "stop_after_ge", "frame_dump_every",
                        "frame_dump_count", "frame_dump_dir"}},
@@ -178,6 +201,20 @@ void apply_native_config(const NativeConfig &config) {
     set_default("PSPRECOMP_MOTORSTORM_AA", config.antialiasing);
     set_default("PSPRECOMP_MOTORSTORM_FPS", config.fps == 0u ? "original" : std::to_string(config.fps));
     set_default("PSPRECOMP_MOTORSTORM_DYNAMIC_FPS", config.dynamic_fps ? "1" : "0");
+    set_default("PSPRECOMP_MOTORSTORM_VSYNC", config.vsync ? "1" : "0");
+    set_default("PSPRECOMP_MOTORSTORM_TEXTURE_FILTER", config.texture_filtering);
+    set_default("PSPRECOMP_MOTORSTORM_FULLSCREEN_MODE", config.fullscreen_mode);
+    set_default("PSPRECOMP_MOTORSTORM_FULLSCREEN_REFRESH", std::to_string(config.fullscreen_refresh));
+    set_default("PSPRECOMP_MOTORSTORM_AUDIO_API", config.audio_api);
+    const auto folder = config.source.parent_path();
+    const auto dump_dir = config.texture_dump_dir.empty() ? folder / "textures" / "dump" : config.texture_dump_dir;
+    const auto replace_dir =
+        config.texture_replace_dir.empty() ? folder / "textures" / "replace" : config.texture_replace_dir;
+    set_default("PSPRECOMP_MOTORSTORM_TEXTURE_DUMP", config.texture_dump ? "1" : "0");
+    set_default("PSPRECOMP_MOTORSTORM_TEXTURE_REPLACE", config.texture_replace ? "1" : "0");
+    set_default("PSPRECOMP_MOTORSTORM_TEXTURE_DUMP_DIR", dump_dir.lexically_normal().string());
+    set_default("PSPRECOMP_MOTORSTORM_TEXTURE_REPLACE_DIR", replace_dir.lexically_normal().string());
+    set_default("PSPRECOMP_MOTORSTORM_TEXTURE_BUDGET_MB", std::to_string(config.texture_budget_mb));
     set_default("PSPRECOMP_MOTORSTORM_WINDOW", config.window ? "1" : "0");
     set_default("PSPRECOMP_MOTORSTORM_FULLSCREEN", config.fullscreen ? "1" : "0");
     set_default("PSPRECOMP_MOTORSTORM_WINDOW_SCALE", std::to_string(config.window_scale));

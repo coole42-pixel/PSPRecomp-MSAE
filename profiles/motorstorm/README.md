@@ -54,6 +54,8 @@ The launcher selects hardware D3D12 rendering. It requires a D3D12 GPU with rast
 
 `dynamic_fps = true` (the default) drops to the original 30 fps pacing while the PC cannot hold the target, instead of slow motion and audio gaps, and returns to the target when it can. With audio disabled, a wall-clock limiter keeps the game at real speed. See [docs/PERFORMANCE_60FPS.md](docs/PERFORMANCE_60FPS.md) for the presentation and readback changes and measurements.
 
+Texture packs: `tools/extract-textures.ps1` extracts every texture from the disc files (no game run) as `<hash>_<w>x<h>.png`. Upscaled copies (or BC7 DDS from `tools/pack-textures.ps1`) placed in `textures/replace` beside the executable replace them in game, at any resolution, loaded in the background. See [docs/TEXTURE_PACKS.md](docs/TEXTURE_PACKS.md).
+
 The vehicle-selection preview is repaired in both renderers. See [preview fix and resolution validation](docs/PREVIEW_RESOLUTION.md).
 
 The race HUD/camera dropout caused by truncated large GE lists is repaired in both renderers. See [the fix and recorded-drive verification](docs/HUD_CAMERA_FIX.md).

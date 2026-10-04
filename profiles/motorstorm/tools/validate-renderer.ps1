@@ -4,7 +4,7 @@ param(
     [UInt64]$StopAfterGe = 2800,
     [UInt64]$RenderAfterGe = 0,
     [ValidateRange(1,4)][int]$Resolution = 1,
-    [ValidateSet('None','FXAA','SSAA4x')][string]$Antialiasing = 'None',
+    [ValidateSet('None','FXAA','SSAA2x','SSAA4x')][string]$Antialiasing = 'None',
     [string]$InputScript = 'out/motorstorm/phase12/fixes/normal-race-straight-input.txt',
     [string]$SaveRoot = 'out/motorstorm/phase12/fixes/test-stick-v2',
     # Reference captures were recorded at the game's original 30 fps pacing.

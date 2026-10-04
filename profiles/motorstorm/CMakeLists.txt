@@ -85,10 +85,52 @@ set(MOTORSTORM_HOST_SOURCES
     host/motorstorm_window.cpp
     host/motorstorm_audio.cpp
     host/motorstorm_pacing.cpp
+    host/motorstorm_textures.cpp
     host/motorstorm_atrac.cpp
     host/motorstorm_media.cpp
     ../vcs/host/vcs_media_decoder.cpp
 )
+
+# D3D12 shaders are compiled once at build time with the Windows SDK's fxc
+# (a pinned compiler; no D3DCompile and no compile cost at startup). Every
+# entry point becomes motorstorm_shader_<entry>.h with the bytecode array
+# g_motorstorm_<entry>.
+find_program(MOTORSTORM_FXC fxc
+    HINTS "$ENV{WindowsSdkVerBinPath}/x64"
+          "${CMAKE_WINDOWS_KITS_10_DIR}/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
+    PATHS "C:/Program Files (x86)/Windows Kits/10/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64")
+if(NOT MOTORSTORM_FXC)
+    file(GLOB MOTORSTORM_FXC_CANDIDATES "C:/Program Files (x86)/Windows Kits/10/bin/10.*/x64/fxc.exe")
+    list(SORT MOTORSTORM_FXC_CANDIDATES ORDER DESCENDING)
+    list(GET MOTORSTORM_FXC_CANDIDATES 0 MOTORSTORM_FXC)
+endif()
+if(NOT MOTORSTORM_FXC OR NOT EXISTS "${MOTORSTORM_FXC}")
+    message(FATAL_ERROR "fxc.exe (Windows 10/11 SDK) is required to compile the MotorStorm D3D12 shaders. "
+                        "Install the Windows SDK or set MOTORSTORM_FXC.")
+endif()
+set(MOTORSTORM_SHADER_SOURCE "${MOTORSTORM_PROFILE_DIR}/host/motorstorm_gpu.hlsl")
+set(MOTORSTORM_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/motorstorm_shaders")
+set(MOTORSTORM_SHADER_HEADERS)
+foreach(shader IN ITEMS VS:vs_5_1 PS:ps_5_1 PointGS:gs_5_1 PresentVS:vs_5_1 PresentPS:ps_5_1
+                        ExpandCS:cs_5_1 ResolveCS:cs_5_1 CaptureCS:cs_5_1 DecodeCS:cs_5_1 MipCS:cs_5_1)
+    string(REPLACE ":" ";" shader_parts "${shader}")
+    list(GET shader_parts 0 entry)
+    list(GET shader_parts 1 profile)
+    set(header "${MOTORSTORM_SHADER_DIR}/motorstorm_shader_${entry}.h")
+    add_custom_command(OUTPUT "${header}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${MOTORSTORM_SHADER_DIR}"
+        COMMAND "${MOTORSTORM_FXC}" /nologo /O3 /Ges /Qstrip_reflect /Qstrip_debug
+                /E ${entry} /T ${profile} /Vn g_motorstorm_${entry} /Fh "${header}" "${MOTORSTORM_SHADER_SOURCE}"
+        DEPENDS "${MOTORSTORM_SHADER_SOURCE}"
+        COMMENT "fxc ${entry} (${profile})"
+        VERBATIM)
+    list(APPEND MOTORSTORM_SHADER_HEADERS "${header}")
+endforeach()
+add_custom_target(motorstorm_shaders DEPENDS ${MOTORSTORM_SHADER_HEADERS})
+function(motorstorm_use_shaders target)
+    target_include_directories(${target} PRIVATE "${MOTORSTORM_SHADER_DIR}")
+    add_dependencies(${target} motorstorm_shaders)
+endfunction()
 
 file(GLOB MOTORSTORM_MEDIA_DLLS "${MOTORSTORM_PROFILE_DIR}/../vcs/third_party/ffmpeg/bin/*.dll")
 function(motorstorm_target_common target)
@@ -98,7 +140,8 @@ function(motorstorm_target_common target)
     target_include_directories(${target} PRIVATE
         "${MOTORSTORM_PROFILE_DIR}/../vcs/host"
         "${MOTORSTORM_PROFILE_DIR}/../vcs/third_party/ffmpeg/include")
-    target_link_libraries(${target} PRIVATE psprecomp_core winmm avrt d3d12 dxgi d3dcompiler dxguid)
+    target_link_libraries(${target} PRIVATE psprecomp_core winmm avrt d3d12 dxgi dxguid windowscodecs ole32)
+    motorstorm_use_shaders(${target})
     foreach(media_library avcodec avformat avutil swresample swscale)
         target_link_libraries(${target} PRIVATE
             "${MOTORSTORM_PROFILE_DIR}/../vcs/third_party/ffmpeg/lib/${media_library}.lib")
@@ -150,6 +193,18 @@ add_custom_command(TARGET MotorStormNative POST_BUILD
         "$<TARGET_FILE_DIR:MotorStormNative>/MotorStormNativePhase12.exe"
     COMMENT "Staging MotorStormNative.ini and Phase12 executable alias")
 
+# Offline texture extraction from the disc's PAK archives (no game run).
+# It decodes through the runtime GE texel path, so it links the GE/GPU units.
+add_executable(MotorStormTextureExtract
+    tools/texture_extract/motorstorm_texture_extract.cpp
+    host/motorstorm_ge.cpp
+    host/motorstorm_gpu.cpp
+    host/motorstorm_textures.cpp)
+target_include_directories(MotorStormTextureExtract PRIVATE "${MOTORSTORM_PROFILE_DIR}/host")
+target_link_libraries(MotorStormTextureExtract PRIVATE psprecomp_core d3d12 dxgi dxguid windowscodecs ole32)
+motorstorm_use_shaders(MotorStormTextureExtract)
+motorstorm_set_runtime_output(MotorStormTextureExtract)
+
 if(PSPRECOMP_BUILD_PROFILE_TESTS)
     if(NOT PSPRECOMP_BUILD_TESTS)
         enable_testing()
@@ -164,6 +219,7 @@ if(PSPRECOMP_BUILD_PROFILE_TESTS)
         host/motorstorm_window.cpp
         host/motorstorm_audio.cpp
         host/motorstorm_pacing.cpp
+        host/motorstorm_textures.cpp
         host/motorstorm_atrac.cpp
         host/motorstorm_media.cpp
         ../vcs/host/vcs_media_decoder.cpp)
@@ -179,11 +235,18 @@ if(PSPRECOMP_BUILD_PROFILE_TESTS)
         MOTORSTORM_CONFIG_TEMPLATE="${MOTORSTORM_PROFILE_DIR}/config/motorstorm.ini")
     motorstorm_set_runtime_output(motorstorm_config_tests)
     add_test(NAME motorstorm_config_tests COMMAND motorstorm_config_tests)
+    add_executable(motorstorm_texture_tests tests/motorstorm_texture_tests.cpp host/motorstorm_textures.cpp)
+    target_include_directories(motorstorm_texture_tests PRIVATE "${MOTORSTORM_PROFILE_DIR}/host")
+    target_link_libraries(motorstorm_texture_tests PRIVATE windowscodecs ole32)
+    motorstorm_set_runtime_output(motorstorm_texture_tests)
+    add_test(NAME motorstorm_texture_tests COMMAND motorstorm_texture_tests)
 
     add_executable(motorstorm_window_tests tests/motorstorm_window_tests.cpp
-        host/motorstorm_window.cpp host/motorstorm_gpu.cpp host/motorstorm_ge.cpp)
+        host/motorstorm_window.cpp host/motorstorm_gpu.cpp host/motorstorm_ge.cpp host/motorstorm_textures.cpp)
     target_include_directories(motorstorm_window_tests PRIVATE "${MOTORSTORM_PROFILE_DIR}/host")
-    target_link_libraries(motorstorm_window_tests PRIVATE psprecomp_core d3d12 dxgi d3dcompiler dxguid user32 gdi32)
+    target_link_libraries(motorstorm_window_tests PRIVATE psprecomp_core d3d12 dxgi dxguid user32 gdi32
+        windowscodecs ole32)
+    motorstorm_use_shaders(motorstorm_window_tests)
     motorstorm_set_runtime_output(motorstorm_window_tests)
     option(PSPRECOMP_MOTORSTORM_WINDOW_TESTS "Register tests requiring a Windows desktop" OFF)
     if(PSPRECOMP_MOTORSTORM_WINDOW_TESTS)
@@ -191,9 +254,10 @@ if(PSPRECOMP_BUILD_PROFILE_TESTS)
         set_tests_properties(motorstorm_window_tests PROPERTIES TIMEOUT 20)
     endif()
     add_executable(motorstorm_gpu_tests tests/motorstorm_gpu_tests.cpp
-        host/motorstorm_ge.cpp host/motorstorm_gpu.cpp)
+        host/motorstorm_ge.cpp host/motorstorm_gpu.cpp host/motorstorm_textures.cpp)
     target_include_directories(motorstorm_gpu_tests PRIVATE "${MOTORSTORM_PROFILE_DIR}/host")
-    target_link_libraries(motorstorm_gpu_tests PRIVATE psprecomp_core d3d12 dxgi d3dcompiler dxguid)
+    target_link_libraries(motorstorm_gpu_tests PRIVATE psprecomp_core d3d12 dxgi dxguid windowscodecs ole32)
+    motorstorm_use_shaders(motorstorm_gpu_tests)
     motorstorm_set_runtime_output(motorstorm_gpu_tests)
     # Hardware tests are explicit: portable CI may have no D3D12/ROV adapter.
     option(PSPRECOMP_MOTORSTORM_GPU_TESTS "Register tests requiring a hardware D3D12 ROV adapter" OFF)

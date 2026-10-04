@@ -1,3 +1,4 @@
+#include "motorstorm_textures.hpp"
 #include "motorstorm_ge.hpp"
 #include "motorstorm_gpu.hpp"
 #include "motorstorm_perf.hpp"
@@ -5,6 +6,7 @@
 #include "psprecomp/common.hpp"
 
 #include <algorithm>
+#include <mutex>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -132,6 +134,75 @@ bool g_pixel_diagnostics{};
 std::unordered_map<std::uint64_t, GpuTexture> g_gpu_textures;
 std::unordered_map<std::uint64_t, std::uint64_t> g_list_texture_keys;
 std::uint64_t g_gpu_texture_bytes{};
+// Least-recently-used clock for g_gpu_textures (advances once per GE list).
+std::uint64_t g_texture_clock{};
+// Content changes per texture state (address/format/size): an address whose
+// content keeps changing (video frames) becomes a streaming texture.
+struct TextureStream { std::uint64_t content{}, last_change{}; std::uint32_t changes{}; };
+std::unordered_map<std::uint64_t, TextureStream> g_texture_streams;
+std::uint64_t texture_cache_bytes(const GpuTexture &texture) {
+    std::uint64_t bytes = 0;
+    for (const auto &level : texture.levels) bytes += level.size() * 4u;
+    for (const auto &level : texture.raw) bytes += level.bytes.size();
+    return bytes;
+}
+// GPU decoding of raw texture data (DecodeCS); the CPU path stays available
+// for diagnosis with PSPRECOMP_MOTORSTORM_CPU_TEXTURE_DECODE=1.
+std::uint32_t swizzled_offset(std::uint32_t byte_x, std::uint32_t y, std::uint32_t row_bytes) noexcept;
+// One past the furthest byte read_texel touches for a level (texels may read
+// beyond `bytes` when the texture is wider than its buffer stride).
+std::uint32_t texel_extent(std::uint32_t format, std::uint32_t width, std::uint32_t height,
+                           std::uint32_t stride, bool swizzled) {
+    const std::uint32_t texel_bytes = format == 3u || format == 7u ? 4u : format == 4u || format == 5u ? 1u : 2u;
+    const std::uint32_t row_bytes = format == 4u ? (stride + 1u) / 2u : stride * texel_bytes;
+    const std::uint32_t byte_x = format == 4u ? (width - 1u) >> 1u : (width - 1u) * texel_bytes;
+    const std::uint32_t last = swizzled ? swizzled_offset(byte_x, height - 1u, row_bytes)
+                                        : (height - 1u) * row_bytes + byte_x;
+    return last + texel_bytes;
+}
+// Texture-pack identities of GPU-decoded textures by cache key (results
+// survive cache eviction) and the dump details of requests in flight.
+std::unordered_map<std::uint64_t, textures::Identified> g_identified;
+std::unordered_map<std::uint64_t, textures::DumpInfo> g_identify_info;
+void apply_identity(GpuTexture &texture, const textures::Identified &identity) {
+    texture.identify=false;
+    texture.content_hash=identity.content_hash;
+    if(identity.match) {
+        texture.replacement_hash=identity.match->hash;
+        texture.replacement_rows=identity.match->rows;
+        texture.replacement_width=identity.match->cover_width;
+        texture.opaque=identity.opaque;
+    }
+}
+// Once per GE list: hand finished GPU readbacks to the hashing worker and
+// apply finished identities to the cached textures.
+void exchange_identities() {
+    if(!textures::active()) return;
+    for(auto &decoded:gpu_take_decoded()) {
+        const auto info=g_identify_info.find(decoded.key);
+        if(info==g_identify_info.end()) continue;
+        if(decoded.rgba.empty()) {
+            // Readback ring full: decode this one on the CPU instead.
+            const auto texture=g_gpu_textures.find(decoded.key);
+            if(texture==g_gpu_textures.end() || texture->second.raw.empty()) { g_identify_info.erase(info); continue; }
+            decoded.width=texture->second.width;
+            decoded.height=texture->second.height;
+            decoded.rgba=ge_decode_raw_level(texture->second,0u);
+        }
+        textures::identify_async(decoded.key,decoded.width,decoded.height,std::move(decoded.rgba),info->second);
+        g_identify_info.erase(info);
+    }
+    for(const auto &identity:textures::take_identified()) {
+        if(g_identified.size()>65536) g_identified.clear();
+        g_identified[identity.key]=identity;
+        if(const auto texture=g_gpu_textures.find(identity.key);texture!=g_gpu_textures.end())
+            apply_identity(texture->second,identity);
+    }
+}
+bool gpu_texture_decode() {
+    static const bool enabled = std::getenv("PSPRECOMP_MOTORSTORM_CPU_TEXTURE_DECODE") == nullptr;
+    return enabled;
+}
 std::uint64_t g_list_texture_epoch{};
 
 std::uint32_t unpack_vertex_color(const GuestMemory &memory, std::uint32_t address, std::uint32_t type);
@@ -1595,7 +1666,7 @@ const GpuTexture *gpu_texture(GuestMemory &memory) {
         g_state.texture_format,g_state.texture_mode,g_state.texture_size,g_state.texture_clut_format};
     state_key = hash_bytes(state_key,values.data(),sizeof(values));
     state_key = hash_bytes(state_key,&g_state.clut_hash,sizeof(g_state.clut_hash));
-    struct Level { std::uint32_t address,bytes,width,height; };
+    struct Level { std::uint32_t address,bytes,width,height,stride; };
     std::array<Level,8> levels{};
     for (std::uint32_t mip=0;mip<=max_level;++mip) {
         const auto size=mip ? g_state.commands[0xB8u+mip] : g_state.texture_size;
@@ -1607,14 +1678,18 @@ const GpuTexture *gpu_texture(GuestMemory &memory) {
             g_state.texture_format==3 || g_state.texture_format==7 ? 32u : 16u;
         const auto row_bytes=(stride*bpp+7)/8;
         const auto bytes=(g_state.texture_mode&1) ? ((height+7)&~7u)*std::max(16u,(row_bytes+15)&~15u) : height*row_bytes;
-        levels[mip]={address,bytes,width,height};
+        levels[mip]={address,bytes,width,height,stride};
         state_key=hash_bytes(state_key,&levels[mip],sizeof(Level));
         gpu_sync_texture(memory,address,bytes);
         if(g_list_texture_epoch!=gpu_memory_epoch()) {
             g_list_texture_keys.clear(); g_list_texture_epoch=gpu_memory_epoch();
         }
     }
-    if(auto found=g_list_texture_keys.find(state_key);found!=g_list_texture_keys.end()) return &g_gpu_textures.at(found->second);
+    if(auto found=g_list_texture_keys.find(state_key);found!=g_list_texture_keys.end()) {
+        auto &cached=g_gpu_textures.at(found->second);
+        cached.last_use=g_texture_clock;
+        return &cached;
+    }
     auto content_key=state_key;
     // Hash in L1-friendly chunks so no per-texture heap copy is needed; only
     // the content key consumes the bytes, the decoder reads guest memory again.
@@ -1631,20 +1706,86 @@ const GpuTexture *gpu_texture(GuestMemory &memory) {
             offset+=count;
         }
     }
-    if(!g_gpu_textures.contains(content_key)) {
-        GpuTexture texture; texture.key=content_key; texture.width=levels[0].width; texture.height=levels[0].height;
-        for(std::uint32_t mip=0;mip<=max_level;++mip) {
+    // Video frames rewrite the same texture every frame: after a few content
+    // changes in consecutive lists the texture streams into a single cache
+    // entry and GPU texture instead of creating new ones (and skips pack
+    // matching). Slots the game merely reuses for other textures over time
+    // (track streaming) change rarely and keep normal, matchable textures.
+    if(g_texture_streams.size()>8192) g_texture_streams.clear();
+    auto &stream=g_texture_streams[state_key];
+    if(stream.content!=content_key) {
+        const auto list=g_summary.lists_executed;
+        stream.changes=stream.content!=0u && list-stream.last_change<=4u ? stream.changes+1u : 0u;
+        stream.last_change=list;
+        stream.content=content_key;
+    }
+    const bool streaming=stream.changes>=3u && gpu_texture_decode();
+    const auto cache_key=streaming ? (state_key ^ 0x53545245414D0000ull) : content_key;
+    auto found=g_gpu_textures.find(cache_key);
+    if(found==g_gpu_textures.end() || (streaming && found->second.generation!=content_key)) {
+        GpuTexture texture; texture.key=cache_key; texture.width=levels[0].width; texture.height=levels[0].height;
+        texture.streaming=streaming; texture.generation=content_key;
+        texture.format=g_state.texture_format; texture.clut_mode=g_state.texture_clut_format;
+        texture.texture_mode=g_state.texture_mode;
+        std::memcpy(texture.clut.data(),g_state.clut.data(),g_state.clut.size());
+        bool raw_ok=gpu_texture_decode();
+        for(std::uint32_t mip=0;mip<=max_level && raw_ok;++mip) {
             const auto &level=levels[mip];
             if(level.width!=std::max(1u,texture.width>>mip) || level.height!=std::max(1u,texture.height>>mip)) break;
-            auto &pixels=texture.levels.emplace_back(static_cast<std::size_t>(level.width)*level.height);
-            for(std::uint32_t y=0;y<level.height;++y) for(std::uint32_t x=0;x<level.width;++x)
-                pixels[y*level.width+x]=read_texel(memory,x,y,0xFFFFFFFFu,mip);
+            const auto extent=std::max(level.bytes,texel_extent(texture.format,level.width,level.height,level.stride,
+                                                                  (texture.texture_mode&1u)!=0u));
+            if(texture.format>7u || !memory.contains(level.address,extent)) { raw_ok=false; break; }
+            auto &raw=texture.raw.emplace_back();
+            raw.width=level.width; raw.height=level.height; raw.stride=level.stride;
+            raw.bytes.resize(extent);
+            memory.copy_out(level.address,raw.bytes);
         }
-        g_gpu_textures.emplace(content_key,std::move(texture));
-        for(const auto &level:g_gpu_textures.at(content_key).levels) g_gpu_texture_bytes+=level.size()*4;
+        if(!raw_ok) {
+            // CPU path: decoded RGBA levels.
+            texture.raw.clear();
+            for(std::uint32_t mip=0;mip<=max_level;++mip) {
+                const auto &level=levels[mip];
+                if(level.width!=std::max(1u,texture.width>>mip) || level.height!=std::max(1u,texture.height>>mip)) break;
+                auto &pixels=texture.levels.emplace_back(static_cast<std::size_t>(level.width)*level.height);
+                for(std::uint32_t y=0;y<level.height;++y) for(std::uint32_t x=0;x<level.width;++x)
+                    pixels[y*level.width+x]=read_texel(memory,x,y,0xFFFFFFFFu,mip);
+            }
+        }
+        // Texture packs: identify the decoded artwork, independent of guest
+        // address, swizzling and palette layout. Only on a decode-cache miss.
+        // GPU-decoded textures are read back and hashed on a worker thread
+        // (apply_identified); the replacement appears a frame or two later.
+        const textures::DumpInfo dump_info{g_state.texture_format,g_state.texture_clut_format,max_level+1u,
+                                           (g_state.texture_mode&1u)!=0u,g_summary.lists_executed};
+        if(!streaming && textures::active() && texture.levels.empty()) {
+            if(const auto known=g_identified.find(cache_key);known!=g_identified.end())
+                apply_identity(texture,known->second);
+            else {
+                texture.identify=true;
+                g_identify_info[cache_key]=dump_info;
+            }
+        } else if(!streaming && textures::active()) {
+            const auto &base=texture.levels[0];
+            texture.content_hash=textures::content_hash(texture.width,texture.height,base);
+            if(const auto match=textures::match_replacement(texture.width,texture.height,base)) {
+                texture.replacement_hash=match->hash;
+                texture.replacement_rows=match->rows;
+                texture.replacement_width=match->cover_width;
+                texture.opaque=std::all_of(base.begin(),base.end(),[](std::uint32_t c) { return (c>>24u)==255u; });
+            }
+            if(textures::dumping())
+                textures::dump(texture.content_hash,texture.width,texture.height,base,dump_info);
+        }
+        if(found!=g_gpu_textures.end()) {
+            g_gpu_texture_bytes-=std::min(g_gpu_texture_bytes,texture_cache_bytes(found->second));
+            g_gpu_textures.erase(found);
+        }
+        g_gpu_texture_bytes+=texture_cache_bytes(texture);
+        found=g_gpu_textures.emplace(cache_key,std::move(texture)).first;
     }
-    g_list_texture_keys[state_key]=content_key;
-    return &g_gpu_textures.at(content_key);
+    found->second.last_use=g_texture_clock;
+    g_list_texture_keys[state_key]=cache_key;
+    return &found->second;
 }
 
 void submit_gpu_primitive(GuestMemory &memory, std::uint32_t type, const std::vector<Vertex> &vertices) {
@@ -2321,7 +2462,8 @@ void execute_list(GuestMemory &memory, std::uint32_t address, std::uint32_t stal
 
 void reset_software_ge() noexcept {
     gpu_shutdown(true);
-    g_gpu_textures.clear(); g_list_texture_keys.clear();
+    g_gpu_textures.clear(); g_list_texture_keys.clear(); g_texture_streams.clear();
+    g_identified.clear(); g_identify_info.clear();
     g_gpu_texture_bytes=0;
     g_state = GeState{};
     g_summary = GeSummary{};
@@ -2333,13 +2475,111 @@ std::uint32_t software_ge_framebuffer() noexcept { return g_state.framebuffer; }
 std::uint32_t software_ge_framebuffer_stride() noexcept { return g_state.framebuffer_stride; }
 std::uint32_t software_ge_framebuffer_format() noexcept { return g_state.framebuffer_format; }
 
+std::vector<std::uint32_t> ge_decode_raw_level(const GpuTexture &texture, std::size_t level) {
+    std::vector<std::uint32_t> texels;
+    if (level >= texture.raw.size()) return texels;
+    const auto &raw = texture.raw[level];
+    const std::uint8_t *bytes = raw.bytes.data();
+    const std::size_t size = raw.bytes.size();
+    const std::uint32_t format = texture.format, stride = raw.stride;
+    const bool swizzled = (texture.texture_mode & 1u) != 0u;
+    texels.assign(static_cast<std::size_t>(raw.width) * raw.height, 0xFFFFFFFFu);
+    // Palette resolved once: every index maps through the CLUT mode exactly
+    // as unpack_clut_entry does (shift, mask, start, wrap, multi-CLUT mips).
+    std::array<std::uint32_t, 256> palette{};
+    const std::uint32_t data = texture.clut_mode, clut_format = data & 3u, shift = (data >> 2u) & 0x1Fu,
+                        mask = (data >> 8u) & 0xFFu, start = ((data >> 16u) & 0x1Fu) << 4u;
+    const std::uint32_t wrap_mask = clut_format == 3u ? 0xFFu : 0x1FFu, entry_bytes = clut_format == 3u ? 4u : 2u;
+    const std::uint32_t mip_offset =
+        format == 4u && (texture.texture_mode & 0x100u) != 0u ? static_cast<std::uint32_t>(level) * 16u : 0u;
+    const auto *clut = reinterpret_cast<const std::uint8_t *>(texture.clut.data());
+    const auto entry = [&](std::uint32_t index) {
+        const std::uint32_t wrapped = (((index >> shift) & mask) | (start & wrap_mask)) & wrap_mask;
+        const std::uint32_t offset = ((wrapped + mip_offset) & wrap_mask) * entry_bytes;
+        std::uint32_t packed = 0u;
+        for (std::uint32_t i = 0u; i < entry_bytes; ++i) packed |= static_cast<std::uint32_t>(clut[offset + i]) << (i * 8u);
+        return decode_packed_color(packed, clut_format + 4u);
+    };
+    // Indices of 8 bits or less (CLUT4/CLUT8) use the precomputed table.
+    if (format == 4u || format == 5u)
+        for (std::uint32_t i = 0u; i < 256u; ++i) palette[i] = entry(i);
+    const std::uint32_t texel_bytes = format == 3u || format == 7u ? 4u : format == 4u || format == 5u ? 1u : 2u;
+    const std::uint32_t row_bytes = format == 4u ? (stride + 1u) / 2u : stride * texel_bytes;
+    for (std::uint32_t y = 0u; y < raw.height; ++y) {
+        auto *out = texels.data() + static_cast<std::size_t>(y) * raw.width;
+        for (std::uint32_t x = 0u; x < raw.width; ++x) {
+            const std::uint32_t byte_x = format == 4u ? x >> 1u : x * texel_bytes;
+            const std::uint32_t offset = swizzled ? swizzled_offset(byte_x, y, row_bytes) : y * row_bytes + byte_x;
+            if (offset + texel_bytes > size) continue;  // read_texel's out-of-memory fallback
+            std::uint32_t value = 0u;
+            std::memcpy(&value, bytes + offset, texel_bytes);
+            switch (format) {
+            case 0u: case 1u: case 2u: out[x] = decode_packed_color(value, format + 4u); break;
+            case 3u: out[x] = value; break;
+            case 4u: out[x] = palette[(x & 1u) != 0u ? value >> 4u : value & 0xFu]; break;
+            case 5u: out[x] = palette[value]; break;
+            default: out[x] = entry(value); break;
+            }
+        }
+    }
+    return texels;
+}
+
+std::vector<std::uint32_t> ge_decode_texture(const GeTextureSource &source, std::uint32_t rows) {
+    // read_texel works on GE state and guest memory; give it a private copy of
+    // both so extraction never disturbs (or depends on) a running game.
+    static std::mutex decode_mutex;
+    std::lock_guard lock(decode_mutex);
+    static GuestMemory scratch(32u * 1024u * 1024u);
+    constexpr std::uint32_t kBase = 0x08800000u;
+    const auto width = 1u << source.width_log2;
+    std::vector<std::uint32_t> texels;
+    if (source.width_log2 > 10u || source.height_log2 > 10u || rows > (1u << source.height_log2))
+        return texels;
+    const std::size_t capacity = scratch.bytes().size() - 0x00800000u;
+    const auto bytes = std::min<std::size_t>(source.bytes.size(), capacity - 4096u);
+    scratch.zero(kBase, bytes + 4096u);  // reads past the source see zeros, never a previous texture
+    scratch.copy_in(kBase, source.bytes.first(bytes));
+    const GeState saved = g_state;
+    g_state = GeState{};
+    g_state.texture_size = source.width_log2 | (source.height_log2 << 8u);
+    g_state.texture_format = source.format;
+    g_state.texture_mode = source.swizzled ? 1u : 0u;
+    g_state.texture_address = kBase;
+    g_state.texture_stride = std::max(1u, source.stride);
+    g_state.texture_clut_format = source.clut_mode;
+    std::copy_n(source.clut.begin(), std::min<std::size_t>(source.clut.size(), g_state.clut.size()), g_state.clut.begin());
+    texels.resize(static_cast<std::size_t>(width) * rows);
+    for (std::uint32_t y = 0; y < rows; ++y)
+        for (std::uint32_t x = 0; x < width; ++x)
+            texels[static_cast<std::size_t>(y) * width + x] =
+                read_texel(scratch, static_cast<std::int32_t>(x), static_cast<std::int32_t>(y), 0xFFFFFFFFu, 0u);
+    g_state = saved;
+    return texels;
+}
+
 std::vector<GeInterrupt> software_ge_execute_list(GuestMemory &memory, std::uint32_t address,
                                                   std::uint32_t stall, bool rasterize,
                                                   std::uint64_t submission) {
     ++g_summary.lists_executed;
     if(rasterize) { gpu_initialize(); gpu_settle(memory); }
     g_list_texture_keys.clear();
-    if(g_gpu_textures.size()>4096 || g_gpu_texture_bytes>256ull*1024*1024) { g_gpu_textures.clear(); g_gpu_texture_bytes=0; }
+    // Least-recently-used eviction (previously the whole cache was cleared,
+    // forcing every texture in the next frames to be rebuilt at once).
+    ++g_texture_clock;
+    exchange_identities();
+    if(g_gpu_textures.size()>4096 || g_gpu_texture_bytes>256ull*1024*1024) {
+        std::vector<std::pair<std::uint64_t,std::uint64_t>> oldest;
+        oldest.reserve(g_gpu_textures.size());
+        for(const auto &[key,texture]:g_gpu_textures) oldest.emplace_back(texture.last_use,key);
+        std::sort(oldest.begin(),oldest.end());
+        for(const auto &[last_use,key]:oldest) {
+            if(g_gpu_textures.size()<=3072 && g_gpu_texture_bytes<=192ull*1024*1024) break;
+            const auto victim=g_gpu_textures.find(key);
+            g_gpu_texture_bytes-=std::min(g_gpu_texture_bytes,texture_cache_bytes(victim->second));
+            g_gpu_textures.erase(victim);
+        }
+    }
     std::vector<GeInterrupt> interrupts;
     execute_list(memory, address, stall, rasterize, interrupts, submission);
     gpu_end_list(memory);

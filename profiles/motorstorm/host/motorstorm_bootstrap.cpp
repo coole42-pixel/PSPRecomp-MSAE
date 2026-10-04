@@ -3,6 +3,7 @@
 #include "motorstorm_hle.hpp"
 #include "motorstorm_media.hpp"
 #include "motorstorm_perf.hpp"
+#include "motorstorm_textures.hpp"
 
 #include "psprecomp/common.hpp"
 #include "psprecomp/elf32.hpp"
@@ -203,6 +204,7 @@ int run(const BootstrapPaths &paths) {
     // frame's guest CPU work. PSPRECOMP_MOTORSTORM_GPU_SYNC_READBACK=1 restores
     // the strict per-list wait for diagnosing a guest that reads VRAM directly.
     gpu_set_deferred_readback(std::getenv("PSPRECOMP_MOTORSTORM_GPU_SYNC_READBACK") == nullptr);
+    textures::configure_from_environment();
     log_line("CONFIG", "ini=\"" + paths.config.source.string() + "\" " +
              (paths.config.loaded ? "loaded" : "using built-in defaults"));
     log_line("CONFIG", std::string("renderer=") + std::getenv("PSPRECOMP_MOTORSTORM_RENDERER") +

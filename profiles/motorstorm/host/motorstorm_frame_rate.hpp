@@ -50,16 +50,30 @@ constexpr std::uint32_t kMinUnlockedFps = 30u, kMaxUnlockedFps = 240u;
 class FrameRateGovernor {
 public:
     enum class Decision { Keep, Fallback, Restore };
-    // One sample per ~second of wall time. idle_s is time the host spent
+    // One sample per ~0.5 s of wall time. idle_s is time the host spent
     // blocked on audio backpressure or the limiter (it had nothing to do).
-    // target_scale = target fps / fallback fps.
-    Decision update(double wall_s, double guest_s, double idle_s, bool at_target, double target_scale) {
+    // target_scale = target fps / fallback fps. disturbed: the sample saw
+    // loading work (texture uploads, pack decodes) that says nothing about
+    // steady-state speed; it and a short quiet period after it are ignored.
+    Decision update(double wall_s, double guest_s, double idle_s, bool at_target, double target_scale,
+                    bool disturbed = false) {
         if (wall_s <= 0.0) return Decision::Keep;
+        since_switch_ += wall_s;
+        if (disturbed) {
+            quiet_ = kQuietSeconds;
+            slow_ = fast_ = 0;
+            return Decision::Keep;
+        }
+        if (quiet_ > 0.0) {
+            quiet_ -= wall_s;
+            return Decision::Keep;
+        }
         const double ratio = guest_s / wall_s;
         double busy = (wall_s - idle_s) / wall_s;
         busy = busy < 0.0 ? 0.0 : (busy > 1.0 ? 1.0 : busy);
-        since_switch_ += wall_s;
         if (at_target) {
+            // A sustained deficit only: kSlowSamples consecutive slow samples
+            // (2 s), so one hitch plus normal load never switches the rate.
             slow_ = ratio < kSlowRatio ? slow_ + 1 : 0;
             if (slow_ < kSlowSamples) return Decision::Keep;
             // Falling back again soon after a restore: wait longer next time.
@@ -67,23 +81,34 @@ public:
             reset();
             return Decision::Fallback;
         }
+        // Mid-play restore only with clear headroom; otherwise the target
+        // returns at the next scene boundary (restore_due).
         const bool headroom = ratio >= kSteadyRatio && busy * target_scale < kRestoreLoad;
         fast_ = since_switch_ >= backoff_ && headroom ? fast_ + 1 : 0;
         if (fast_ < kFastSamples) return Decision::Keep;
+        return restored();
+    }
+    // Scene boundaries and loading screens: restore the target once the
+    // back-off has passed, where a rate change cannot jolt gameplay.
+    [[nodiscard]] bool restore_due() const { return since_switch_ >= backoff_; }
+    Decision restored() {
         reset();
         restored_ = true;
         return Decision::Restore;
     }
+    // Wall time without samples (loading screens) still counts to the back-off.
+    void elapse(double seconds) { since_switch_ += seconds; }
     [[nodiscard]] double backoff_seconds() const { return backoff_; }
 
     static constexpr double kSlowRatio = 0.95, kSteadyRatio = 0.98, kRestoreLoad = 0.85;
-    static constexpr int kSlowSamples = 2, kFastSamples = 3;
+    static constexpr int kSlowSamples = 4, kFastSamples = 6;
+    static constexpr double kSampleSeconds = 0.5, kQuietSeconds = 3.0;
     static constexpr double kBounceSeconds = 20.0, kMaxBackoff = 160.0;
 
 private:
-    void reset() { slow_ = fast_ = 0; since_switch_ = 0.0; }
+    void reset() { slow_ = fast_ = 0; since_switch_ = 0.0; quiet_ = 0.0; }
     int slow_{}, fast_{};
-    double since_switch_{}, backoff_{10.0};
+    double since_switch_{}, backoff_{10.0}, quiet_{};
     bool restored_{};
 };
 

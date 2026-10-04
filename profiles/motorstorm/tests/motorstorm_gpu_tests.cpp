@@ -1,12 +1,21 @@
 #include "motorstorm_ge.hpp"
 #include "motorstorm_gpu.hpp"
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <vector>
+#include <string_view>
 #include <windows.h>
+
+namespace motorstorm {
+void log_line(std::string_view category, std::string_view message) {
+    std::printf("[%.*s] %.*s\n", static_cast<int>(category.size()), category.data(),
+                static_cast<int>(message.size()), message.data());
+}
+}
 
 namespace {
 constexpr std::uint32_t kList = 0x08B00000, kVertices = 0x08B08000, kColor = 0x04000000, kDepth = 0x04100000;
@@ -191,6 +200,56 @@ void feedback(psprecomp::GuestMemory &memory) {
         throw std::runtime_error("GPU framebuffer feedback / transfer coherence failed");
 }
 } // namespace
+// GPU texture decoding (DecodeCS) must match the CPU texel path bit for bit
+// for every format, swizzle mode and palette mode.
+void decode_parity() {
+    if (!motorstorm::gpu_initialize())
+        throw std::runtime_error("GPU decode test needs the D3D12 renderer");
+    std::vector<std::uint8_t> bytes(64 * 1024);
+    std::uint32_t seed = 0x1234567u;
+    for (auto &b : bytes) { seed = seed * 1664525u + 1013904223u; b = static_cast<std::uint8_t>(seed >> 24); }
+    std::array<std::uint32_t, 256> clut{};
+    for (auto &c : clut) { seed = seed * 1664525u + 1013904223u; c = seed; }
+    std::size_t cases = 0;
+    for (std::uint32_t format = 0; format < 8; ++format)
+        for (std::uint32_t swizzled = 0; swizzled < 2; ++swizzled)
+            for (std::uint32_t stride : {64u, 80u})
+                for (std::uint32_t clut_mode : {0xFF03u, 0xFF00u, 0xFF01u, 0xFF02u, 0x0F0403u, 0x3F0C02u, 0x7F0001u}) {
+                    if (format < 4u && clut_mode != 0xFF03u) continue;  // palette mode only matters for CLUT
+                    motorstorm::GeTextureSource source;
+                    source.format = format;
+                    source.width_log2 = 6;
+                    source.height_log2 = 5;
+                    source.stride = stride;
+                    source.swizzled = swizzled != 0u;
+                    source.bytes = bytes;
+                    source.clut = {reinterpret_cast<const std::uint8_t *>(clut.data()), 1024};
+                    source.clut_mode = clut_mode;
+                    const auto expected = motorstorm::ge_decode_texture(source, 32);
+                    motorstorm::GpuTexture texture;
+                    texture.width = 64;
+                    texture.height = 32;
+                    texture.format = format;
+                    texture.clut_mode = clut_mode;
+                    texture.texture_mode = swizzled;
+                    texture.clut = clut;
+                    texture.raw.push_back({64, 32, stride, bytes});
+                    if (motorstorm::ge_decode_raw_level(texture, 0) != expected)
+                        throw std::runtime_error("Fast CPU raw decoding differs from the CPU texel path");
+                    const auto actual = motorstorm::gpu_debug_decode(texture, 0);
+                    if (actual != expected) {
+                        std::size_t first = 0;
+                        while (first < actual.size() && first < expected.size() && actual[first] == expected[first]) ++first;
+                        std::fprintf(stderr, "decode mismatch format=%u swizzled=%u stride=%u clut=%06X texel=%zu gpu=%08X cpu=%08X\n",
+                                     format, swizzled, stride, clut_mode, first,
+                                     first < actual.size() ? actual[first] : 0u, first < expected.size() ? expected[first] : 0u);
+                        throw std::runtime_error("GPU texture decoding differs from the CPU texel path");
+                    }
+                    ++cases;
+                }
+    std::printf("GPU texture decoding matches the CPU path in %zu format/swizzle/palette cases\n", cases);
+}
+
 int main() {
     try {
         _putenv_s("PSPRECOMP_MOTORSTORM_RESOLUTION", "1");
@@ -243,6 +302,7 @@ int main() {
         run(memory, Case{3, {}});
         if (memory.load16(kDepth + (10 * 32 + 10) * 2) != 50)
             throw std::runtime_error("GPU depth-disabled UI must preserve the preview depth buffer");
+        decode_parity();
         auto report = motorstorm::gpu_report();
         if (!report.active || report.draws < cases.size() + 3 || report.software_draws ||
             !report.feedback_draws)
@@ -263,7 +323,7 @@ int main() {
         // resolution. Triangle edges are intentionally sampled more finely.
         std::vector<std::uint8_t> no_aa;
         for (int resolution = 1; resolution <= 4; ++resolution)
-            for (const char *aa : {"none", "fxaa", "ssaa4x"}) {
+            for (const char *aa : {"none", "fxaa", "ssaa2x", "ssaa4x"}) {
                 _putenv_s("PSPRECOMP_MOTORSTORM_RESOLUTION", std::to_string(resolution).c_str());
                 _putenv_s("PSPRECOMP_MOTORSTORM_AA", aa);
                 motorstorm::reset_software_ge();

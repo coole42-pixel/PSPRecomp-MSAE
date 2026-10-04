@@ -18,6 +18,15 @@ struct NativeConfig {
     std::uint32_t fps{60};  // 0 = the game's original 30 fps pacing
     bool window{true}, fullscreen{}, audio{true};
     bool dynamic_fps{true};  // fall back to 30 fps instead of running in slow motion
+    bool vsync{true};
+    std::string texture_filtering{"psp"};  // psp (exact) or enhanced (anisotropic + mips)
+    std::string fullscreen_mode{"borderless"}, audio_api{"wasapi"};
+    std::uint32_t fullscreen_refresh{};  // exclusive fullscreen refresh in Hz, 0 = desktop
+    // Texture packs; directories are absolute (relative INI values resolve
+    // against the INI's folder). Empty means "<INI folder>/textures/...".
+    bool texture_dump{}, texture_replace{true};
+    std::filesystem::path texture_dump_dir, texture_replace_dir;
+    std::uint32_t texture_budget_mb{1024};
     bool trace_imports{}, trace_filesystem{}, verbose{};
     std::vector<std::pair<std::string, std::string>> debug_environment;
     // Unknown or misplaced keys; they are reported in the log, never fatal.
