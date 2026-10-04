@@ -3,7 +3,7 @@ param(
     [UInt64]$StartUs = 115000000,
     [UInt64]$EndUs = 140000000,
     [ValidateSet('d3d12','software','auto')][string]$Renderer = 'd3d12',
-    [ValidateRange(1,4)][int]$Resolution = 1,
+    [ValidateSet(1,2,3,4,8)][int]$Resolution = 1,
     [ValidateSet('None','FXAA','SSAA2x','SSAA4x')][string]$Antialiasing = 'None',
     [string]$InputScript = 'profiles/motorstorm/tools/race-throughput-input.txt',
     [string]$SaveRoot = 'out/motorstorm/phase12/fixes/test-stick-v2',

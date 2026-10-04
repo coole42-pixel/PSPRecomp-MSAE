@@ -6,10 +6,13 @@ param(
     [switch]$Audio = $true,
     [switch]$Mute,
     [ValidateSet('d3d12', 'software', 'auto')][string]$Renderer = 'd3d12',
-    [ValidateRange(1,4)][int]$Resolution = 1,
+    [ValidateSet(1,2,3,4,8)][int]$Resolution = 1,
     [ValidateSet('None','FXAA','SSAA4x')][string]$Antialiasing = 'None',
     # 'original' or 30-240; omitted uses the INI (default 60).
     [ValidatePattern('^(original|\d+)$')][string]$Fps,
+    # low, normal, high, ultra, max or a multiplier (0.5-8); omitted uses the INI.
+    [string]$RenderDistance,
+    [ValidateSet('on','off')][string]$LessPopIn,
     [switch]$Fullscreen,
     [switch]$Windowed,
     [switch]$Bringup
@@ -41,6 +44,8 @@ if ($PSBoundParameters.ContainsKey('Renderer')) { $settings.PSPRECOMP_MOTORSTORM
 if ($PSBoundParameters.ContainsKey('Resolution')) { $settings.PSPRECOMP_MOTORSTORM_RESOLUTION = "$Resolution" }
 if ($PSBoundParameters.ContainsKey('Antialiasing')) { $settings.PSPRECOMP_MOTORSTORM_AA = $Antialiasing.ToLowerInvariant() }
 if ($PSBoundParameters.ContainsKey('Fps')) { $settings.PSPRECOMP_MOTORSTORM_FPS = $Fps.ToLowerInvariant() }
+if ($PSBoundParameters.ContainsKey('RenderDistance')) { $settings.PSPRECOMP_MOTORSTORM_RENDER_DISTANCE = $RenderDistance.ToLowerInvariant() }
+if ($PSBoundParameters.ContainsKey('LessPopIn')) { $settings.PSPRECOMP_MOTORSTORM_LESS_POP_IN = $(if ($LessPopIn -eq 'on') { '1' } else { '0' }) }
 if ($PSBoundParameters.ContainsKey('Scale')) { $settings.PSPRECOMP_MOTORSTORM_WINDOW_SCALE = "$Scale" }
 if ($PSBoundParameters.ContainsKey('MaxDispatches')) { $settings.PSPRECOMP_MAX_DISPATCHES = "$MaxDispatches" }
 if ($PSBoundParameters.ContainsKey('StopAfterGe')) { $settings.PSPRECOMP_MOTORSTORM_STOP_AFTER_GE = "$StopAfterGe" }

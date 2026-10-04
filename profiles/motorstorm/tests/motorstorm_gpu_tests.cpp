@@ -762,7 +762,7 @@ int main() {
         // Integer-aligned rectangles retain PSP pixel semantics at every
         // resolution. Triangle edges are intentionally sampled more finely.
         std::vector<std::uint8_t> no_aa;
-        for (int resolution = 1; resolution <= 4; ++resolution)
+        for (const int resolution : {1, 2, 3, 4, 8})
             for (const char *aa : {"none", "fxaa", "ssaa2x", "ssaa4x"}) {
                 _putenv_s("PSPRECOMP_MOTORSTORM_RESOLUTION", std::to_string(resolution).c_str());
                 _putenv_s("PSPRECOMP_MOTORSTORM_AA", aa);

@@ -14,13 +14,17 @@ struct NativeConfig {
     std::string eboot, disc_root, log_file;
     std::uint64_t max_dispatches{4'000'000'000ull};
     std::string renderer{"d3d12"}, antialiasing{"fxaa"};
-    std::uint32_t resolution{4}, window_scale{2};
+    std::uint32_t resolution{4}, window_scale{2};  // resolution: 1-4 or 8
     std::uint32_t fps{60};  // 0 = the game's original 30 fps pacing
     bool window{true}, fullscreen{}, audio{true};
     bool dynamic_fps{true};  // fall back to 30 fps instead of running in slow motion
     bool vsync{true};
     std::string texture_filtering{"psp"};  // psp (exact) or enhanced (anisotropic + mips)
     std::string widescreen{"auto"};  // auto = Hor+ gameplay, psp = original aspect
+    // Race props: distance-faded instead of popping, and how far they are drawn
+    // (normal = the game's distances; see motorstorm_draw_distance.hpp).
+    bool less_pop_in{true};
+    std::string render_distance{"normal"};
     std::string fullscreen_mode{"borderless"}, audio_api{"wasapi"};
     std::uint32_t fullscreen_refresh{};  // exclusive fullscreen refresh in Hz, 0 = desktop
     // Texture packs; directories are absolute (relative INI values resolve

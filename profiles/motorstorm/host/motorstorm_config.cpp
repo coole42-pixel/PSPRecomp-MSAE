@@ -1,4 +1,5 @@
 #include "motorstorm_config.hpp"
+#include "motorstorm_draw_distance.hpp"
 #include "motorstorm_frame_rate.hpp"
 
 #include <algorithm>
@@ -92,7 +93,17 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
         if (section == "runtime" && key == "max_dispatches")
             config.max_dispatches = number(1u, UINT64_MAX);
         if (section == "graphics") {
-            if (key == "resolution") config.resolution = static_cast<std::uint32_t>(number(1u, 4u));
+            if (key == "resolution") {
+                const auto scale = number(1u, 8u);
+                if (scale > 4u && scale != 8u) invalid("must be 1, 2, 3, 4 or 8");
+                config.resolution = static_cast<std::uint32_t>(scale);
+            }
+            else if (key == "less_pop_in") config.less_pop_in = boolean();
+            else if (key == "render_distance") {
+                if (!draw_distance::parse_render_distance(choice))
+                    invalid("must be low, normal, high, ultra, max or a multiplier from 0.5 to 8");
+                config.render_distance = choice;
+            }
             else if (key == "fps") {
                 if (choice == "original") config.fps = 0u;
                 else if (const auto fps = number(0u, kMaxUnlockedFps); fps != 0u && fps < kMinUnlockedFps)
@@ -172,7 +183,7 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
             {"logging", {"log_file", "trace_imports", "trace_filesystem", "verbose"}},
             {"runtime", {"max_dispatches"}},
             {"graphics", {"resolution", "renderer", "antialiasing", "fps", "dynamic_fps", "vsync",
-                          "texture_filtering", "widescreen"}},
+                          "texture_filtering", "widescreen", "less_pop_in", "render_distance"}},
             {"window", {"enabled", "fullscreen", "scale", "fullscreen_mode", "fullscreen_refresh"}},
             {"audio", {"enabled", "api"}},
             {"textures", {"dump", "replace", "dump_dir", "replace_dir", "budget_mb"}},
@@ -252,6 +263,8 @@ void apply_native_config(const NativeConfig &config) {
     set_default("PSPRECOMP_MOTORSTORM_VSYNC", config.vsync ? "1" : "0");
     set_default("PSPRECOMP_MOTORSTORM_TEXTURE_FILTER", config.texture_filtering);
     set_default("PSPRECOMP_MOTORSTORM_WIDESCREEN", config.widescreen);
+    set_default("PSPRECOMP_MOTORSTORM_LESS_POP_IN", config.less_pop_in ? "1" : "0");
+    set_default("PSPRECOMP_MOTORSTORM_RENDER_DISTANCE", config.render_distance);
     set_default("PSPRECOMP_MOTORSTORM_FULLSCREEN_MODE", config.fullscreen_mode);
     set_default("PSPRECOMP_MOTORSTORM_FULLSCREEN_REFRESH", std::to_string(config.fullscreen_refresh));
     set_default("PSPRECOMP_MOTORSTORM_AUDIO_API", config.audio_api);

@@ -1516,8 +1516,10 @@ bool gpu_initialize() {
                 s.output_scale = 3;
             else if (choice == "4" || choice == "4x" || choice == "1920x1088")
                 s.output_scale = 4;
+            else if (choice == "8" || choice == "8x" || choice == "3840x2176")
+                s.output_scale = 8;
             else
-                throw std::runtime_error("MotorStorm resolution must be 1x, 2x, 3x or 4x");
+                throw std::runtime_error("MotorStorm resolution must be 1x, 2x, 3x, 4x or 8x");
         }
         if (const char *value = std::getenv("PSPRECOMP_MOTORSTORM_AA")) {
             const std::string choice = value;

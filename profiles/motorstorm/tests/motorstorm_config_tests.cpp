@@ -1,9 +1,11 @@
 #include "motorstorm_arena.hpp"
 #include "motorstorm_config.hpp"
+#include "motorstorm_draw_distance.hpp"
 #include "motorstorm_frame_rate.hpp"
 #include "motorstorm_pacing.hpp"
 #include "motorstorm_presentation.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -41,6 +43,8 @@ int main() {
         check(shipped.loaded && shipped.resolution == 4u && shipped.antialiasing == "fxaa" &&
               shipped.renderer == "d3d12" && shipped.window && shipped.audio && shipped.fps == 60u && shipped.widescreen == "auto",
               "Shipped INI must enable native 4x / FXAA / 60 fps with window and audio");
+        check(shipped.less_pop_in && shipped.render_distance == "normal",
+              "Shipped INI enables less pop-in at the game's own render distance");
         check(!shipped.fullscreen && !shipped.trace_imports && !shipped.trace_filesystem &&
               !shipped.verbose && shipped.debug_environment.empty(), "Debug examples remain commented out");
         const auto directory = std::filesystem::temp_directory_path() / "motorstorm_config_regressions";
@@ -87,12 +91,60 @@ int main() {
         for (const char *invalid : {"[graphics]\nresolution=0\n", "[graphics]\nantialiasing=MSAA\n",
                                    "[window]\nfullscreen=perhaps\n", "[window]\nscale=9\n",
                                    "[graphics]\nfps=20\n", "[graphics]\nfps=241\n", "[graphics]\nfps=fast\n",
-                                   "[graphics]\nwidescreen=stretch\n"}) {
+                                   "[graphics]\nwidescreen=stretch\n", "[graphics]\nresolution=5\n",
+                                   "[graphics]\nresolution=16\n", "[graphics]\nrender_distance=far\n",
+                                   "[graphics]\nrender_distance=9\n", "[graphics]\nless_pop_in=maybe\n"}) {
             { std::ofstream file(path); file << invalid; }
             bool rejected = false;
             try { (void)motorstorm::load_native_config(path); }
             catch (const std::exception &error) { rejected = std::string(error.what()).find(path.string() + ":2:") != std::string::npos; }
             check(rejected, "Invalid INI values report the option's file and line");
+        }
+        {
+            { std::ofstream file(path); file << "[graphics]\nresolution=8\nless_pop_in=false\nrender_distance=Ultra\n"; }
+            const auto eight = motorstorm::load_native_config(path);
+            check(eight.resolution == 8u && !eight.less_pop_in && eight.render_distance == "ultra" && eight.warnings.empty(),
+                  "8x resolution, less pop-in and render distance load from [graphics]");
+            { std::ofstream file(path); file << "[graphics]\nrender_distance=2.5x\n"; }
+            check(motorstorm::load_native_config(path).render_distance == "2.5x", "A render distance multiplier is accepted");
+        }
+        {
+            namespace dd = motorstorm::draw_distance;
+            check(dd::parse_render_distance("normal") == 1.0f && dd::parse_render_distance("MAX") == 4.0f &&
+                  dd::parse_render_distance("3") == 3.0f && dd::parse_render_distance("0.5x") == 0.5f &&
+                  !dd::parse_render_distance("0.4") && !dd::parse_render_distance("far"),
+                  "Render distance presets and multipliers parse");
+            // Parity selects the game's path: odd fades, even switches at once.
+            check(dd::scaled_threshold(129, 1.0f, false) == 129 && dd::scaled_threshold(96, 1.0f, false) == 96 &&
+                  dd::scaled_threshold(129, 2.0f, false) == 259 && dd::scaled_threshold(96, 1.5f, false) == 144,
+                  "Scaled thresholds keep the game's fade/switch choice");
+            check(dd::scaled_threshold(96, 1.0f, true) == 97 && dd::scaled_threshold(0, 4.0f, true) == 0 &&
+                  dd::scaled_threshold(30000, 8.0f, true) == 32765, "Less pop-in fades every limit; 0 stays unlimited");
+            const auto far = dd::fading_far(129);
+            check(far > 129 + 20 && (far & 1) == 1, "The fade band extends beyond the original cutoff");
+            // Port of 0x08922220's alpha update: an even limit switches at once;
+            // otherwise snap within 1e-4, else step 1/16 toward the target.
+            const auto game_step = [](float alpha, float target, bool odd) {
+                if (!odd) return target;
+                if (std::fabs(alpha - target) <= 0.0001f) return target;
+                if (alpha >= target) return std::max(alpha - 0.0625f, target);
+                return std::min(alpha + 0.0625f, target);
+            };
+            const motorstorm::draw_distance::Thresholds t{0, far, 64};
+            const float band = static_cast<float>(far - 129);
+            for (float distance = 0.0f; distance < 220.0f; distance += 0.37f) {
+                const float alpha = dd::fade_alpha(distance, t, band);
+                const float target = dd::game_target(distance, t);
+                const float shown = game_step(dd::seed_alpha(alpha, target), target, (t.far & 1) != 0);
+                check(std::fabs(shown - alpha) < 1e-5f, "The seeded alpha survives the game's step exactly");
+                if (distance <= 129.0f) check(alpha == 1.0f, "Props stay opaque up to their original cutoff");
+                if (distance >= far - 1.0f) check(alpha == 0.0f, "Props are fully faded at the extended cutoff");
+            }
+            // A near cutoff (LOD counterpart) fades in over the band past it.
+            const motorstorm::draw_distance::Thresholds near{101, 0, 400};
+            check(dd::fade_alpha(100.0f, near, 0.0f) == 0.0f && dd::fade_alpha(200.0f, near, 0.0f) == 1.0f &&
+                  dd::fade_alpha(111.0f, near, 0.0f) > 0.0f && dd::fade_alpha(111.0f, near, 0.0f) < 1.0f,
+                  "Near-switched props fade in past their cutoff");
         }
         const auto fallback = motorstorm::load_native_config(directory / "missing.ini");
         check(!fallback.loaded && fallback.resolution == 4u && fallback.antialiasing == "fxaa" && fallback.fps == 60u,

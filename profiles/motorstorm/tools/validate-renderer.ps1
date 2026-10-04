@@ -3,7 +3,7 @@ param(
     [string]$Name = 'd3d12-final',
     [UInt64]$StopAfterGe = 2800,
     [UInt64]$RenderAfterGe = 0,
-    [ValidateRange(1,4)][int]$Resolution = 1,
+    [ValidateSet(1,2,3,4,8)][int]$Resolution = 1,
     [ValidateSet('None','FXAA','SSAA2x','SSAA4x')][string]$Antialiasing = 'None',
     [string]$InputScript = 'out/motorstorm/phase12/fixes/normal-race-straight-input.txt',
     [string]$SaveRoot = 'out/motorstorm/phase12/fixes/test-stick-v2',

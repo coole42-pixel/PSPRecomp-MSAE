@@ -6,6 +6,7 @@
 #include "motorstorm_arena.hpp"
 #include "motorstorm_gpu.hpp"
 #include "motorstorm_presentation.hpp"
+#include "motorstorm_draw_distance.hpp"
 #include "motorstorm_window.hpp"
 #include "motorstorm_media.hpp"
 #include "motorstorm_atrac.hpp"
@@ -536,6 +537,138 @@ void update_widescreen_camera(Runtime &runtime, bool racing) {
     }
     gpu_set_guest_widescreen(widened);
 }
+
+// [graphics] render_distance / less_pop_in (see motorstorm_draw_distance.hpp).
+// Distance-switched scene nodes are found by a rolling scan of user RAM, one
+// step per displayed frame, so props loaded at any time are picked up without
+// a stall (a full pass takes about 1.6 s at 60 fps). Their thresholds are
+// restored when the race ends.
+const draw_distance::Settings &draw_distance_settings() {
+    static const draw_distance::Settings settings = [] {
+        draw_distance::Settings result;
+        if (const char *value = std::getenv("PSPRECOMP_MOTORSTORM_RENDER_DISTANCE"))
+            if (const auto scale = draw_distance::parse_render_distance(value)) result.scale = *scale;
+        if (const char *value = std::getenv("PSPRECOMP_MOTORSTORM_LESS_POP_IN"))
+            result.less_pop_in = std::string_view(value) != "0";
+        return result;
+    }();
+    return settings;
+}
+struct DistanceNode {
+    std::uint32_t address{};
+    bool fade{};  // fade node (near/far/split) rather than an LOD group
+    std::array<std::int16_t, 4> original{}, written{};
+    float far_band{};
+};
+void update_draw_distance(Runtime &runtime, bool racing) {
+    namespace dd = draw_distance;
+    static std::vector<DistanceNode> nodes;
+    static std::unordered_set<std::uint32_t> known;
+    static std::uint32_t cursor = 0x08800000u, scanned_frame = 0u;
+    static bool reported = false;
+    auto &memory = runtime.memory();
+    const auto &settings = draw_distance_settings();
+    const auto thresholds = [&](std::uint32_t node) {
+        std::array<std::int16_t, 4> values{};
+        for (std::uint32_t i = 0; i < 4u; ++i)
+            values[i] = static_cast<std::int16_t>(memory.load16(node + dd::kNodeThresholds + 2u * i));
+        return values;
+    };
+    const auto write = [&](std::uint32_t node, const std::array<std::int16_t, 4> &values) {
+        for (std::uint32_t i = 0; i < 4u; ++i)
+            memory.store16(node + dd::kNodeThresholds + 2u * i, static_cast<std::uint16_t>(values[i]));
+    };
+    const auto is_node = [&](std::uint32_t node) {
+        return memory.contains(node, dd::kNodeTarget + 4u) && memory.load32(node + 0x10u) == dd::kNodeVtable;
+    };
+    if (!racing || !settings.active()) {
+        for (const auto &node : nodes)
+            if (is_node(node.address) && thresholds(node.address) == node.written) write(node.address, node.original);
+        nodes.clear();
+        known.clear();
+        cursor = 0x08800000u;
+        return;
+    }
+    // Adopts a node with its current values as the originals.
+    const auto adopt = [&](DistanceNode &node) {
+        node.original = thresholds(node.address);
+        node.written = node.original;
+        node.far_band = 0.0f;
+        const auto &[near, far, split, last] = node.original;
+        if (node.fade) {
+            node.written[0] = dd::scaled_threshold(near, settings.scale, settings.less_pop_in);
+            const auto scaled_far = dd::scaled_threshold(far, settings.scale, settings.less_pop_in);
+            node.written[1] = settings.less_pop_in ? dd::fading_far(scaled_far) : scaled_far;
+            node.far_band = static_cast<float>(node.written[1] - scaled_far);
+            if (split > 0)
+                node.written[2] = static_cast<std::int16_t>(std::clamp<long>(std::lround(split * settings.scale), 1, 32767));
+        } else {
+            for (std::size_t i = 0; i < 4u; ++i)
+                node.written[i] = dd::scaled_threshold(node.original[i], settings.scale, false);
+        }
+        write(node.address, node.written);
+    };
+    // Freed nodes are dropped; values the game rewrote become the new originals.
+    std::erase_if(nodes, [&](DistanceNode &node) {
+        if (!is_node(node.address)) {
+            known.erase(node.address);
+            return true;
+        }
+        if (thresholds(node.address) != node.written) adopt(node);
+        return false;
+    });
+    if (scanned_frame != g_display.set_frame_buf_count) {
+        scanned_frame = g_display.set_frame_buf_count;
+        constexpr std::uint32_t kFirst = 0x08800000u, kLast = 0x0A000000u, kStep = 256u * 1024u;
+        static std::vector<std::uint8_t> chunk(kStep);
+        if (memory.contains(cursor, kStep)) {
+            memory.copy_out(cursor, chunk);
+            for (std::uint32_t offset = 0; offset + 4u <= kStep; offset += 4u) {
+                std::uint32_t word;
+                std::memcpy(&word, chunk.data() + offset, 4u);
+                if (word != dd::kNodeVtable || cursor + offset < kFirst + 0x10u) continue;
+                const std::uint32_t address = cursor + offset - 0x10u;
+                if (known.contains(address) || !is_node(address)) continue;
+                const auto flags = memory.load32(address + dd::kNodeFlags);
+                if ((flags & (dd::kFadeNode | dd::kLodGroup)) == 0u) continue;
+                DistanceNode node{address, (flags & dd::kLodGroup) == 0u};
+                adopt(node);
+                nodes.push_back(node);
+                known.insert(address);
+            }
+        }
+        cursor = cursor + kStep >= kLast ? kFirst : cursor + kStep;
+        if (cursor == kFirst && !reported && !nodes.empty()) {
+            reported = true;
+            std::ostringstream out;
+            out << "draw distance: " << nodes.size() << " distance-switched scene node(s), render_distance x"
+                << settings.scale << ", less_pop_in " << (settings.less_pop_in ? "on" : "off");
+            log_line(category::kGe, out.str());
+        }
+    }
+    if (!settings.less_pop_in) return;
+    // Seed each prop's alpha so the game's next 1/16 step lands on the
+    // opacity for its distance: a smooth fade across the band at any speed.
+    const auto camera = memory.contains(dd::kCameraPointer, 4u) ? memory.load32(dd::kCameraPointer) : 0u;
+    if (!memory.contains(camera + dd::kCameraPosition, 12u)) return;
+    const auto position = [&](std::uint32_t address) {
+        return std::array<float, 3>{std::bit_cast<float>(memory.load32(address)),
+                                    std::bit_cast<float>(memory.load32(address + 4u)),
+                                    std::bit_cast<float>(memory.load32(address + 8u))};
+    };
+    const auto eye = position(camera + dd::kCameraPosition);
+    for (const auto &node : nodes) {
+        if (!node.fade || (memory.load32(node.address + dd::kNodeFlags) & dd::kFadeNode) == 0u) continue;
+        const auto at = position(node.address + dd::kNodePosition);
+        const float distance = std::sqrt((at[0] - eye[0]) * (at[0] - eye[0]) + (at[1] - eye[1]) * (at[1] - eye[1]) +
+                                         (at[2] - eye[2]) * (at[2] - eye[2]));
+        const dd::Thresholds written{node.written[0], node.written[1], node.written[2]};
+        const float alpha = dd::fade_alpha(distance, written, node.far_band);
+        const float seed = dd::seed_alpha(alpha, dd::game_target(distance, written));
+        memory.store32(node.address + dd::kNodeAlpha, std::bit_cast<std::uint32_t>(seed));
+    }
+}
+
 void update_racing_scene(Runtime &runtime) {
     const auto &memory = runtime.memory();
     const auto scene = memory.contains(0x08A76FDCu, 4u) ? memory.load32(0x08A76FDCu) : 0u;
@@ -548,6 +681,7 @@ void update_racing_scene(Runtime &runtime) {
     }
     gpu_set_racing(racing);
     update_widescreen_camera(runtime, racing);
+    update_draw_distance(runtime, racing);
 }
 
 // Scheduler counters for the end-of-run census.
