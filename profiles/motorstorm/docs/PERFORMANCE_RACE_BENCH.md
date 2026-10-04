@@ -344,3 +344,60 @@ Also in this round:
 Correctness: all 10 test suites pass (including `motorstorm_gpu_tests` pixel
 comparisons); boot, menus, vehicle select and the race were checked from frame
 captures with the GE thread active.
+
+## Round 4 (2026-10-04): no mid-frame GPU waits, GPU vertex processing
+
+Measured unthrottled (`PSPRECOMP_MOTORSTORM_UNTHROTTLED=1`, audio off) on the
+Anguta Glacier race window, so values above 1.00x show headroom over real time.
+This laptop's results drift by ~10 % with temperature, so A/B pairs below are
+interleaved runs.
+
+**GPU-sourced textures and palettes.** Once per frame the game renders a
+16-colour palette into a 32-bit target (`041BF000`) and samples a CLUT8
+texture (`041BF080`) that starts inside another target and runs past its end.
+Each use flushed the list, waited ~2.5 ms for the GPU and read every target
+back. Now:
+
+- a palette inside a target drawn in the current list is copied from that
+  target into the decode constants on the GPU (`gpu_clut_constants`);
+- a texture wholly inside such a target is decoded straight from the resolved
+  target by `DecodeTargetCS`;
+- a texture partly inside 32-bit targets is composed on the GPU: the guest
+  bytes are uploaded and the drawn parts copied over them before decoding.
+
+Mid-list sync publishes went from 2,818 to 3 per run and `gpu_sync` from
+8.9 s to 0.2 s (single-thread: 0.80x → 0.93x).
+
+**GPU vertex processing (`VertexCS`).** Hardware-transformed triangles,
+strips and fans (≈ 95 % of the race's vertices) are no longer decoded on the
+CPU. The GE uploads the raw vertex bytes and a parameter block (layout, morph
+weights, bones, world matrix, precomputed lighting, UV transform); `VertexCS`
+decodes each input vertex once (morph, skinning, lighting, UVs) into the
+`GpuVertex` layout, and the input assembler expands strips natively and fans
+through an index list. All dispatches of a command chunk are recorded into a
+per-slot pre-pass list executed just before the chunk, with one resource
+transition per chunk. The texel range for enhanced filtering is still computed
+exactly on the CPU from the raw coordinates. Flat-shaded draws, particle-like
+draws (soft particles), lines, points, sprites, through-mode and UV-projection
+modes keep the CPU path. `PSPRECOMP_MOTORSTORM_GPU_VERTICES=0` disables it.
+
+| Unthrottled, interleaved | CPU vertices | GPU vertices |
+| --- | ---: | ---: |
+| Run 1 | 1.34x | 1.47x |
+| Run 2 | 1.28x | 1.44x |
+
+Frames rendered with CPU and GPU vertices under a fixed clock are identical
+in menus and differ in at most 0.003 % of pixels in the race (edge pixels and
+1-2 level lighting rounding).
+
+**Where the limit is now.** At 4x the GPU bounds the frame: the same race runs
+at 1.37x at 4x and 1.84x at 2x, with GPU fence waits falling from 9.8 s to
+2.5 s. A sampler profile shows the GE thread ~60 % busy and ~34 % waiting on
+GPU fences, and the CPU thread waiting ~1.4 ms per frame at `sceGeDrawSync`.
+Splitting the GE thread into a parse/decode front end and a recording back end
+(the next CPU-side idea) would therefore not speed up 4x; it would only help
+at 2x and below. More command slots (8) and other chunk sizes (64, 256)
+measured within noise.
+
+At the 60 fps cap with audio the race holds 60.0 fps (p50 17.6 ms incl. the
+vsync wait, p99 23 ms) and the audio device never ran dry.
