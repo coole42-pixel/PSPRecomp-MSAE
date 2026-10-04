@@ -1318,7 +1318,7 @@ void switch_frame_rate(GuestMemory &memory, const FrameRatePlan &next, const std
 
 struct Pacer {
     bool limit{}, govern{};
-    std::uint64_t anchor_wall{}, anchor_guest{};
+    FramePacer clock;
     std::uint64_t sample_wall{}, sample_guest{}, sample_idle{}, sample_frames{}, slept_us{}, frames{};
     // Loading work seen at the previous sample (see loading_activity).
     std::uint64_t sample_uploads{}, sample_replacements{}, sample_pack_loads{};
@@ -1368,28 +1368,19 @@ bool loading_activity(double seconds) {
 // Called once per displayed frame.
 void pace_frame(GuestMemory &memory) {
     ++g_pacer.frames;
-    // Audio backpressure normally ties guest time to real time. Without it
-    // (audio disabled or unavailable) hold the visible game to the wall clock
-    // instead of letting it run fast. Falling far behind re-anchors rather
-    // than fast-forwarding to catch up.
-    if (g_pacer.limit && window_enabled() && !audio_enabled()) {
+    // Pace every visible frame, including with audio enabled. Audio's device
+    // periods maintain average speed but wake the guest in uneven bursts.
+    // Wait before publishing a snapshot, otherwise two early frames can
+    // replace each other while the presenter waits for the display.
+    if (g_pacer.limit && window_enabled() && audio_frame_pacing_ready()) {
         const auto wall = host_time_us();
-        if (g_pacer.anchor_wall == 0u) {
-            g_pacer.anchor_wall = wall;
-            g_pacer.anchor_guest = g_virtual_time_us;
-        }
-        const auto guest_elapsed = g_virtual_time_us - g_pacer.anchor_guest;
-        const auto wall_elapsed = wall - g_pacer.anchor_wall;
-        if (guest_elapsed > wall_elapsed + 1000u) {
-            const auto ahead = guest_elapsed - wall_elapsed;
-            host_sleep_us(ahead);
-            g_pacer.slept_us += ahead;
-        } else if (wall_elapsed > guest_elapsed + 100'000u) {
-            g_pacer.anchor_wall = wall;
-            g_pacer.anchor_guest = g_virtual_time_us;
+        const auto deadline = g_pacer.clock.deadline(g_virtual_time_us, wall);
+        if (deadline > wall) {
+            host_sleep_until_us(deadline);
+            g_pacer.slept_us += host_time_us() - wall;
         }
     } else {
-        g_pacer.anchor_wall = 0u;
+        g_pacer.clock.reset();
     }
     // Governing needs a real-time pacing source (audio or the limiter); an
     // unthrottled diagnostic run has no notion of "below real time".
@@ -3918,15 +3909,16 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
                 if (second_fb != 0u && second_fb != dump_fb)
                     write_ppm(second_fb, second_stride, g_display.format, "_disp");
             }
+            pace_frame(rt.memory());
             // Publish the frame the guest just displayed to the native window.
             window_present(rt.memory(), g_display.frame_buf,
                            g_display.stride != 0u ? g_display.stride : 512u, g_display.format,
                            g_display.width != 0u ? g_display.width : 480u,
                            g_display.height != 0u ? g_display.height : 272u);
-            pace_frame(rt.memory());
             // Optional race benchmark: close the guest-time window and stop.
+            const auto bench_audio = perf::bench_window().enabled ? audio_report() : AudioReport{};
             if (perf::bench_frame(g_virtual_time_us, g_display.set_frame_buf_count,
-                                  g_ge_submissions))
+                                  g_ge_submissions, bench_audio.underruns, bench_audio.device_dry))
                 rt.stop("race benchmark window complete");
             ctx.set_gpr(2, 0u);
         });

@@ -32,4 +32,8 @@ void audio_shutdown();
 // full (audio backpressure). The frame-rate governor treats it as idle time.
 [[nodiscard]] std::uint64_t audio_blocked_us() noexcept;
 
+// True once PCM has built a reserve; false while refilling after a stall.
+// Frame waits must not prevent this prebuffering. Disabled audio returns true.
+[[nodiscard]] bool audio_frame_pacing_ready();
+
 } // namespace motorstorm

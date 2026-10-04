@@ -71,3 +71,10 @@ mode is byte-identical to the build before the CPU changes. All 8 test suites
   `PSPRECOMP_MOTORSTORM_UNTHROTTLED=1` disables it (the bench scripts set it).
 - Audio backpressure time is counted as idle time for the governor
   (`audio_blocked_us`).
+
+## Frame cadence follow-up (2026-10-04)
+
+The limiter now also runs with audio enabled and waits before publishing a
+frame, using absolute host deadlines. Audio backpressure alone held the average
+at 60 fps but delivered frames unevenly. See [frame pacing](FRAME_PACING.md)
+for measurements, verification and the display refresh settings.

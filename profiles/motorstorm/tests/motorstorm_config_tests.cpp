@@ -1,6 +1,7 @@
 #include "motorstorm_arena.hpp"
 #include "motorstorm_config.hpp"
 #include "motorstorm_frame_rate.hpp"
+#include "motorstorm_pacing.hpp"
 #include "motorstorm_presentation.hpp"
 
 #include <array>
@@ -109,6 +110,31 @@ int main() {
             check(high.interval == 1u && high.vblank_us == 6944u && high.game_fps == 144.0f && high.refresh_hz == 144.0f,
                   "Rates above 60 run the virtual display at the target rate");
             check(motorstorm::plan_frame_rate(1000u).game_fps == 240.0f, "Frame rate plan clamps to the supported range");
+        }
+        {
+            motorstorm::FramePacer clock;
+            check(clock.deadline(100'000u, 1'000'000u) == 1'000'000u, "First frame anchors the host clock");
+            check(clock.deadline(116'667u, 1'010'000u) == 1'016'667u,
+                  "Early audio wake waits for the frame's guest deadline");
+            check(clock.deadline(133'334u, 1'034'000u) == 1'033'334u,
+                  "A late frame does not shift the next deadline");
+            check(clock.deadline(150'001u, 1'040'000u) == 1'050'001u,
+                  "Frames retain an even cadence after a short delay");
+            check(clock.deadline(166'668u, 1'300'000u) == 1'300'000u,
+                  "A loading stall reanchors instead of fast forwarding");
+            check(clock.deadline(10u, 1'400'000u) == 1'400'000u, "A reset guest clock reanchors safely");
+            clock.reset();
+            check(clock.deadline(20u, 1'500'000u) == 1'500'000u, "Resuming the limiter uses a fresh anchor");
+            motorstorm::AudioPacingReserve reserve;
+            check(!reserve.ready(100u, 12'288u) && !reserve.ready(3'072u, 12'288u),
+                  "Audio can prebuffer before frame pacing starts");
+            check(reserve.ready(9'216u, 12'288u) && reserve.ready(4'000u, 12'288u),
+                  "A healthy reserve keeps pacing across device wakes");
+            check(!reserve.ready(1'000u, 12'288u) && !reserve.ready(4'000u, 12'288u) &&
+                  reserve.ready(9'216u, 12'288u), "A drained reserve refills before pacing resumes");
+            motorstorm::AudioPacingReserve small;
+            check(small.ready(1'536u, 2'048u) && small.ready(512u, 2'048u) && !small.ready(511u, 2'048u),
+                  "Prebuffer thresholds also fit a custom short audio queue");
         }
         {
             using Decision = motorstorm::FrameRateGovernor::Decision;

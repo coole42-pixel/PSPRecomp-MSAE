@@ -121,6 +121,7 @@ struct BenchWindow {
     std::uint64_t start_us_actual{};
     std::uint64_t start_frame{};
     std::uint64_t start_submissions{};
+    std::uint64_t start_audio_underruns{}, start_audio_device_dry{};
     std::array<std::uint64_t, kSlotCount> start_ticks{};
     std::uint64_t previous_frame_ns{};
     std::vector<std::uint64_t> frame_intervals_ns;
@@ -148,7 +149,8 @@ inline BenchWindow &bench_window() {
 }
 
 // Returns true when the window just closed: the caller must stop the guest run.
-inline bool bench_frame(std::uint64_t guest_us, std::uint64_t frames, std::uint64_t submissions) {
+inline bool bench_frame(std::uint64_t guest_us, std::uint64_t frames, std::uint64_t submissions,
+                        std::uint64_t audio_underruns = 0u, std::uint64_t audio_device_dry = 0u) {
     BenchWindow &window = bench_window();
     if (!window.enabled || window.finished) return false;
     if (!window.started) {
@@ -158,6 +160,8 @@ inline bool bench_frame(std::uint64_t guest_us, std::uint64_t frames, std::uint6
         window.start_us_actual = guest_us;
         window.start_frame = frames;
         window.start_submissions = submissions;
+        window.start_audio_underruns = audio_underruns;
+        window.start_audio_device_dry = audio_device_dry;
         window.start_ticks = ticks();
         window.previous_frame_ns = window.start_wall_ns;
         return false;
@@ -198,6 +202,8 @@ inline bool bench_frame(std::uint64_t guest_us, std::uint64_t frames, std::uint6
     field("guest_per_wall", guest_seconds / wall_seconds);
     field("fps", static_cast<double>(frame_span) / guest_seconds);
     field("wall_fps", static_cast<double>(frame_span) / wall_seconds);
+    field("audio_underruns", audio_underruns - window.start_audio_underruns);
+    field("audio_device_dry", audio_device_dry - window.start_audio_device_dry);
     std::sort(window.frame_intervals_ns.begin(), window.frame_intervals_ns.end());
     const auto percentile = [&](double fraction) {
         const auto &samples = window.frame_intervals_ns;

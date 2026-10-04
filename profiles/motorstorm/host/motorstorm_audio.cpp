@@ -2,6 +2,7 @@
 #include "motorstorm_bootstrap.hpp"
 #include "motorstorm_perf.hpp"
 #include "motorstorm_audio_recovery.hpp"
+#include "motorstorm_pacing.hpp"
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -64,6 +65,7 @@ std::size_t wasapi_queued_frames() {
 std::size_t g_queued_limit=kWaveOutQueuedFrames;
 bool g_wasapi{};
 std::atomic<std::uint64_t> g_blocked_us{};
+AudioPacingReserve g_pacing_reserve;
 // Last PCM submission: tells a real guest stall from the normal few
 // milliseconds between grains.
 std::chrono::steady_clock::time_point g_last_submit;
@@ -382,11 +384,16 @@ void wasapi_worker(std::promise<std::string> opened) {
 
 bool audio_enabled() {return g_enabled.load();}
 std::uint64_t audio_blocked_us() noexcept {return g_blocked_us.load(std::memory_order_relaxed);}
+bool audio_frame_pacing_ready() {
+    std::lock_guard lock(g_mutex);
+    return !g_enabled.load() || g_pacing_reserve.ready(g_pcm.size() / 2u, g_queued_limit);
+}
 AudioReport audio_report() {std::lock_guard lock(g_mutex);completed();auto report=g_report;report.buffered_frames=g_pcm.size()/2;return report;}
 void audio_start(std::uint32_t sample_rate) {
     if(!requested()) return;
     std::lock_guard lock(g_mutex);if(g_open.load()) return;
     g_report={};g_next=0;g_rate=sample_rate?sample_rate:44100;g_pcm.clear();g_stopping=false;g_starved=false;g_recovery={};
+    g_pacing_reserve = {};
     g_event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
     if(!g_event) {error(MMSYSERR_NOMEM,"completion event");return;}
     g_capture_bytes=0;

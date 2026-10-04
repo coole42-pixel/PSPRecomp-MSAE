@@ -32,4 +32,9 @@ void host_sleep_us(std::uint64_t microseconds) noexcept {
     WaitForSingleObject(timer, INFINITE);
 }
 
+void host_sleep_until_us(std::uint64_t deadline) noexcept {
+    for (auto now = host_time_us(); now < deadline; now = host_time_us())
+        host_sleep_us(deadline - now);
+}
+
 } // namespace motorstorm

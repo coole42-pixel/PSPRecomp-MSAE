@@ -9,6 +9,8 @@ param(
     [string]$SaveRoot = 'out/motorstorm/phase12/fixes/test-stick-v2',
     [switch]$Audio,
     [switch]$Window,
+    # Measure normal frame cadence instead of maximum throughput (with or without audio).
+    [switch]$Paced,
     [string]$Executable = 'out/motorstorm/bin/Release/MotorStormNative.exe',
     # Guest time normally also advances per 256 chained dispatches.  Builds
     # with a different generated-unit layout dispatch differently, so their
@@ -23,6 +25,8 @@ param(
 # and stops exactly when the guest reaches -EndUs; the host writes the report
 # to out/motorstorm/bench/<Name>.txt.  Audio stays off by default because audio
 # backpressure paces the guest to real time and would hide throughput changes.
+# -Paced -Window measures the normal frame limiter instead; add -Audio to check
+# whether sound and frame delivery remain stable together.
 
 $repoDirectory = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../../..'))
 $outputDirectory = Join-Path $repoDirectory 'out/motorstorm/bench'
@@ -37,8 +41,8 @@ $settings = @{
     PSPRECOMP_MOTORSTORM_RESOLUTION = "$Resolution"
     PSPRECOMP_MOTORSTORM_AA = $Antialiasing.ToLowerInvariant()
     PSPRECOMP_MOTORSTORM_FPS = $Fps
-    # Measure throughput, not the wall-clock limiter used when audio is off.
-    PSPRECOMP_MOTORSTORM_UNTHROTTLED = '1'
+    # Throughput is the default; -Paced enables normal frame deadlines.
+    PSPRECOMP_MOTORSTORM_UNTHROTTLED = $(if ($Paced) { $null } else { '1' })
     PSPRECOMP_MOTORSTORM_SOFTGE = '1'
     PSPRECOMP_MOTORSTORM_WINDOW = $(if ($Window) {'1'} else {'0'})
     PSPRECOMP_MOTORSTORM_AUDIO = $(if ($Audio) { '1' } else { '0' })
