@@ -1,5 +1,6 @@
 #include "motorstorm_bootstrap.hpp"
 #include "motorstorm_window.hpp"
+#include "motorstorm_controller.hpp"
 #include "motorstorm_audio.hpp"
 #include "motorstorm_textures.hpp"
 
@@ -89,13 +90,23 @@ LONG WINAPI motorstorm_crash_filter(EXCEPTION_POINTERS *info) noexcept {
 
 int main(int argc, char **argv) {
     if (argc > 1 && std::string_view(argv[1]) == "--input-probe") {
-        for (int i = 0; i < 50; ++i) {
-            const auto input = motorstorm::poll_xinput_controller();
-            std::cout << "connected=" << input.connected << " slot=" << input.slot
-                      << " packet=" << input.packet << " buttons=" << psprecomp::hex32(input.buttons)
+        // Lists controller input for ten seconds; with --rumble, every
+        // controller press also plays a short rumble.
+        const bool rumble = argc > 2 && std::string_view(argv[2]) == "--rumble";
+        motorstorm::controller_start();
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        std::cout << "backend=" << motorstorm::controller_backend() << '\n';
+        for (int i = 0; i < 100; ++i) {
+            const auto input = motorstorm::controller_input();
+            std::cout << "connected=" << input.connected << " active=" << input.slot
+                      << " pads=" << input.packet << " buttons=" << psprecomp::hex32(input.buttons)
                       << " analog=" << static_cast<unsigned>(input.x) << ',' << static_cast<unsigned>(input.y) << '\n';
+            if (rumble)
+                motorstorm::controller_set_rumble(input.buttons != 0u ? motorstorm::RumbleOutput{0.6f, 0.6f, 0.4f, 0.4f}
+                                                                       : motorstorm::RumbleOutput{});
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+        motorstorm::controller_shutdown();
         return 0;
     }
 #if defined(_WIN32)

@@ -1,6 +1,7 @@
 #include "motorstorm_config.hpp"
 #include "motorstorm_draw_distance.hpp"
 #include "motorstorm_frame_rate.hpp"
+#include "motorstorm_input.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -151,6 +152,35 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
             else if (key == "replace_dir") config.texture_replace_dir = resolve();
             else if (key == "budget_mb") config.texture_budget_mb = static_cast<std::uint32_t>(number(64u, 65536u));
         }
+        if (section == "controller") {
+            if (key == "enabled") config.controller = boolean();
+            else if (key == "api") {
+                if (choice != "auto" && choice != "sdl" && choice != "xinput") invalid("must be auto, sdl or xinput");
+                config.controller_api = choice;
+            } else if (key == "rumble") config.rumble = boolean();
+            else if (key == "rumble_strength") config.rumble_strength = static_cast<std::uint32_t>(number(0u, 100u));
+            else if (key == "trigger_rumble") config.trigger_rumble = boolean();
+            else if (key == "deadzone") config.controller_deadzone = static_cast<std::uint32_t>(number(0u, 90u));
+            else if (key == "trigger_threshold") config.trigger_threshold = static_cast<std::uint32_t>(number(1u, 90u));
+            else if (key == "stick") {
+                if (choice != "left" && choice != "right") invalid("must be left or right");
+                config.controller_stick = choice;
+            } else if (const auto control = control_from_name(key); control && !is_stick(*control)) {
+                std::string error;
+                if (!parse_pad_list(choice, &error)) invalid(("lists an " + error).c_str());
+                config.controller_bindings += key + "=" + choice + ";";
+            }
+        }
+        if (section == "keyboard") {
+            if (key == "enabled") config.keyboard = boolean();
+            else if (key == "analog_ramp_ms") config.keyboard_ramp_ms = static_cast<std::uint32_t>(number(0u, 1000u));
+            else if (control_from_name(key)) {
+                std::string error;
+                if (!parse_key_list(choice, &error))
+                    invalid(("lists an " + error + " (Escape and F11 are reserved for the window)").c_str());
+                config.keyboard_bindings += key + "=" + choice + ";";
+            }
+        }
         if (section == "enhancements") {
             const auto real = [&](double minimum, double maximum) {
                 double result{};
@@ -177,7 +207,8 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
             else if (key == "soft_particles") config.post_soft_particles = boolean();
             else if (key == "soft_particle_softness") config.post_soft_particle_softness = real(10.0, 20000.0);
         }
-        static const std::map<std::string, std::set<std::string>> known{
+        static const std::map<std::string, std::set<std::string>> known = [] {
+          std::map<std::string, std::set<std::string>> sections{
             {"", {"eboot", "disc_root", "log_file", "trace_imports", "trace_filesystem", "verbose"}},
             {"paths", {"eboot", "disc_root"}},
             {"logging", {"log_file", "trace_imports", "trace_filesystem", "verbose"}},
@@ -193,8 +224,18 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
             {"debug", {"profile", "trace_controller", "trace_music", "trace_atrac", "trace_display",
                        "d3d12_debug", "pc_sample", "frame_dump", "stop_after_ge", "frame_dump_every",
                        "frame_dump_count", "frame_dump_dir", "memory_dump", "audio_capture",
-                       "trace_state", "trace_switch", "trace_flags", "trace_callback_owner", "trace_preempt", "stack_scan", "frame_dump_both", "frame_dump_rolling"}},
-        };
+                       "trace_state", "trace_switch", "trace_flags", "trace_callback_owner", "trace_preempt", "stack_scan", "frame_dump_both", "frame_dump_rolling",
+                       "trace_rumble"}},
+            {"controller", {"enabled", "api", "rumble", "rumble_strength", "trigger_rumble", "deadzone",
+                            "trigger_threshold", "stick"}},
+            {"keyboard", {"enabled", "analog_ramp_ms"}},
+          };
+          for (std::size_t i = 0; i < kControlCount; ++i) {
+              sections["keyboard"].insert(std::string(kControlNames[i]));
+              if (!is_stick(static_cast<Control>(i))) sections["controller"].insert(std::string(kControlNames[i]));
+          }
+          return sections;
+        }();
         const auto found = known.find(section);
         if (found == known.end() || !found->second.contains(key)) {
             const auto where = path.filename().string() + ":" + std::to_string(line_number) + ": ";
@@ -210,6 +251,7 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
             const std::pair<const char *, const char *> switches[]{
                 {"profile", "PSPRECOMP_MOTORSTORM_PROFILE"},
                 {"trace_controller", "PSPRECOMP_MOTORSTORM_TRACE_CTRL"},
+                {"trace_rumble", "PSPRECOMP_MOTORSTORM_TRACE_RUMBLE"},
                 {"trace_music", "PSPRECOMP_MOTORSTORM_TRACE_MUSIC"},
                 {"trace_atrac", "PSPRECOMP_MOTORSTORM_TRACE_ATRAC"},
                 {"trace_display", "PSPRECOMP_MOTORSTORM_TRACE_DISPLAY"},
@@ -295,6 +337,20 @@ void apply_native_config(const NativeConfig &config) {
     set_default("PSPRECOMP_MOTORSTORM_WINDOW_SCALE", std::to_string(config.window_scale));
     set_default("PSPRECOMP_MOTORSTORM_AUDIO", config.audio ? "1" : "0");
     set_default("PSPRECOMP_MOTORSTORM_SOFTGE", "1");
+    set_default("PSPRECOMP_MOTORSTORM_CONTROLLER", config.controller ? "1" : "0");
+    set_default("PSPRECOMP_MOTORSTORM_CONTROLLER_API", config.controller_api);
+    set_default("PSPRECOMP_MOTORSTORM_RUMBLE", config.rumble ? "1" : "0");
+    set_default("PSPRECOMP_MOTORSTORM_RUMBLE_STRENGTH", std::to_string(config.rumble_strength));
+    set_default("PSPRECOMP_MOTORSTORM_TRIGGER_RUMBLE", config.trigger_rumble ? "1" : "0");
+    set_default("PSPRECOMP_MOTORSTORM_DEADZONE", std::to_string(config.controller_deadzone));
+    set_default("PSPRECOMP_MOTORSTORM_TRIGGER_THRESHOLD", std::to_string(config.trigger_threshold));
+    set_default("PSPRECOMP_MOTORSTORM_CONTROLLER_STICK", config.controller_stick);
+    if (!config.controller_bindings.empty())
+        set_default("PSPRECOMP_MOTORSTORM_CONTROLLER_BINDINGS", config.controller_bindings);
+    set_default("PSPRECOMP_MOTORSTORM_KEYBOARD", config.keyboard ? "1" : "0");
+    set_default("PSPRECOMP_MOTORSTORM_KEYBOARD_RAMP_MS", std::to_string(config.keyboard_ramp_ms));
+    if (!config.keyboard_bindings.empty())
+        set_default("PSPRECOMP_MOTORSTORM_KEYBOARD_BINDINGS", config.keyboard_bindings);
     for (const auto &[name, value] : config.debug_environment) set_default(name, value);
 }
 } // namespace motorstorm

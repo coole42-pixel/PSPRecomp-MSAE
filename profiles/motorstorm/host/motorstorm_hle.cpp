@@ -8,6 +8,8 @@
 #include "motorstorm_presentation.hpp"
 #include "motorstorm_draw_distance.hpp"
 #include "motorstorm_window.hpp"
+#include "motorstorm_controller.hpp"
+#include "motorstorm_rumble.hpp"
 #include "motorstorm_media.hpp"
 #include "motorstorm_atrac.hpp"
 #include "motorstorm_frame_rate.hpp"
@@ -257,6 +259,7 @@ std::uint64_t g_virtual_time_us{};
 FrameRatePlan g_frame_rate;
 std::uint64_t g_music_next_trace{};
 std::uint32_t g_ctrl_requested_cycle{}, g_ctrl_requested_mode{};
+std::uint32_t g_last_pad_buttons{};
 struct ScriptedInput { std::uint64_t time{}; std::uint32_t buttons{}; std::uint8_t x{128}, y{128}; };
 std::vector<ScriptedInput> g_input_script;
 std::size_t g_input_script_index{};
@@ -669,6 +672,86 @@ void update_draw_distance(Runtime &runtime, bool racing) {
     }
 }
 
+// Player vehicle (see motorstorm_rumble.hpp and docs/CONTROLLER_INPUT.md):
+// race 0x08A9E2AC -> player +4444 -> vehicle +8 -> motion +32, position at
+// motion +48; vehicle +704 is the state object, player +228 the distance
+// travelled under boost.
+struct PlayerVehicle { std::uint32_t race{}, player{}, vehicle{}, motion{}, recovery{}; };
+PlayerVehicle player_vehicle(const psprecomp::GuestMemory &memory) {
+    const auto read = [&](std::uint32_t address) { return memory.contains(address, 4u) ? memory.load32(address) : 0u; };
+    PlayerVehicle result;
+    result.race = read(0x08A9E2ACu);
+    result.player = result.race ? read(result.race + 4444u) : 0u;
+    result.vehicle = result.player ? read(result.player + 8u) : 0u;
+    result.motion = result.vehicle ? read(result.vehicle + 32u) : 0u;
+    result.recovery = result.vehicle ? read(result.vehicle + 48u) : 0u;
+    return result;
+}
+
+// Diagnostic: PSPRECOMP_MOTORSTORM_VEHICLE_DUMP=<file> appends one record per
+// displayed race frame (48-byte header, then the race, player, vehicle,
+// motion, recovery and camera objects); the layout is in CONTROLLER_INPUT.md.
+void dump_vehicle(const psprecomp::GuestMemory &memory, std::uint32_t scene, const PlayerVehicle &player) {
+    static const char *path = std::getenv("PSPRECOMP_MOTORSTORM_VEHICLE_DUMP");
+    if (path == nullptr) return;
+    static std::ofstream dump(path, std::ios::binary);
+    const auto camera = memory.contains(0x08A78F8Cu, 4u) ? memory.load32(0x08A78F8Cu) : 0u;
+    const std::uint32_t header[12]{static_cast<std::uint32_t>(g_virtual_time_us),
+        static_cast<std::uint32_t>(g_virtual_time_us >> 32u), g_display.set_frame_buf_count, scene, player.race,
+        player.player, player.vehicle, player.motion, player.recovery, camera, g_last_pad_buttons, 0u};
+    dump.write(reinterpret_cast<const char *>(header), sizeof(header));
+    const auto block = [&](std::uint32_t address, std::uint32_t size) {
+        std::vector<std::uint8_t> bytes(size);
+        if (address != 0u && memory.contains(address, size)) memory.copy_out(address, bytes);
+        dump.write(reinterpret_cast<const char *>(bytes.data()), size);
+    };
+    block(player.race, 8192u); block(player.player, 1024u); block(player.vehicle, 4096u);
+    block(player.motion, 512u); block(player.recovery, 1024u); block(camera, 512u);
+    dump.flush();
+}
+
+// Controller rumble from the player vehicle, once per displayed frame. Only
+// the running race (0x08A76064) rumbles: countdown, pause, menus and movies
+// stay still.
+void update_rumble(const Runtime &runtime, std::uint32_t scene) {
+    // static RumbleModel model;
+    static std::uint32_t sampled_frame = 0xFFFFFFFFu;
+    if (sampled_frame == g_display.set_frame_buf_count) return;
+    sampled_frame = g_display.set_frame_buf_count;
+    const auto &memory = runtime.memory();
+    const bool racing = scene == 0x08A76064u;
+    const auto player = racing ? player_vehicle(memory) : PlayerVehicle{};
+    if (racing) dump_vehicle(memory, scene, player);
+    // Rumble disabled for the time being; the vehicle dump above still runs.
+    // VehicleSample sample;
+    // sample.time = static_cast<double>(g_virtual_time_us) / 1e6;
+    // if (racing && player.motion != 0u && memory.contains(player.motion + 48u, 12u) &&
+    //     memory.contains(player.vehicle + 704u, 4u) && memory.contains(player.player + 228u, 4u)) {
+    //     sample.racing = true;
+    //     sample.vehicle = player.vehicle;
+    //     sample.state = memory.load32(player.vehicle + 704u);
+    //     sample.x = std::bit_cast<float>(memory.load32(player.motion + 48u));
+    //     sample.y = std::bit_cast<float>(memory.load32(player.motion + 52u));
+    //     sample.z = std::bit_cast<float>(memory.load32(player.motion + 56u));
+    //     sample.boost_distance = std::bit_cast<float>(memory.load32(player.player + 228u));
+    // }
+    // const auto rumble = model.update(sample);
+    // controller_set_rumble(rumble);
+    // if (model.events() != 0u && MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_TRACE_RUMBLE")) {
+    //     std::ostringstream out;
+    //     out << "guest_us=" << g_virtual_time_us;
+    //     const std::pair<unsigned, const char *> names[]{
+    //         {rumble_event::kImpact, "impact"}, {rumble_event::kLanding, "landing"}, {rumble_event::kWreck, "wreck"},
+    //         {rumble_event::kBoostStart, "boost-start"}, {rumble_event::kBoostEnd, "boost-end"},
+    //         {rumble_event::kRespawn, "respawn"}, {rumble_event::kTeleport, "teleport"}};
+    //     for (const auto &[bit, name] : names)
+    //         if ((model.events() & bit) != 0u) out << ' ' << name;
+    //     out << " low=" << rumble.low << " high=" << rumble.high << " lt=" << rumble.left_trigger
+    //         << " rt=" << rumble.right_trigger << " state=" << hex32(sample.state);
+    //     log_line("RUMBLE", out.str());
+    // }
+}
+
 void update_racing_scene(Runtime &runtime) {
     const auto &memory = runtime.memory();
     const auto scene = memory.contains(0x08A76FDCu, 4u) ? memory.load32(0x08A76FDCu) : 0u;
@@ -682,6 +765,7 @@ void update_racing_scene(Runtime &runtime) {
     gpu_set_racing(racing);
     update_widescreen_camera(runtime, racing);
     update_draw_distance(runtime, racing);
+    update_rumble(runtime, scene);
 }
 
 // Scheduler counters for the end-of-run census.
@@ -4215,6 +4299,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
                 }
             }
             const std::uint32_t live_pad = input.buttons;
+            g_last_pad_buttons = live_pad | (static_cast<std::uint32_t>(input.x) << 16u) | (static_cast<std::uint32_t>(input.y) << 24u);
             const auto analog_x = g_ctrl_requested_mode == 1u ? input.x : std::uint8_t{128u};
             const auto analog_y = g_ctrl_requested_mode == 1u ? input.y : std::uint8_t{128u};
             if (address != 0u && count > 0 && rt.memory().contains(address, 16u)) {

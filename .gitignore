@@ -82,3 +82,8 @@ BOOT.BIN
 # Python
 __pycache__/
 *.pyc
+
+
+# Vendored controller library the MotorStorm build links against
+!profiles/motorstorm/third_party/SDL3/bin/SDL3.dll
+!profiles/motorstorm/third_party/SDL3/lib/x64/SDL3.lib

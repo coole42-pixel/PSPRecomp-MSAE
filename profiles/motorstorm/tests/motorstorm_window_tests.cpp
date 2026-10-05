@@ -107,6 +107,36 @@ int main(int argc, char **argv) {
               "Windowed mode restores the original placement and style");
         present();
         check(!(motorstorm::window_pad() & 0x8u), "Alt+Enter must not emit a PSP Start button");
+        // Keyboard: keys are matched by scan code (lparam bits 16-23, bit 24
+        // = extended), whatever virtual key the layout reports.
+        const auto key = [&](UINT message, WPARAM vk, unsigned scan, bool extended = false) {
+            LPARAM lparam = static_cast<LPARAM>(scan) << 16;
+            if (extended) lparam |= 1ll << 24;
+            if (message == WM_KEYUP) lparam |= (1ll << 30) | (1ll << 31);
+            SendMessageW(window, message, vk, lparam);
+        };
+        (void)motorstorm::window_input();
+        key(WM_KEYDOWN, 'Z', 0x11u);  // AZERTY 'Z' sits where QWERTY has W
+        check(motorstorm::window_pad() == 0x200u, "The W position accelerates (R) on any layout");
+        key(WM_KEYUP, 'Z', 0x11u);
+        key(WM_KEYDOWN, VK_UP, 0x48u, true);
+        check(motorstorm::window_pad() == 0x10u, "Extended Up arrow is the D-pad");
+        key(WM_KEYUP, VK_UP, 0x48u, true);
+        key(WM_KEYDOWN, VK_NUMPAD8, 0x48u);
+        check(motorstorm::window_pad() == 0u, "Numpad 8 is not the Up arrow");
+        key(WM_KEYUP, VK_NUMPAD8, 0x48u);
+        key(WM_KEYDOWN, 'D', 0x20u);
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        (void)motorstorm::window_input();
+        check(motorstorm::window_input().x == 255u, "Held D steers fully right after the ramp");
+        SendMessageW(window, WM_KILLFOCUS, 0u, 0u);
+        (void)motorstorm::window_input();
+        check(motorstorm::window_pad() == 0u && motorstorm::window_input().x == 128u,
+              "Losing focus releases every key");
+        key(WM_KEYUP, 'D', 0x20u);
+        key(WM_KEYDOWN, VK_RETURN, 0u);  // synthesized message without a scan code
+        key(WM_KEYUP, VK_RETURN, 0u);
+        check(motorstorm::window_pad() == 0x8u, "Keys without a scan code are mapped from the virtual key");
         SendMessageW(window, WM_KEYDOWN, VK_F11, 0u);
         check(motorstorm::window_fullscreen(), "F11 enters fullscreen");
         present();

@@ -1,11 +1,11 @@
 #include "motorstorm_env.hpp"
 #include "motorstorm_window.hpp"
 #include "motorstorm_bootstrap.hpp"
+#include "motorstorm_controller.hpp"
 #include "motorstorm_gpu.hpp"
 #include "motorstorm_presentation.hpp"
 
 #include <windows.h>
-#include <Xinput.h>
 
 #include <atomic>
 #include <chrono>
@@ -31,11 +31,11 @@ std::atomic<bool> g_shutdown_requested{false};
 std::atomic<bool> g_fullscreen{false};
 WINDOWPLACEMENT g_windowed_placement{sizeof(WINDOWPLACEMENT)};
 LONG_PTR g_windowed_style{};
-std::atomic<std::uint32_t> g_pad{0u};
-std::atomic<std::uint32_t> g_keyboard_presses{0u};
+// Keyboard state, written by the UI thread and sampled by the guest's pad reads.
 std::mutex g_input_mutex;
-PadInput g_gamepad;
-std::uint32_t g_gamepad_presses{};
+KeyboardMapper g_keyboard;
+bool g_keyboard_enabled{true};
+std::chrono::steady_clock::time_point g_keyboard_sampled{};
 
 // Latest frame in the BGRA byte order expected by a Win32 DIB.
 std::mutex g_frame_mutex;
@@ -85,25 +85,39 @@ void set_fullscreen(HWND window, bool enabled) {
     log_line("WINDOW", enabled ? "fullscreen enabled (F11 / Alt+Enter to restore)" : "windowed mode restored");
 }
 
-std::uint32_t key_to_pad(WPARAM key) {
-    // PSP pad bits (pspctrl.h): SELECT 0x1, START 0x8, UP 0x10, RIGHT 0x20,
-    // DOWN 0x40, LEFT 0x80, L 0x100, R 0x200, TRIANGLE 0x1000, CIRCLE 0x2000,
-    // CROSS 0x4000, SQUARE 0x8000.
-    switch (key) {
-    case VK_UP: return 0x0010u;
-    case VK_RIGHT: return 0x0020u;
-    case VK_DOWN: return 0x0040u;
-    case VK_LEFT: return 0x0080u;
-    case 'Q': return 0x0100u;
-    case 'E': return 0x0200u;
-    case 'W': return 0x1000u;
-    case 'Z': return 0x2000u;
-    case 'X': return 0x4000u;
-    case 'S': return 0x8000u;
-    case VK_RETURN: return 0x0008u;
-    case VK_BACK: return 0x0001u;
-    default: return 0u;
+void configure_keyboard() {
+    const char *enabled = std::getenv("PSPRECOMP_MOTORSTORM_KEYBOARD");
+    const char *bindings = std::getenv("PSPRECOMP_MOTORSTORM_KEYBOARD_BINDINGS");
+    const char *ramp = std::getenv("PSPRECOMP_MOTORSTORM_KEYBOARD_RAMP_MS");
+    std::lock_guard<std::mutex> lock(g_input_mutex);
+    g_keyboard_enabled = !(enabled && (std::string_view(enabled) == "0" || std::string_view(enabled) == "false"));
+    g_keyboard = KeyboardMapper(bindings ? parse_keyboard_bindings(bindings) : default_keyboard_bindings(),
+                                ramp ? static_cast<float>(std::strtod(ramp, nullptr)) : 90.0f);
+    g_keyboard_sampled = std::chrono::steady_clock::now();
+}
+
+// Physical key position from a key message: the PS/2 set 1 scan code, with
+// 0x100 for E0-extended keys (arrows, right Ctrl/Alt, numpad Enter...).
+std::uint16_t key_code(WPARAM key, LPARAM lparam) {
+    std::uint16_t code = static_cast<std::uint16_t>((lparam >> 16) & 0xFF);
+    if (code != 0u) return static_cast<std::uint16_t>(code | (((lparam >> 24) & 1) != 0 ? 0x100u : 0u));
+    // Synthesized messages may carry no scan code.
+    const UINT mapped = MapVirtualKeyW(static_cast<UINT>(key), MAPVK_VK_TO_VSC_EX);
+    return static_cast<std::uint16_t>((mapped & 0xFFu) | ((mapped & 0xFF00u) == 0xE000u ? 0x100u : 0u));
+}
+
+void keyboard_event(WPARAM key, LPARAM lparam, bool down) {
+    const std::uint16_t code = key_code(key, lparam);
+    std::uint32_t before, after;
+    {
+        std::lock_guard<std::mutex> lock(g_input_mutex);
+        if (!g_keyboard_enabled) return;
+        before = g_keyboard.buttons();
+        if (!g_keyboard.key(code, down)) return;
+        after = g_keyboard.buttons();
     }
+    if (before != after && MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_TRACE_CTRL"))
+        log_line("HOST INPUT", std::string(down ? "down " : "up ") + key_name(code) + " pad=" + std::to_string(after));
 }
 
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -141,19 +155,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     case WM_SETCURSOR:
         if (g_fullscreen.load() && LOWORD(lparam) == HTCLIENT) { SetCursor(nullptr); return TRUE; }
         break;
-    case WM_KILLFOCUS:
-        g_pad.store(0u);
-        g_keyboard_presses.store(0u);
+    case WM_SETFOCUS:
+        controller_set_focus(true);
         return 0;
-    case WM_TIMER: {
-        const PadInput next = poll_xinput_controller();
+    case WM_KILLFOCUS: {
         std::lock_guard<std::mutex> lock(g_input_mutex);
-        if (next.connected != g_gamepad.connected || next.slot != g_gamepad.slot)
-            log_line("INPUT", next.connected ? "XInput controller connected, slot=" + std::to_string(next.slot)
-                                              : "XInput controller disconnected");
-        if (next.connected) g_gamepad_presses |= next.buttons & ~g_gamepad.buttons;
-        else g_gamepad_presses = 0u;
-        g_gamepad = next;
+        g_keyboard.release_all();
+        controller_set_focus(false);
         return 0;
     }
     case WM_KEYDOWN:
@@ -169,13 +177,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             if ((lparam & (1ll << 30)) == 0) set_fullscreen(window, !g_fullscreen.load());
             return 0;
         }
-        const std::uint32_t bit = key_to_pad(wparam);
-        if (bit != 0u) {
-            const auto old = g_pad.fetch_or(bit);
-            g_keyboard_presses.fetch_or(bit & ~old);
-            if (old != (old | bit) && MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_TRACE_CTRL"))
-                log_line("HOST INPUT", "down vk=" + std::to_string(wparam) + " pad=" + std::to_string(old | bit));
-        }
+        keyboard_event(wparam, lparam, true);  // Escape is never bindable
         if (wparam == VK_ESCAPE) {
             if (g_fullscreen.load()) { set_fullscreen(window, false); return 0; }
             g_close_requested.store(true);
@@ -184,15 +186,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         return 0;
     }
     case WM_KEYUP:
-    case WM_SYSKEYUP: {
-        const std::uint32_t bit = key_to_pad(wparam);
-        if (bit != 0u) {
-            const auto old = g_pad.fetch_and(~bit);
-            if (old != (old & ~bit) && MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_TRACE_CTRL"))
-                log_line("HOST INPUT", "up vk=" + std::to_string(wparam) + " pad=" + std::to_string(old & ~bit));
-        }
+    case WM_SYSKEYUP:
+        keyboard_event(wparam, lparam, false);
         return 0;
-    }
     case WM_PAINT: {
         PAINTSTRUCT paint{};
         HDC dc = BeginPaint(window, &paint);
@@ -259,7 +255,6 @@ void window_thread_main() {
         log_line("WINDOW", "window creation failed");
         return;
     }
-    SetTimer(window, 1u, 16u, nullptr);
     if (enabled_option("PSPRECOMP_MOTORSTORM_FULLSCREEN")) {
         // Go borderless while still hidden so the bordered window never shows,
         // and show it without ShowWindow: the first ShowWindow call adopts the
@@ -296,6 +291,9 @@ void window_start() {
     g_shutdown_requested.store(false);
     // Match monitor pixel coordinates when switching between monitors / DPI.
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    configure_keyboard();
+    controller_set_focus(true);
+    controller_start();
     g_enabled.store(true);
     g_thread = std::thread(window_thread_main);
 }
@@ -389,59 +387,17 @@ void window_present(psprecomp::GuestMemory &memory, std::uint32_t framebuffer,
     }
 }
 
-PadInput poll_xinput_controller() {
-    using GetState = DWORD (WINAPI *)(DWORD, XINPUT_STATE *);
-    static const GetState get_state = []() -> GetState {
-        const char *option = std::getenv("PSPRECOMP_MOTORSTORM_XINPUT");
-        if (option != nullptr && std::string_view(option) == "0") return nullptr;
-        for (const wchar_t *name : {L"xinput1_4.dll", L"xinput9_1_0.dll", L"xinput1_3.dll"}) {
-            const HMODULE module = LoadLibraryExW(name, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-            if (module == nullptr) continue;
-            const auto function = reinterpret_cast<GetState>(GetProcAddress(module, "XInputGetState"));
-            if (function != nullptr) return function;
-            FreeLibrary(module);
-        }
-        return nullptr;
-    }();
-    if (get_state == nullptr) return {};
-    static int active_slot = -1;
-    static std::chrono::steady_clock::time_point next_scan{};
-    const auto now = std::chrono::steady_clock::now();
-    XINPUT_STATE state{};
-    const auto translate = [&](DWORD slot) {
-        auto result = map_xinput(state.Gamepad.wButtons, state.Gamepad.bLeftTrigger,
-            state.Gamepad.bRightTrigger, state.Gamepad.sThumbLX, state.Gamepad.sThumbLY);
-        result.connected = true; result.slot = slot; result.packet = state.dwPacketNumber;
-        return result;
-    };
-    if (active_slot >= 0) {
-        if (get_state(static_cast<DWORD>(active_slot), &state) == ERROR_SUCCESS)
-            return translate(static_cast<DWORD>(active_slot));
-        active_slot = -1;
-        next_scan = now;
-    }
-    if (now < next_scan) return {};
-    next_scan = now + std::chrono::seconds(2);
-    for (DWORD slot = 0u; slot < 4u; ++slot) {
-        if (get_state(slot, &state) == ERROR_SUCCESS) {
-            active_slot = static_cast<int>(slot);
-            return translate(slot);
-        }
-    }
-    return {};
-}
-
 PadInput window_input() {
-    PadInput result;
-    if (!g_enabled.load()) return result;
+    if (!g_enabled.load()) return {};
+    PadInput keyboard;
     {
         std::lock_guard<std::mutex> lock(g_input_mutex);
-        result = g_gamepad;
-        result.buttons |= g_gamepad_presses;
-        g_gamepad_presses = 0u;
+        const auto now = std::chrono::steady_clock::now();
+        const float elapsed_ms = std::chrono::duration<float, std::milli>(now - g_keyboard_sampled).count();
+        g_keyboard_sampled = now;
+        if (g_keyboard_enabled) keyboard = g_keyboard.sample(elapsed_ms);
     }
-    result.buttons |= g_pad.load() | g_keyboard_presses.exchange(0u);
-    return result;
+    return merge_inputs(controller_input(), keyboard);
 }
 
 std::uint32_t window_pad() { return window_input().buttons; }
@@ -460,6 +416,7 @@ void window_shutdown() {
         PostMessageW(g_window, WM_APP + 1, 0u, 0u);
     }
     if (g_thread.joinable()) g_thread.join();
+    controller_shutdown();
     g_enabled.store(false);
 }
 

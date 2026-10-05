@@ -43,7 +43,7 @@ $targets = @('MotorStormNative', 'MotorStormTextureExtract')
 if ($Tests -or $GpuTests) {
     $targets += @('psprecomp_tests', 'psprecomp_codegen_tests', 'motorstorm_profile_tests',
                   'motorstorm_config_tests', 'motorstorm_texture_tests', 'motorstorm_post_tests',
-                  'motorstorm_window_tests')
+                  'motorstorm_window_tests', 'motorstorm_input_tests')
 }
 if ($GpuTests) { $targets += 'motorstorm_gpu_tests' }
 & $cmakePath --build $buildPath --config Release --parallel 1 --target @targets

@@ -84,6 +84,7 @@ set(MOTORSTORM_HOST_SOURCES
     host/motorstorm_ge.cpp
     host/motorstorm_gpu.cpp
     host/motorstorm_window.cpp
+    host/motorstorm_controller.cpp
     host/motorstorm_audio.cpp
     host/motorstorm_pacing.cpp
     host/motorstorm_textures.cpp
@@ -159,6 +160,23 @@ function(motorstorm_target_common target)
     psprecomp_enable_host_avx(${target})
 endfunction()
 
+# SDL3 (zlib licence) provides universal game-controller support and rumble;
+# see third_party/SDL3/README.md. It is delay-loaded: without SDL3.dll the
+# game still starts and falls back to XInput.
+set(MOTORSTORM_SDL3_DIR "${MOTORSTORM_PROFILE_DIR}/third_party/SDL3")
+function(motorstorm_use_sdl3 target)
+    target_include_directories(${target} PRIVATE "${MOTORSTORM_SDL3_DIR}/include")
+    target_link_libraries(${target} PRIVATE "${MOTORSTORM_SDL3_DIR}/lib/x64/SDL3.lib" delayimp)
+    if(MSVC)
+        target_link_options(${target} PRIVATE "/DELAYLOAD:SDL3.dll")
+    endif()
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${MOTORSTORM_SDL3_DIR}/bin/SDL3.dll" "$<TARGET_FILE_DIR:${target}>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${MOTORSTORM_SDL3_DIR}/LICENSE.txt" "$<TARGET_FILE_DIR:${target}>/SDL3.LICENSE.txt")
+endfunction()
+
 function(motorstorm_set_runtime_output target)
     set_target_properties(${target} PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>")
@@ -169,6 +187,7 @@ add_executable(MotorStormNative
     ${MOTORSTORM_GENERATED}
 )
 motorstorm_target_common(MotorStormNative)
+motorstorm_use_sdl3(MotorStormNative)
 motorstorm_set_runtime_output(MotorStormNative)
 
 if(MSVC)
@@ -231,6 +250,7 @@ if(PSPRECOMP_BUILD_PROFILE_TESTS)
         host/motorstorm_ge.cpp
         host/motorstorm_gpu.cpp
         host/motorstorm_window.cpp
+        host/motorstorm_controller.cpp
         host/motorstorm_audio.cpp
         host/motorstorm_pacing.cpp
         host/motorstorm_textures.cpp
@@ -239,6 +259,7 @@ if(PSPRECOMP_BUILD_PROFILE_TESTS)
         host/motorstorm_media.cpp
         ../vcs/host/vcs_media_decoder.cpp)
     motorstorm_target_common(motorstorm_profile_tests)
+    motorstorm_use_sdl3(motorstorm_profile_tests)
     motorstorm_set_runtime_output(motorstorm_profile_tests)
     if(MSVC)
         target_link_options(motorstorm_profile_tests PRIVATE /STACK:67108864)
@@ -265,10 +286,18 @@ if(PSPRECOMP_BUILD_PROFILE_TESTS)
         MOTORSTORM_CONFIG_TEMPLATE="${MOTORSTORM_PROFILE_DIR}/config/motorstorm.ini")
     motorstorm_set_runtime_output(motorstorm_post_tests)
     add_test(NAME motorstorm_post_tests COMMAND motorstorm_post_tests)
+    # Keyboard / controller mapping and the rumble model (no devices needed).
+    add_executable(motorstorm_input_tests tests/motorstorm_input_tests.cpp host/motorstorm_config.cpp)
+    target_include_directories(motorstorm_input_tests PRIVATE "${MOTORSTORM_PROFILE_DIR}/host")
+    target_compile_definitions(motorstorm_input_tests PRIVATE
+        MOTORSTORM_CONFIG_TEMPLATE="${MOTORSTORM_PROFILE_DIR}/config/motorstorm.ini")
+    motorstorm_set_runtime_output(motorstorm_input_tests)
+    add_test(NAME motorstorm_input_tests COMMAND motorstorm_input_tests)
 
     add_executable(motorstorm_window_tests tests/motorstorm_window_tests.cpp
-        host/motorstorm_window.cpp host/motorstorm_gpu.cpp host/motorstorm_ge.cpp host/motorstorm_textures.cpp
-        host/motorstorm_post.cpp)
+        host/motorstorm_window.cpp host/motorstorm_controller.cpp host/motorstorm_pacing.cpp
+        host/motorstorm_gpu.cpp host/motorstorm_ge.cpp host/motorstorm_textures.cpp host/motorstorm_post.cpp)
+    motorstorm_use_sdl3(motorstorm_window_tests)
     target_include_directories(motorstorm_window_tests PRIVATE "${MOTORSTORM_PROFILE_DIR}/host")
     target_link_libraries(motorstorm_window_tests PRIVATE psprecomp_core d3d12 dxgi dxguid user32 gdi32
         windowscodecs ole32)

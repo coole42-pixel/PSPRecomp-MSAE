@@ -13,6 +13,9 @@ param(
     # low, normal, high, ultra, max or a multiplier (0.5-8); omitted uses the INI.
     [string]$RenderDistance,
     [ValidateSet('on','off')][string]$LessPopIn,
+    # Controllers: auto (SDL3, else XInput), sdl, xinput or off; omitted uses the INI.
+    [ValidateSet('auto','sdl','xinput','off')][string]$Controller,
+    [ValidateSet('on','off')][string]$Rumble,
     [switch]$Fullscreen,
     [switch]$Windowed,
     [switch]$Bringup
@@ -46,6 +49,11 @@ if ($PSBoundParameters.ContainsKey('Antialiasing')) { $settings.PSPRECOMP_MOTORS
 if ($PSBoundParameters.ContainsKey('Fps')) { $settings.PSPRECOMP_MOTORSTORM_FPS = $Fps.ToLowerInvariant() }
 if ($PSBoundParameters.ContainsKey('RenderDistance')) { $settings.PSPRECOMP_MOTORSTORM_RENDER_DISTANCE = $RenderDistance.ToLowerInvariant() }
 if ($PSBoundParameters.ContainsKey('LessPopIn')) { $settings.PSPRECOMP_MOTORSTORM_LESS_POP_IN = $(if ($LessPopIn -eq 'on') { '1' } else { '0' }) }
+if ($PSBoundParameters.ContainsKey('Controller')) {
+    if ($Controller -eq 'off') { $settings.PSPRECOMP_MOTORSTORM_CONTROLLER = '0' }
+    else { $settings.PSPRECOMP_MOTORSTORM_CONTROLLER = '1'; $settings.PSPRECOMP_MOTORSTORM_CONTROLLER_API = $Controller }
+}
+if ($PSBoundParameters.ContainsKey('Rumble')) { $settings.PSPRECOMP_MOTORSTORM_RUMBLE = $(if ($Rumble -eq 'on') { '1' } else { '0' }) }
 if ($PSBoundParameters.ContainsKey('Scale')) { $settings.PSPRECOMP_MOTORSTORM_WINDOW_SCALE = "$Scale" }
 if ($PSBoundParameters.ContainsKey('MaxDispatches')) { $settings.PSPRECOMP_MAX_DISPATCHES = "$MaxDispatches" }
 if ($PSBoundParameters.ContainsKey('StopAfterGe')) { $settings.PSPRECOMP_MOTORSTORM_STOP_AFTER_GE = "$StopAfterGe" }

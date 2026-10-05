@@ -38,6 +38,15 @@ struct NativeConfig {
     std::uint32_t post_color_depth{32};
     std::string post_exposure{"0.0"}, post_contrast{"1.0"}, post_saturation{"1.0"},
         post_temperature{"0.0"}, post_tint{"0.0"}, post_sharpen_strength{"0.2"}, post_soft_particle_softness{"600"};
+    // [controller]: SDL3 / XInput gamepads and synthesized rumble.
+    bool controller{true}, rumble{true}, trigger_rumble{true};
+    std::string controller_api{"auto"}, controller_stick{"left"};
+    std::uint32_t rumble_strength{100}, controller_deadzone{24}, trigger_threshold{12};  // percent
+    // [keyboard]: physical-key bindings. Both binding strings hold only the
+    // controls the INI sets ("cross=space,x;l=s"); the rest keep their defaults.
+    bool keyboard{true};
+    std::uint32_t keyboard_ramp_ms{90};
+    std::string controller_bindings, keyboard_bindings;
     bool trace_imports{}, trace_filesystem{}, verbose{};
     std::vector<std::pair<std::string, std::string>> debug_environment;
     // Unknown or misplaced keys; they are reported in the log, never fatal.

@@ -28,11 +28,11 @@ void window_present(psprecomp::GuestMemory &memory, std::uint32_t framebuffer,
                     std::uint32_t stride, std::uint32_t format, std::uint32_t width,
                     std::uint32_t height);
 
-// Live PSP button mask sampled from the host keyboard (0 when disabled).
+// Live PSP pad from the keyboard (while the window has focus) and every
+// connected controller (see motorstorm_controller.hpp); neutral when disabled.
+// Presses since the previous call are reported once.
 [[nodiscard]] std::uint32_t window_pad();
 [[nodiscard]] PadInput window_input();
-// Device-only polling for diagnostics. No keyboard/mouse automation is used.
-[[nodiscard]] PadInput poll_xinput_controller();
 
 // Captured once the window closes, so the host can report it at exit.
 [[nodiscard]] bool window_close_requested();
