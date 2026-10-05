@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('d3d12','software','auto')][string]$Renderer = 'd3d12',
+    [ValidateSet('d3d12','vulkan','software','auto')][string]$Renderer = 'd3d12',
     [string]$Name = 'd3d12-final',
     [UInt64]$StopAfterGe = 2800,
     [UInt64]$RenderAfterGe = 0,

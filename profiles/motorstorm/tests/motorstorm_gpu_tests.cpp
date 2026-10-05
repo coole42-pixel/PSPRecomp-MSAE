@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <stdexcept>
 #include <vector>
@@ -663,7 +664,149 @@ void soft_particle_pixels(psprecomp::GuestMemory &memory) {
 }
 
 
-int main() {
+// Enhanced filtering samples GPU-generated mips. A sprite at exactly two
+// texels per pixel samples mip 1 at texel centres, so every pixel must be the
+// alpha-weighted 2x2 box of MipCS, computed here independently.
+void enhanced_mip_texels(psprecomp::GuestMemory &memory) {
+    constexpr std::uint32_t texture = 0x08B06000u;
+    std::uint32_t seed = 0x1357u;
+    std::array<std::uint32_t, 32 * 32> texels{};
+    for (unsigned i = 0u; i < texels.size(); ++i) {
+        seed = seed * 1664525u + 1013904223u;
+        texels[i] = (seed >> 7) % 3u == 0u ? 0x00FFFFFFu : 0xFF000000u | (seed >> 8);
+        memory.store32(texture + i * 4u, texels[i]);
+    }
+    for (std::uint32_t i = 0; i < 32 * 32; ++i) memory.store32(kColor + i * 4, 0);
+    // Sprite (two vertices): 16x16 pixels covering 32x32 texels.
+    vertex(memory, 0, 0.0f, 0.0f, 0xFFFFFFFFu);
+    vertex(memory, 1, 16.0f, 16.0f, 0xFFFFFFFFu);
+    memory.store32(kVertices + 24u, std::bit_cast<std::uint32_t>(32.0f));
+    memory.store32(kVertices + 28u, std::bit_cast<std::uint32_t>(32.0f));
+    std::vector<std::uint32_t> list;
+    command(list, 0x9C, kColor); command(list, 0x9D, 0x040020); command(list, 0xD2, 3);
+    command(list, 0xD4, 0); command(list, 0xD5, 31 | (31 << 10));
+    command(list, 0x12, 0x80019F); command(list, 0x10, 0x080000); command(list, 0x01, kVertices);
+    for (auto disabled : {0x1D, 0x1F, 0x21, 0x22, 0x23, 0x24, 0x27, 0xD3, 0xE8, 0xE9})
+        command(list, disabled, 0);
+    command(list, 0xA0, texture); command(list, 0xA8, 0x080020); command(list, 0xB8, 0x505);
+    command(list, 0xC3, 3); command(list, 0xC2, 0); command(list, 0xC0, 0);
+    command(list, 0xC6, 0x101); command(list, 0xC7, 0); command(list, 0xC9, 0x103);  // replace, texture alpha
+    command(list, 0x1E, 1); command(list, 0x04, 0x060002); command(list, 0x0C, 0);
+    for (unsigned i = 0u; i < list.size(); ++i) memory.store32(kList + i * 4u, list[i]);
+    motorstorm::software_ge_execute_list(memory, kList, 0u);
+    std::size_t wrong = 0;
+    for (unsigned y = 1u; y < 15u; ++y)
+        for (unsigned x = 1u; x < 15u; ++x) {
+            std::uint32_t alpha = 0, weighted[3]{}, plain[3]{};
+            for (unsigned dy = 0u; dy < 2u; ++dy)
+                for (unsigned dx = 0u; dx < 2u; ++dx) {
+                    const auto c = texels[(y * 2 + dy) * 32 + x * 2 + dx];
+                    const auto a = c >> 24;
+                    alpha += a;
+                    for (unsigned k = 0; k < 3; ++k) {
+                        weighted[k] += ((c >> (k * 8)) & 255u) * a;
+                        plain[k] += (c >> (k * 8)) & 255u;
+                    }
+                }
+            std::uint32_t expected = ((alpha + 2) / 4) << 24;
+            for (unsigned k = 0; k < 3; ++k)
+                expected |= (alpha ? (weighted[k] + alpha / 2) / alpha : (plain[k] + 2) / 4) << (k * 8);
+            const auto actual = memory.load32(kColor + (y * 32 + x) * 4);
+            bool close = true;
+            for (unsigned k = 0; k < 32; k += 8)
+                close = close && std::abs(int((actual >> k) & 255u) - int((expected >> k) & 255u)) <= 1;
+            if (!close && ++wrong <= 3)
+                std::printf("  mip pixel %u,%u: %08X expected %08X\n", x, y, actual, expected);
+        }
+    std::printf("enhanced filtering mip 1: %zu of 196 texels wrong\n", wrong);
+    if (wrong)
+        throw std::runtime_error("Enhanced filtering must sample the alpha-weighted GPU mip chain");
+}
+// Random sub-pixel triangles (Gouraud colour, bilinear texture, blending)
+// rendered through one GPU renderer; returns every scene's guest pixels.
+std::vector<std::uint8_t> backend_scenes(psprecomp::GuestMemory &memory, const char *renderer) {
+    _putenv_s("PSPRECOMP_MOTORSTORM_RENDERER", renderer);
+    motorstorm::gpu_shutdown(true);
+    motorstorm::reset_software_ge();
+    constexpr std::uint32_t texture = 0x08B06000u;
+    std::uint32_t seed = 0x2468ACEu;
+    const auto next = [&] { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+    // 32x32 texels: opaque colour blocks and fully transparent white, as in sprites.
+    for (unsigned i = 0u; i < 32u * 32u; ++i)
+        memory.store32(texture + i * 4u, ((i / 4u + i / 128u) & 1u) ? 0x00FFFFFFu : 0xFF000000u | (next() & 0xFFFFFFu));
+    std::vector<std::uint8_t> pixels;
+    for (unsigned scene = 0u; scene < 64u; ++scene) {
+        for (std::uint32_t i = 0; i < 32 * 32; ++i) memory.store32(kColor + i * 4, 0x80402010u + i);
+        for (unsigned v = 0u; v < 24u; ++v) {
+            vertex(memory, v, (next() % 4096u) / 120.0f - 1.0f, (next() % 4096u) / 120.0f - 1.0f,
+                   0x80000000u | (next() & 0x7FFFFFFFu));
+            // Minified UVs: several texels per pixel, so mip levels are used.
+            const float scale = scene & 8u ? 7.0f : 1.0f;
+            memory.store32(kVertices + v * 24u, std::bit_cast<std::uint32_t>(memory.load32(kVertices + v * 24u) ? std::bit_cast<float>(memory.load32(kVertices + v * 24u)) * scale : 0.0f));
+            memory.store32(kVertices + v * 24u + 4u, std::bit_cast<std::uint32_t>(std::bit_cast<float>(memory.load32(kVertices + v * 24u + 4u)) * scale));
+        }
+        std::vector<std::uint32_t> list;
+        command(list, 0x9C, kColor); command(list, 0x9D, 0x040020); command(list, 0xD2, 3);
+        command(list, 0xD4, 0); command(list, 0xD5, 31 | (31 << 10));
+        command(list, 0x12, 0x80019F); command(list, 0x10, 0x080000); command(list, 0x01, kVertices);
+        for (auto disabled : {0x1D, 0x1F, 0x23, 0x24, 0x27, 0xD3, 0xE8, 0xE9})
+            command(list, disabled, 0);
+        command(list, 0x50, 1);  // Gouraud shading
+        command(list, 0xA0, texture); command(list, 0xA8, 0x080020); command(list, 0xB8, 0x505);
+        command(list, 0xC3, 3); command(list, 0xC2, 0); command(list, 0xC0, 0);
+        command(list, 0xC6, scene & 1u ? 0x101 : 0); command(list, 0xC7, 0); command(list, 0xC9, 0x100);
+        command(list, 0x22, scene & 16u ? 1 : 0); command(list, 0xDB, 0xFF8004);  // alpha test: a > 128
+        command(list, 0x1E, scene & 2u ? 1 : 0);
+        command(list, 0x21, scene & 4u ? 1 : 0); command(list, 0xDF, 0x0032);  // src alpha, inv src alpha
+        command(list, 0x04, 0x030000 | 24u); command(list, 0x0C, 0);
+        for (unsigned i = 0u; i < list.size(); ++i) memory.store32(kList + i * 4u, list[i]);
+        motorstorm::software_ge_execute_list(memory, kList, 0u);
+        for (std::uint32_t i = 0; i < 32 * 32 * 4; ++i) pixels.push_back(memory.load8(kColor + i));
+    }
+    motorstorm::gpu_shutdown(true);
+    return pixels;
+}
+int main(int argc, char **argv) {
+    // --compare-backends: the D3D12 and Vulkan renderers must produce identical
+    // guest pixels for sub-pixel Gouraud / bilinear / mipmapped / blended
+    // triangles, with PSP and enhanced texture filtering. (The software GE
+    // rasterizes sub-pixel edges differently and is only reported.)
+    if (argc > 1 && std::string(argv[1]) == "--compare-backends") {
+        _putenv_s("PSPRECOMP_MOTORSTORM_RESOLUTION", "1");
+        _putenv_s("PSPRECOMP_MOTORSTORM_AA", "none");
+        psprecomp::GuestMemory memory;
+        bool identical = true;
+        for (const char *filter : {"psp", "enhanced"}) {
+            _putenv_s("PSPRECOMP_MOTORSTORM_TEXTURE_FILTER", filter);
+            const auto d3d12 = backend_scenes(memory, "d3d12");
+            const auto vulkan = backend_scenes(memory, "vulkan");
+            const auto software = backend_scenes(memory, "software");
+            for (const auto &[name, other] : {std::pair{"vulkan", &vulkan}, std::pair{"software", &software}}) {
+                std::size_t pixels = 0, worst = 0;
+                for (std::size_t i = 0; i < d3d12.size(); i += 4) {
+                    std::size_t delta = 0;
+                    for (std::size_t c = 0; c < 4; ++c)
+                        delta = std::max<std::size_t>(delta, std::abs(int(d3d12[i + c]) - int((*other)[i + c])));
+                    pixels += delta != 0;
+                    worst = std::max(worst, delta);
+                }
+                std::printf("filter=%s d3d12 vs %s: %zu of %zu pixels differ, max channel delta %zu\n", filter, name,
+                            pixels, d3d12.size() / 4, worst);
+                if (std::string_view(name) == "vulkan" && pixels)
+                    identical = false;
+            }
+        }
+        _putenv_s("PSPRECOMP_MOTORSTORM_TEXTURE_FILTER", "");
+        if (!identical) {
+            std::fprintf(stderr, "[FAIL] Vulkan and D3D12 renderers produced different guest pixels\n");
+            return 1;
+        }
+        std::puts("D3D12 / Vulkan backend parity passed");
+        return 0;
+    }
+    // --vulkan runs every hardware check against the Vulkan renderer instead of D3D12.
+    const bool vulkan = argc > 1 && std::string(argv[1]) == "--vulkan";
+    const char *renderer = vulkan ? "vulkan" : "d3d12";
     try {
         _putenv_s("PSPRECOMP_MOTORSTORM_RESOLUTION", "1");
         _putenv_s("PSPRECOMP_MOTORSTORM_AA", "none");
@@ -703,7 +846,7 @@ int main() {
         run(memory, Case{3, {}});
         if (memory.load16(kDepth + (10 * 32 + 10) * 2) != 50)
             throw std::runtime_error("Depth-disabled UI must preserve the vehicle preview depth buffer");
-        _putenv_s("PSPRECOMP_MOTORSTORM_RENDERER", "d3d12");
+        _putenv_s("PSPRECOMP_MOTORSTORM_RENDERER", renderer);
         motorstorm::reset_software_ge();
         post_pixels();
         widescreen_pixels(memory);
@@ -812,11 +955,18 @@ int main() {
                             resolution, aa);
             }
         bilinear_fraction_grid(memory);
+        _putenv_s("PSPRECOMP_MOTORSTORM_RESOLUTION", "1");
+        _putenv_s("PSPRECOMP_MOTORSTORM_AA", "none");
+        _putenv_s("PSPRECOMP_MOTORSTORM_TEXTURE_FILTER", "enhanced");
+        motorstorm::gpu_shutdown();
+        enhanced_mip_texels(memory);
+        motorstorm::gpu_shutdown();
+        _putenv_s("PSPRECOMP_MOTORSTORM_TEXTURE_FILTER", "");
         _putenv_s("PSPRECOMP_MOTORSTORM_RESOLUTION", "");
         _putenv_s("PSPRECOMP_MOTORSTORM_AA", "");
-        std::printf("D3D12 %s: %zu pixel-exact blend/stencil/depth/mask/clear "
+        std::printf("%s %s: %zu pixel-exact blend/stencil/depth/mask/clear "
                     "cases, feedback, transfer, presentation and resize passed\n",
-                    report.adapter.c_str(), cases.size());
+                    vulkan ? "Vulkan" : "D3D12", report.adapter.c_str(), cases.size());
         return 0;
     } catch (const std::exception &error) {
         std::fprintf(stderr, "[FAIL] %s\n", error.what());

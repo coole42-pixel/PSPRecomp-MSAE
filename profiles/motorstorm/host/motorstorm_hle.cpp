@@ -5010,7 +5010,7 @@ void report_summary() {
         const auto gpu = gpu_report();
         if (!gpu.adapter.empty()) {
             std::ostringstream out;
-            out << "D3D12 adapter=\"" << gpu.adapter << "\" draws=" << gpu.draws
+            out << gpu.api << " adapter=\"" << gpu.adapter << "\" draws=" << gpu.draws
                 << " hardware_transform_draws=" << gpu.hardware_transform_draws << " vertices=" << gpu.vertices
                 << " submissions=" << gpu.submissions << " texture_uploads=" << gpu.texture_uploads
                 << " publishes(draw/sync/end/cpu/start/other)=" << gpu.publishes[0] << '/' << gpu.publishes[1] << '/'

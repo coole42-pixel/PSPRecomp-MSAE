@@ -60,19 +60,21 @@ void draw_gpu_frame(psprecomp::GuestMemory &memory) {
     for (unsigned i = 0u; i < std::size(words); ++i) memory.store32(list + i * 4u, words[i]);
     motorstorm::software_ge_execute_list(memory, list, 0u, true, 1u);
     check(motorstorm::gpu_active() && motorstorm::gpu_report().draws > 0u,
-          "Hardware window test must render a real PSP framebuffer on D3D12");
+          "Hardware window test must render a real PSP framebuffer on the GPU renderer");
 }
 }
 int main(int argc, char **argv) {
     try {
-        const bool hardware = argc == 2 && std::string_view(argv[1]) == "--d3d12";
+        // --d3d12 / --vulkan: hardware presentation through that renderer.
+        const bool vulkan = argc == 2 && std::string_view(argv[1]) == "--vulkan";
+        const bool hardware = vulkan || (argc == 2 && std::string_view(argv[1]) == "--d3d12");
         _putenv_s("PSPRECOMP_MOTORSTORM_WINDOW", "0");
         motorstorm::window_start();
         check(!motorstorm::window_enabled(), "Explicit WINDOW=0 must stay headless");
         _putenv_s("PSPRECOMP_MOTORSTORM_WINDOW", "1");
         _putenv_s("PSPRECOMP_MOTORSTORM_FULLSCREEN", "0");
         _putenv_s("PSPRECOMP_MOTORSTORM_WINDOW_SCALE", "2");
-        _putenv_s("PSPRECOMP_MOTORSTORM_RENDERER", hardware ? "d3d12" : "software");
+        _putenv_s("PSPRECOMP_MOTORSTORM_RENDERER", vulkan ? "vulkan" : hardware ? "d3d12" : "software");
         _putenv_s("PSPRECOMP_MOTORSTORM_RESOLUTION", "4");
         _putenv_s("PSPRECOMP_MOTORSTORM_AA", "fxaa");
         motorstorm::window_start();

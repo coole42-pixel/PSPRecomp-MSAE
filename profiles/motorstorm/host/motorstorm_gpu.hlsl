@@ -8,7 +8,38 @@
 // X3579: groupshared declared for the compute entry points is ignored (with a
 // warning) when the same file is compiled for the graphics stages.
 #pragma warning(disable : 3556 3579 4000)
-cbuffer DrawState : register(b0) {
+// Vulkan (DXC -spirv): every register gets an explicit descriptor binding.
+// Set 0 is a push-descriptor set updated per draw/dispatch (the D3D12 root
+// views and tables); set 1 holds the eight immutable samplers. Under fxc the
+// annotations vanish and the D3D12 root signature applies unchanged.
+// globallycoherent: on Vulkan, consecutive draws are not separated by
+// barriers; fragment-shader interlock orders their pixel critical sections
+// and coherent accesses make each draw's packed writes visible to the next.
+// DXC's automatic ROV lowering scatters interlock pairs over early returns, so
+// the SPIR-V build declares plain storage buffers and brackets the single
+// read-modify-write call in PS with one explicit begin/end pair
+// (SPV_EXT_fragment_shader_interlock, pixel-ordered) that every invocation
+// executes exactly once in uniform control flow.
+#if defined(__spirv__)
+#define VK_BIND(slot, group) [[vk::binding(slot, group)]]
+#define VK_COHERENT globallycoherent
+#define PIXEL_TARGET RWStructuredBuffer<uint>
+[[vk::ext_extension("SPV_EXT_fragment_shader_interlock")]] [[vk::ext_capability(5378)]]
+[[vk::ext_instruction(5364)]] void beginInvocationInterlock();
+[[vk::ext_extension("SPV_EXT_fragment_shader_interlock")]] [[vk::ext_capability(5378)]]
+[[vk::ext_instruction(5365)]] void endInvocationInterlock();
+#define PS_INTERLOCK_MODE vk::ext_execution_mode(5366)
+#define PS_INTERLOCK_BEGIN beginInvocationInterlock()
+#define PS_INTERLOCK_END endInvocationInterlock()
+#else
+#define VK_BIND(slot, group)
+#define VK_COHERENT
+#define PIXEL_TARGET RasterizerOrderedStructuredBuffer<uint>
+#define PS_INTERLOCK_MODE
+#define PS_INTERLOCK_BEGIN
+#define PS_INTERLOCK_END
+#endif
+VK_BIND(0, 0) cbuffer DrawState : register(b0) {
     uint4 commands[64];
     float4 clipRows[4];
     float4 viewZ, viewportScale, viewportCenter;
@@ -25,25 +56,25 @@ uint C(uint i) { return commands[i >> 2][i & 3]; }
 float rasterScale() { return render.x*0.5; }
 uint rasterExtent(uint native) { return native*render.x/2; }
 uint nativeOf(uint raster) { return (2*raster+1)/render.x; }
-RasterizerOrderedStructuredBuffer<uint> colorTarget : register(u0);
+VK_BIND(1, 0) VK_COHERENT PIXEL_TARGET colorTarget : register(u0);
 // 16-bit PSP depth in the low half of each word. Bit 16 (kHudTag) is set by
 // through-mode draws (the HUD) while render.w bit 2 is on; the post chain reads
 // it from the depth snapshot to keep the HUD out of the colour grade. Guest
 // readback keeps only the low 16 bits, so the game never sees the tag; every
 // depth write replaces it, and the game's per-frame depth clear removes it.
 static const uint kHudTag = 0x10000u;
-RasterizerOrderedStructuredBuffer<uint> depthTarget : register(u1);
-Texture2D<float4> textureImage : register(t0);
-SamplerState samplerWrapWrap : register(s0);
-SamplerState samplerClampWrap : register(s1);
-SamplerState samplerWrapClamp : register(s2);
-SamplerState samplerClampClamp : register(s3);
-SamplerState anisoWrapWrap : register(s4);
-SamplerState anisoClampWrap : register(s5);
-SamplerState anisoWrapClamp : register(s6);
-SamplerState anisoClampClamp : register(s7);
-StructuredBuffer<uint> feedbackImage : register(t2);
-Texture2D<float4> replacementImage : register(t3);
+VK_BIND(2, 0) VK_COHERENT PIXEL_TARGET depthTarget : register(u1);
+VK_BIND(3, 0) Texture2D<float4> textureImage : register(t0);
+VK_BIND(0, 1) SamplerState samplerWrapWrap : register(s0);
+VK_BIND(1, 1) SamplerState samplerClampWrap : register(s1);
+VK_BIND(2, 1) SamplerState samplerWrapClamp : register(s2);
+VK_BIND(3, 1) SamplerState samplerClampClamp : register(s3);
+VK_BIND(4, 1) SamplerState anisoWrapWrap : register(s4);
+VK_BIND(5, 1) SamplerState anisoClampWrap : register(s5);
+VK_BIND(6, 1) SamplerState anisoWrapClamp : register(s6);
+VK_BIND(7, 1) SamplerState anisoClampClamp : register(s7);
+VK_BIND(5, 0) StructuredBuffer<uint> feedbackImage : register(t2);
+VK_BIND(7, 0) Texture2D<float4> replacementImage : register(t3);
 struct Input {
     float3 position : POSITION;
     uint color : COLOR0;
@@ -248,11 +279,11 @@ uint4 sampleEnhanced(float2 st, float2 gx, float2 gy, float2 size) {
 uint4 shade(float2 uv, uint4 v, float clipW) {
     if(feedback.x==2) uv*=rasterScale();
     // A replacement covers the first replace.z rows of the GE texture.
-    float2 st = uv/float2(max(replace.yz,1)), stdx = ddx(st), stdy = ddy(st);
+    float2 st = uv/float2(max(replace.yz,1)), stdx = ddx_coarse(st), stdy = ddy_coarse(st);
     uint baseW,baseH,baseLevels; textureImage.GetDimensions(0,baseW,baseH,baseLevels);
-    float2 st0 = uv/float2(max(baseW,1),max(baseH,1)), st0dx = ddx(st0), st0dy = ddy(st0);
+    float2 st0 = uv/float2(max(baseW,1),max(baseH,1)), st0dx = ddx_coarse(st0), st0dy = ddy_coarse(st0);
     uint lodMode = C(0xc8)&3;
-    float footprint = max(max(abs(ddx(uv.x)),abs(ddy(uv.x))),max(abs(ddx(uv.y)),abs(ddy(uv.y))));
+    float footprint = max(max(abs(ddx_coarse(uv.x)),abs(ddy_coarse(uv.x))),max(abs(ddx_coarse(uv.y)),abs(ddy_coarse(uv.y))));
     float delta = lodMode==0 ? footprint : lodMode==2 ? 2*clipW*asfloat(C(0xd0)<<8) : 1;
     uint bits = asuint(delta);
     int detail = lodMode==0 || lodMode==2 ? (delta>0 ? (int((bits>>23)&255)-127)*16 + int((bits>>19)&15) : -2048) : 0;
@@ -301,25 +332,13 @@ uint3 factor(uint which, bool source, uint4 s, uint4 d, uint fixedColor) {
     if(which==8) return 2*d.a; if(which==9) return 255-min(2*d.a,255);
     return bytes(fixedColor).rgb;
 }
-void PS(Varying i, bool front : SV_IsFrontFace) {
-    uint2 pixel = uint2(i.position.xy);
-    if(any(pixel>=surface.xy)) return;
-    bool clearing = (C(0xd3)&1)!=0;
-    if(!clearing && (C(0x1d)&1) && (front != ((C(0x9b)&1)!=0))) return;
-    uint4 s = uint4(clamp(i.color,0,255));
-    if(!clearing && (C(0x1e)&1)) s = shade(i.uvq.xy/i.uvq.z,s,1/i.position.w);
-    s.rgb = min(255,s.rgb+uint3(clamp(i.secondary,0,255)));
-    if(!clearing && (C(0x22)&1) && !compare(s.a&((C(0xdb)>>16)&255),(C(0xdb)>>8)&((C(0xdb)>>16)&255),C(0xdb))) return;
+// The packed read-modify-write of one pixel (the ROV critical section). Every
+// early return here only skips later writes; nothing returns to PS early.
+void pixelUpdate(uint2 pixel, uint4 s, bool clearing, uint z) {
     uint index = pixel.y*surface.z+pixel.x;
     uint oldColor = unpackFrame(colorTarget[index]); uint4 d = bytes(oldColor);
     uint oldStencil = mode.x==0 ? 0 : d.a;
     uint depthIndex = pixel.y*surface.w+pixel.x;
-    uint z = uint(clamp(i.depthFog.x,0,65535));
-    if(!clearing && (C(0x1f)&1) && i.depthFog.y<1) {
-        uint fog = uint(saturate(i.depthFog.y)*255);
-        s.rgb = (s.rgb*fog+bytes(C(0xcf)).rgb*(255-fog)+255)>>8;
-    }
-    if(!clearing && (C(0x27)&1) && !compare(pack(s)&(C(0xda)&0xffffff),C(0xd9)&C(0xda),C(0xd8)&3)) return;
     bool stencil = !clearing && (C(0x24)&1);
     uint alphaMask = (C(0xe9)&255)<<24;
     if(stencil && !compare(((C(0xdc)>>8)&255)&((C(0xdc)>>16)&255),oldStencil&((C(0xdc)>>16)&255),C(0xdc))) {
@@ -371,9 +390,30 @@ void PS(Varying i, bool front : SV_IsFrontFace) {
     uint mask=(C(0xe8)&0xffffff)|alphaMask;
     colorTarget[index]=packFrame((pack(s)&~mask)|(oldColor&mask));
 }
+void PS(Varying i, bool front : SV_IsFrontFace) {
+    PS_INTERLOCK_MODE;
+    // Tests that need no target pixel come first. A failing pixel still passes
+    // through the (Vulkan) interlock once, at the top level, but skips the update.
+    uint2 pixel = uint2(i.position.xy);
+    bool clearing = (C(0xd3)&1)!=0;
+    bool live = all(pixel<surface.xy) && (clearing || !((C(0x1d)&1) && (front != ((C(0x9b)&1)!=0))));
+    uint4 s = uint4(clamp(i.color,0,255));
+    if(live && !clearing && (C(0x1e)&1)) s = shade(i.uvq.xy/i.uvq.z,s,1/i.position.w);
+    s.rgb = min(255,s.rgb+uint3(clamp(i.secondary,0,255)));
+    if(!clearing && (C(0x22)&1) && !compare(s.a&((C(0xdb)>>16)&255),(C(0xdb)>>8)&((C(0xdb)>>16)&255),C(0xdb))) live = false;
+    uint z = uint(clamp(i.depthFog.x,0,65535));
+    if(!clearing && (C(0x1f)&1) && i.depthFog.y<1) {
+        uint fog = uint(saturate(i.depthFog.y)*255);
+        s.rgb = (s.rgb*fog+bytes(C(0xcf)).rgb*(255-fog)+255)>>8;
+    }
+    if(!clearing && (C(0x27)&1) && !compare(pack(s)&(C(0xda)&0xffffff),C(0xd9)&C(0xda),C(0xd8)&3)) live = false;
+    PS_INTERLOCK_BEGIN;
+    if(live) pixelUpdate(pixel, s, clearing, z);
+    PS_INTERLOCK_END;
+}
 // Direct swapchain presentation reads the GE's resident packed framebuffer.
-StructuredBuffer<uint> presentColor : register(t1);
-RWStructuredBuffer<uint> computeOutput : register(u2);
+VK_BIND(4, 0) StructuredBuffer<uint> presentColor : register(t1);
+VK_BIND(6, 0) RWStructuredBuffer<uint> computeOutput : register(u2);
 // Guest VRAM keeps its original stride and dimensions. Expansion and resolve
 // happen on the GPU; high-resolution surfaces survive guest readback.
 [numthreads(8,8,1)]
@@ -754,7 +794,8 @@ void MipCS(uint3 id : SV_DispatchThreadID) {
         uint4 c=bytes(presentColor[p.y*surface.w+p.x]);
         alpha+=c.a; weighted+=c.rgb*c.a; plain+=c.rgb;
     }
-    uint3 rgb = alpha ? (weighted+alpha/2)/alpha : (plain+2)/4;
+    // Both sides of a vector ?: are evaluated: never divide by zero (undefined in SPIR-V).
+    uint3 rgb = alpha ? (weighted+alpha/2)/max(alpha,1u) : (plain+2)/4;
     computeOutput[id.y*surface.z+id.x]=pack(uint4(rgb,(alpha+2)/4));
 }
 
@@ -802,7 +843,7 @@ void DepthResolveCS(uint3 id : SV_DispatchThreadID) {
 // pixel or any of its 8 neighbours, so the one-pixel fringe that edge
 // filtering blends around HUD shapes stays ungraded too.
 // The depth snapshot (t5) and the other per-frame post inputs.
-StructuredBuffer<uint> depthSnapshot : register(t5);
+VK_BIND(8, 0) StructuredBuffer<uint> depthSnapshot : register(t5);
 float hudMask(int2 p) {
     if((C(0)&64)==0) return 0;
     uint2 e=postExtent();

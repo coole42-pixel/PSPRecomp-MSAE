@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Name,
     [UInt64]$StartUs = 115000000,
     [UInt64]$EndUs = 140000000,
-    [ValidateSet('d3d12','software','auto')][string]$Renderer = 'd3d12',
+    [ValidateSet('d3d12','vulkan','software','auto')][string]$Renderer = 'd3d12',
     [ValidateSet(1,2,3,4,8)][int]$Resolution = 1,
     [ValidateSet('None','FXAA','SSAA2x','SSAA4x')][string]$Antialiasing = 'None',
     [string]$InputScript = 'profiles/motorstorm/tools/race-throughput-input.txt',

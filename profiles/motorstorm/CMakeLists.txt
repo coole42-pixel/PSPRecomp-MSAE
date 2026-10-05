@@ -82,7 +82,6 @@ set(MOTORSTORM_HOST_SOURCES
     host/motorstorm_bootstrap.cpp
     host/motorstorm_hle.cpp
     host/motorstorm_ge.cpp
-    host/motorstorm_gpu.cpp
     host/motorstorm_window.cpp
     host/motorstorm_controller.cpp
     host/motorstorm_audio.cpp
@@ -132,11 +131,90 @@ foreach(shader IN ITEMS VS:vs_5_1 PS:ps_5_1 PointGS:gs_5_1 PresentVS:vs_5_1 Pres
         VERBATIM)
     list(APPEND MOTORSTORM_SHADER_HEADERS "${header}")
 endforeach()
-add_custom_target(motorstorm_shaders DEPENDS ${MOTORSTORM_SHADER_HEADERS})
+# Vulkan renderer ([graphics] renderer = vulkan): the same HLSL compiled to
+# SPIR-V by DXC at build time (motorstorm_spirv_<entry>.h, array
+# g_motorstorm_spirv_<entry>). The Windows SDK's dxc lacks SPIR-V code
+# generation, so DXC comes from the Vulkan SDK (VULKAN_SDK) or, by default, the
+# pinned official GitHub release downloaded into the build tree. VS, PointGS
+# and PresentVS flip Y for Vulkan's clip space; VSPoint is VS unflipped for the
+# point pipeline, whose geometry shader flips.
+option(PSPRECOMP_MOTORSTORM_VULKAN "Build the Vulkan renderer" ON)
+set(MOTORSTORM_DXC "" CACHE FILEPATH "dxc.exe with SPIR-V code generation (Vulkan SDK or DXC GitHub release)")
+set(MOTORSTORM_SPIRV_HEADERS)
+if(PSPRECOMP_MOTORSTORM_VULKAN)
+    if(NOT MOTORSTORM_DXC)
+        if(DEFINED ENV{VULKAN_SDK} AND EXISTS "$ENV{VULKAN_SDK}/Bin/dxc.exe")
+            set(MOTORSTORM_DXC "$ENV{VULKAN_SDK}/Bin/dxc.exe" CACHE FILEPATH
+                "dxc.exe with SPIR-V code generation (Vulkan SDK or DXC GitHub release)" FORCE)
+        else()
+            set(MOTORSTORM_DXC_ROOT "${CMAKE_BINARY_DIR}/_deps/dxc-v1.9.2609")
+            if(NOT EXISTS "${MOTORSTORM_DXC_ROOT}/bin/x64/dxc.exe")
+                message(STATUS "Downloading DXC v1.9.2609 (SPIR-V shader compiler for the Vulkan renderer)")
+                file(DOWNLOAD
+                    "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip"
+                    "${MOTORSTORM_DXC_ROOT}.zip"
+                    EXPECTED_HASH SHA256=ad31b1fc8443175d204f77a611fdb3ef2ec42759bdc2f1167368de24a4a7e7f1
+                    STATUS MOTORSTORM_DXC_DOWNLOAD)
+                list(GET MOTORSTORM_DXC_DOWNLOAD 0 MOTORSTORM_DXC_DOWNLOAD_CODE)
+                if(NOT MOTORSTORM_DXC_DOWNLOAD_CODE EQUAL 0)
+                    message(FATAL_ERROR "DXC download failed (${MOTORSTORM_DXC_DOWNLOAD}). Install the Vulkan SDK, "
+                                        "set MOTORSTORM_DXC, or configure with -DPSPRECOMP_MOTORSTORM_VULKAN=OFF.")
+                endif()
+                file(ARCHIVE_EXTRACT INPUT "${MOTORSTORM_DXC_ROOT}.zip" DESTINATION "${MOTORSTORM_DXC_ROOT}")
+            endif()
+            set(MOTORSTORM_DXC "${MOTORSTORM_DXC_ROOT}/bin/x64/dxc.exe" CACHE FILEPATH
+                "dxc.exe with SPIR-V code generation (Vulkan SDK or DXC GitHub release)" FORCE)
+        endif()
+    endif()
+    if(NOT EXISTS "${MOTORSTORM_DXC}")
+        message(FATAL_ERROR "MOTORSTORM_DXC does not exist: ${MOTORSTORM_DXC}")
+    endif()
+    set(MOTORSTORM_SPIRV_DIR "${CMAKE_CURRENT_BINARY_DIR}/motorstorm_spirv")
+    foreach(shader IN ITEMS VS:VS:vs_6_0:-fvk-invert-y VSPoint:VS:vs_6_0:none PS:PS:ps_6_0:-fvk-use-dx-position-w
+                            PointGS:PointGS:gs_6_0:-fvk-invert-y PresentVS:PresentVS:vs_6_0:-fvk-invert-y
+                            PresentPS:PresentPS:ps_6_0:none PostPS:PostPS:ps_6_0:none
+                            PostPresentPS:PostPresentPS:ps_6_0:none
+                            ExpandCS:ExpandCS:cs_6_0:none ResolveCS:ResolveCS:cs_6_0:none
+                            CaptureCS:CaptureCS:cs_6_0:none DecodeCS:DecodeCS:cs_6_0:none MipCS:MipCS:cs_6_0:none
+                            PostResolveCS:PostResolveCS:cs_6_0:none DebandCS:DebandCS:cs_6_0:none
+                            PostCaptureCS:PostCaptureCS:cs_6_0:none PostColorCS:PostColorCS:cs_6_0:none
+                            PostColorCaptureCS:PostColorCaptureCS:cs_6_0:none
+                            DepthResolveCS:DepthResolveCS:cs_6_0:none VertexCS:VertexCS:cs_6_0:none
+                            DecodeTargetCS:DecodeTargetCS:cs_6_0:none)
+        string(REPLACE ":" ";" shader_parts "${shader}")
+        list(GET shader_parts 0 name)
+        list(GET shader_parts 1 entry)
+        list(GET shader_parts 2 profile)
+        list(GET shader_parts 3 flags)
+        if(flags STREQUAL "none")
+            set(flags "")
+        endif()
+        set(header "${MOTORSTORM_SPIRV_DIR}/motorstorm_spirv_${name}.h")
+        add_custom_command(OUTPUT "${header}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${MOTORSTORM_SPIRV_DIR}"
+            COMMAND "${MOTORSTORM_DXC}" -nologo -spirv -HV 2018 -fspv-target-env=vulkan1.3 -O3 ${flags}
+                    -T ${profile} -E ${entry} -Vn g_motorstorm_spirv_${name} -Fh "${header}" "${MOTORSTORM_SHADER_SOURCE}"
+            DEPENDS "${MOTORSTORM_SHADER_SOURCE}"
+            COMMENT "dxc -spirv ${name} (${profile})"
+            VERBATIM)
+        list(APPEND MOTORSTORM_SPIRV_HEADERS "${header}")
+    endforeach()
+endif()
+add_custom_target(motorstorm_shaders DEPENDS ${MOTORSTORM_SHADER_HEADERS} ${MOTORSTORM_SPIRV_HEADERS})
 function(motorstorm_use_shaders target)
     target_include_directories(${target} PRIVATE "${MOTORSTORM_SHADER_DIR}")
     add_dependencies(${target} motorstorm_shaders)
 endfunction()
+# The renderer: D3D12, plus the Vulkan backend when enabled. The Vulkan
+# headers and define apply to these files only, so enabling the backend never
+# changes the command line of the generated corpus.
+set(MOTORSTORM_GPU_SOURCES host/motorstorm_gpu.cpp)
+if(PSPRECOMP_MOTORSTORM_VULKAN)
+    list(APPEND MOTORSTORM_GPU_SOURCES host/motorstorm_gpu_vulkan.cpp host/motorstorm_vma.cpp)
+    set_property(SOURCE ${MOTORSTORM_GPU_SOURCES} APPEND PROPERTY INCLUDE_DIRECTORIES "${MOTORSTORM_SPIRV_DIR}"
+        "${MOTORSTORM_PROFILE_DIR}/third_party/vulkan/include" "${MOTORSTORM_PROFILE_DIR}/third_party/vma")
+    set_property(SOURCE ${MOTORSTORM_GPU_SOURCES} APPEND PROPERTY COMPILE_DEFINITIONS MOTORSTORM_VULKAN=1)
+endif()
 
 file(GLOB MOTORSTORM_MEDIA_DLLS "${MOTORSTORM_PROFILE_DIR}/../vcs/third_party/ffmpeg/bin/*.dll")
 function(motorstorm_target_common target)
@@ -182,6 +260,7 @@ function(motorstorm_set_runtime_output target)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>")
 endfunction()
 
+list(APPEND MOTORSTORM_HOST_SOURCES ${MOTORSTORM_GPU_SOURCES})
 add_executable(MotorStormNative
     ${MOTORSTORM_HOST_SOURCES}
     ${MOTORSTORM_GENERATED}
@@ -230,7 +309,7 @@ add_custom_command(TARGET MotorStormNative POST_BUILD
 add_executable(MotorStormTextureExtract
     tools/texture_extract/motorstorm_texture_extract.cpp
     host/motorstorm_ge.cpp
-    host/motorstorm_gpu.cpp
+    ${MOTORSTORM_GPU_SOURCES}
     host/motorstorm_textures.cpp
     host/motorstorm_post.cpp)
 target_include_directories(MotorStormTextureExtract PRIVATE "${MOTORSTORM_PROFILE_DIR}/host")
@@ -248,7 +327,7 @@ if(PSPRECOMP_BUILD_PROFILE_TESTS)
         host/motorstorm_bootstrap.cpp
         host/motorstorm_hle.cpp
         host/motorstorm_ge.cpp
-        host/motorstorm_gpu.cpp
+        ${MOTORSTORM_GPU_SOURCES}
         host/motorstorm_window.cpp
         host/motorstorm_controller.cpp
         host/motorstorm_audio.cpp
@@ -296,7 +375,7 @@ if(PSPRECOMP_BUILD_PROFILE_TESTS)
 
     add_executable(motorstorm_window_tests tests/motorstorm_window_tests.cpp
         host/motorstorm_window.cpp host/motorstorm_controller.cpp host/motorstorm_pacing.cpp
-        host/motorstorm_gpu.cpp host/motorstorm_ge.cpp host/motorstorm_textures.cpp host/motorstorm_post.cpp)
+        ${MOTORSTORM_GPU_SOURCES} host/motorstorm_ge.cpp host/motorstorm_textures.cpp host/motorstorm_post.cpp)
     motorstorm_use_sdl3(motorstorm_window_tests)
     target_include_directories(motorstorm_window_tests PRIVATE "${MOTORSTORM_PROFILE_DIR}/host")
     target_link_libraries(motorstorm_window_tests PRIVATE psprecomp_core d3d12 dxgi dxguid user32 gdi32
@@ -309,7 +388,7 @@ if(PSPRECOMP_BUILD_PROFILE_TESTS)
         set_tests_properties(motorstorm_window_tests PROPERTIES TIMEOUT 20)
     endif()
     add_executable(motorstorm_gpu_tests tests/motorstorm_gpu_tests.cpp
-        host/motorstorm_ge.cpp host/motorstorm_gpu.cpp host/motorstorm_textures.cpp host/motorstorm_post.cpp)
+        host/motorstorm_ge.cpp ${MOTORSTORM_GPU_SOURCES} host/motorstorm_textures.cpp host/motorstorm_post.cpp)
     target_include_directories(motorstorm_gpu_tests PRIVATE "${MOTORSTORM_PROFILE_DIR}/host")
     target_link_libraries(motorstorm_gpu_tests PRIVATE psprecomp_core d3d12 dxgi dxguid windowscodecs ole32)
     motorstorm_use_shaders(motorstorm_gpu_tests)
@@ -318,6 +397,13 @@ if(PSPRECOMP_BUILD_PROFILE_TESTS)
     option(PSPRECOMP_MOTORSTORM_GPU_TESTS "Register tests requiring a hardware D3D12 ROV adapter" OFF)
     if(PSPRECOMP_MOTORSTORM_GPU_TESTS)
         add_test(NAME motorstorm_gpu_tests COMMAND motorstorm_gpu_tests)
+        if(PSPRECOMP_MOTORSTORM_VULKAN)
+            add_test(NAME motorstorm_gpu_vulkan_tests COMMAND motorstorm_gpu_tests --vulkan)
+            add_test(NAME motorstorm_gpu_backend_parity COMMAND motorstorm_gpu_tests --compare-backends)
+            add_test(NAME motorstorm_profile_vulkan_tests COMMAND motorstorm_profile_tests --vulkan)
+            add_test(NAME motorstorm_window_vulkan_tests COMMAND motorstorm_window_tests --vulkan)
+            set_tests_properties(motorstorm_window_vulkan_tests PROPERTIES TIMEOUT 30)
+        endif()
         add_test(NAME motorstorm_profile_d3d12_tests COMMAND motorstorm_profile_tests --d3d12)
         add_test(NAME motorstorm_window_d3d12_tests COMMAND motorstorm_window_tests --d3d12)
         set_tests_properties(motorstorm_window_d3d12_tests PROPERTIES TIMEOUT 30)

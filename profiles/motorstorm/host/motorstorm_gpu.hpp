@@ -66,6 +66,7 @@ struct GpuTexture {
     std::uint32_t replacement_rows{}, replacement_width{};
 };
 struct GpuReport {
+    std::string api{"D3D12"};  // renderer that produced the counters
     std::string adapter;
     std::uint64_t draws{}, hardware_transform_draws{}, vertices{}, submissions{}, texture_uploads{},
         feedback_syncs{}, feedback_draws{}, software_draws{}, presents{}, skipped_presents{}, superseded_presents{},

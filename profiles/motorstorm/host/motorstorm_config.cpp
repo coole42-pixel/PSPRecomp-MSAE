@@ -112,8 +112,8 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
                 else config.fps = static_cast<std::uint32_t>(fps);
             } else if (key == "dynamic_fps") config.dynamic_fps = boolean();
             else if (key == "renderer") {
-                if (choice != "d3d12" && choice != "software" && choice != "auto")
-                    invalid("must be d3d12, software or auto");
+                if (choice != "d3d12" && choice != "vulkan" && choice != "software" && choice != "auto")
+                    invalid("must be d3d12, vulkan, software or auto");
                 config.renderer = choice;
             } else if (key == "antialiasing") {
                 if (choice != "none" && choice != "fxaa" && choice != "ssaa2x" && choice != "ssaa4x")

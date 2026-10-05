@@ -5,7 +5,7 @@ param(
     [string]$Executable = 'out/motorstorm/bin/Release/MotorStormNative.exe',
     [switch]$Audio = $true,
     [switch]$Mute,
-    [ValidateSet('d3d12', 'software', 'auto')][string]$Renderer = 'd3d12',
+    [ValidateSet('d3d12', 'vulkan', 'software', 'auto')][string]$Renderer = 'd3d12',
     [ValidateSet(1,2,3,4,8)][int]$Resolution = 1,
     [ValidateSet('None','FXAA','SSAA4x')][string]$Antialiasing = 'None',
     # 'original' or 30-240; omitted uses the INI (default 60).

@@ -23,7 +23,7 @@ their LGPL notice is documented in [the dependency notices](../vcs/THIRD_PARTY.m
 `build.bat` is the Command Prompt / double-click wrapper for the same build.
 The Release executable is `out/motorstorm/bin/Release/MotorStormNative.exe`.
 Run `build.ps1 -Tests -GpuTests` for framework, configuration, window and hardware
-renderer checks; hardware tests require a D3D12 ROV GPU. `-Jobs 1..16` controls
+renderer checks; hardware tests require a D3D12 ROV GPU, and the Vulkan suites a Vulkan 1.3 GPU with fragment shader interlock. `-Jobs 1..16` controls
 compiler workers (default 4). `-BuildDirectory` selects another build tree.
 
 The executable reads `MotorStormNative.ini` beside it. Defaults are **4x internal
@@ -54,7 +54,7 @@ and validation of the aspect and image-effect fixes.
 See [remaining post effects and debug presets](docs/POST_EFFECTS.md) for the
 supported enhancements and the cleaned native/full-debug configurations.
 
-The launcher selects hardware D3D12 rendering. It requires a D3D12 GPU with rasterizer ordered views. Use `-Renderer software` for the software reference or `-Renderer auto` to allow a reported software fallback. `-Bringup` enables historical scene skips for diagnostics; normal play leaves it off.
+The launcher selects hardware D3D12 rendering. It requires a D3D12 GPU with rasterizer ordered views. `-Renderer vulkan` (or `[graphics] renderer = vulkan`) runs the same renderer on Vulkan; see [the Vulkan renderer](docs/VULKAN_RENDERER.md). Use `-Renderer software` for the software reference or `-Renderer auto` to allow a reported software fallback. `-Bringup` enables historical scene skips for diagnostics; normal play leaves it off.
 
 `-Resolution` selects actual internal rendering: 1 = 480×272, 2 = 960×544, 3 = 1440×816, 4 = 1920×1088, 8 = 3840×2176. `-Antialiasing` accepts `None`, `FXAA` or `SSAA4x`. SSAA4x renders a 2×2 sample grid per output pixel and costs more GPU work. `-Scale` controls the window size independently. These are PSP aspect-ratio resolutions; 4× is 1920×1088, rather than a cropped 1080p frame. Software rendering remains native-resolution.
 
@@ -76,4 +76,4 @@ Zero-byte file reads at soundtrack boundaries no longer reuse a stale byte count
 
 The generated corpus uses 4 KiB units emitted with `--builtin-accessors`, which made the race benchmark 37% faster with identical frames. Regenerate it with `psp_recomp <EBOOT> --auto profiles/motorstorm/generated 0x08804000 4096 --builtin-accessors`; see [the race benchmark page](docs/PERFORMANCE_RACE_BENCH.md#round-2-2026-10-03-generated-code-layout).
 
-See [D3D12 implementation and verification](docs/PHASE12_D3D12.md) and [verified correctness fixes](docs/PHASE12_FIXES.md). The generated corpus and game files must already be present as described by the profile's existing configuration.
+See [D3D12 implementation and verification](docs/PHASE12_D3D12.md), [the Vulkan renderer](docs/VULKAN_RENDERER.md) and [verified correctness fixes](docs/PHASE12_FIXES.md). The generated corpus and game files must already be present as described by the profile's existing configuration.

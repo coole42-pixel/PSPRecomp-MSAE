@@ -81,8 +81,8 @@ int main(int argc,char **argv) {
                 pcm[440] == 12000 && pcm.back() == -12000,
                 "Recovery ramps into new PCM without changing its later samples");
     }
-    if(argc==2 && std::string(argv[1])=="--d3d12") {
-        _putenv_s("PSPRECOMP_MOTORSTORM_RENDERER","d3d12");
+    if(argc==2 && (std::string(argv[1])=="--d3d12" || std::string(argv[1])=="--vulkan")) {
+        _putenv_s("PSPRECOMP_MOTORSTORM_RENDERER",std::string(argv[1])=="--vulkan" ? "vulkan" : "d3d12");
         // These assertions specify native PSP pixel centers and mip footprints.
         // Scaled rendering/AA are exercised separately by motorstorm_gpu_tests.
         _putenv_s("PSPRECOMP_MOTORSTORM_RESOLUTION","1");

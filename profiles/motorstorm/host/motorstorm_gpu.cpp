@@ -4,6 +4,16 @@
 #include "motorstorm_perf.hpp"
 #include "motorstorm_post.hpp"
 #include "motorstorm_textures.hpp"
+#if defined(MOTORSTORM_VULKAN)
+#include "motorstorm_gpu_vulkan.hpp"
+#define MOTORSTORM_VULKAN_ROUTE(call) \
+    if (use_vulkan)                    \
+        return vulkan::call;
+#define MOTORSTORM_VULKAN_FORWARD(call) vulkan::call;
+#else
+#define MOTORSTORM_VULKAN_ROUTE(call)
+#define MOTORSTORM_VULKAN_FORWARD(call)
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -52,6 +62,14 @@ bool emulation_racing{};
 std::atomic<bool> guest_widescreen{};
 void (*publish_guard)() = nullptr;
 std::atomic<std::uint64_t> output_size{(480ull << 32) | 272u};
+// [graphics] renderer = vulkan routes every public call to the Vulkan
+// renderer (motorstorm_gpu_vulkan.cpp); the shared settings below are
+// forwarded to it as well.
+bool use_vulkan{};
+bool vulkan_selected() noexcept {
+    const char *backend = std::getenv("PSPRECOMP_MOTORSTORM_RENDERER");
+    return backend && std::strcmp(backend, "vulkan") == 0;
+}
 #if defined(_WIN32)
 using Microsoft::WRL::ComPtr;
 // Shader bytecode compiled at build time by fxc from motorstorm_gpu.hlsl.
@@ -1401,6 +1419,7 @@ ID3D12Resource *feedback_snapshot(State &s, const psprecomp::GuestMemory &memory
 } // namespace
 
 std::vector<GpuDecodedTexture> gpu_take_decoded() {
+    MOTORSTORM_VULKAN_ROUTE(take_decoded())
     std::vector<GpuDecodedTexture> result;
 #if defined(_WIN32)
     if (!state)
@@ -1430,6 +1449,7 @@ std::vector<GpuDecodedTexture> gpu_take_decoded() {
     return result;
 }
 std::vector<std::uint32_t> gpu_debug_decode(const GpuTexture &texture, std::size_t level) {
+    MOTORSTORM_VULKAN_ROUTE(debug_decode(texture, level))
     std::vector<std::uint32_t> result;
 #if defined(_WIN32)
     if (!state || state->recording || level >= texture.raw.size())
@@ -1483,6 +1503,7 @@ void setup_post(State &s) {
 } // namespace
 #endif
 void gpu_set_racing(bool racing) noexcept {
+    MOTORSTORM_VULKAN_FORWARD(set_racing(racing))
     emulation_racing = racing;
 #if defined(_WIN32)
     if (state)
@@ -1493,12 +1514,20 @@ void gpu_set_racing(bool racing) noexcept {
 }
 bool gpu_requested() noexcept {
     const char *backend = std::getenv("PSPRECOMP_MOTORSTORM_RENDERER");
-    return backend && (std::strcmp(backend, "d3d12") == 0 || std::strcmp(backend, "auto") == 0);
+    return backend && (std::strcmp(backend, "d3d12") == 0 || std::strcmp(backend, "auto") == 0 ||
+                       std::strcmp(backend, "vulkan") == 0);
 }
-bool gpu_active() noexcept { return report.active; }
+bool gpu_active() noexcept {
+    MOTORSTORM_VULKAN_ROUTE(active()) return report.active; }
 bool gpu_initialize() {
     if (report.active)
         return true;
+#if defined(MOTORSTORM_VULKAN)
+    if (use_vulkan || vulkan_selected()) {
+        use_vulkan = true;
+        return vulkan::initialize();
+    }
+#endif
     if (attempted || !gpu_requested())
         return false;
     attempted = true;
@@ -1643,6 +1672,15 @@ bool gpu_initialize() {
     return false;
 }
 void gpu_shutdown(bool reset_report) noexcept {
+#if defined(MOTORSTORM_VULKAN)
+    if (use_vulkan) {
+        // The final counters stay readable through gpu_report() until a reset.
+        vulkan::shutdown(reset_report);
+        use_vulkan = !reset_report;
+        if (use_vulkan)
+            return;
+    }
+#endif
 #if defined(_WIN32)
     if (state) {
         try {
@@ -1713,6 +1751,7 @@ UINT64 process_vertices(State &s, psprecomp::GuestMemory &memory, const GpuVerte
 #endif
 void gpu_submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const GpuVertex> vertices,
                 const GpuTexture *texture, const GpuVertexJob *job) {
+    MOTORSTORM_VULKAN_ROUTE(submit(memory, draw, vertices, texture, job))
 #if defined(_WIN32)
     const UINT vertex_count = job ? job->output_count : static_cast<UINT>(vertices.size());
     if (!state || vertex_count == 0 || draw.framebuffer == 0 || draw.stride == 0 || draw.stride > 1024 ||
@@ -2126,6 +2165,7 @@ void publish_readbacks(State &s, psprecomp::GuestMemory &memory) {
 } // namespace
 #endif
 void gpu_sync(psprecomp::GuestMemory &memory) {
+    MOTORSTORM_VULKAN_ROUTE(sync(memory))
 #if defined(_WIN32)
     if (!state)
         return;
@@ -2140,6 +2180,7 @@ void gpu_sync(psprecomp::GuestMemory &memory) {
 #endif
 }
 void gpu_end_list(psprecomp::GuestMemory &memory) {
+    MOTORSTORM_VULKAN_ROUTE(end_list(memory))
 #if defined(_WIN32)
     if (!deferred_readback) {
         gpu_sync(memory);
@@ -2167,6 +2208,7 @@ void gpu_end_list(psprecomp::GuestMemory &memory) {
 #endif
 }
 void gpu_settle(psprecomp::GuestMemory &memory) {
+    MOTORSTORM_VULKAN_ROUTE(settle(memory))
 #if defined(_WIN32)
     if (state) {
         PublishReason reason(4);
@@ -2174,9 +2216,16 @@ void gpu_settle(psprecomp::GuestMemory &memory) {
     }
 #endif
 }
-void gpu_set_deferred_readback(bool enabled) noexcept { deferred_readback = enabled; }
-void gpu_set_publish_guard(void (*guard)()) noexcept { publish_guard = guard; }
+void gpu_set_deferred_readback(bool enabled) noexcept {
+    MOTORSTORM_VULKAN_FORWARD(set_deferred_readback(enabled))
+    deferred_readback = enabled;
+}
+void gpu_set_publish_guard(void (*guard)()) noexcept {
+    MOTORSTORM_VULKAN_FORWARD(set_publish_guard(guard))
+    publish_guard = guard;
+}
 bool gpu_sync_texture(psprecomp::GuestMemory &memory, std::uint32_t address, std::uint32_t bytes) {
+    MOTORSTORM_VULKAN_ROUTE(sync_texture(memory, address, bytes))
 #if defined(_WIN32)
     if (!state)
         return false;
@@ -2202,6 +2251,9 @@ bool gpu_transfer_from_target(std::uint32_t source, std::uint32_t source_stride,
                               std::uint32_t source_y, std::uint32_t destination, std::uint32_t destination_stride,
                               std::uint32_t destination_x, std::uint32_t destination_y, std::uint32_t width,
                               std::uint32_t height, std::uint32_t bpp) {
+    MOTORSTORM_VULKAN_ROUTE(transfer_from_target(source, source_stride, source_x, source_y, destination,
+                                                 destination_stride, destination_x, destination_y, width, height,
+                                                 bpp))
 #if defined(_WIN32)
     if (!state || !state->recording)
         return false;
@@ -2259,6 +2311,7 @@ bool gpu_transfer_from_target(std::uint32_t source, std::uint32_t source_stride,
 }
 bool gpu_source_in_target(std::uint32_t address, std::uint32_t bytes, bool palette,
                           std::uint64_t &version) noexcept {
+    MOTORSTORM_VULKAN_ROUTE(source_in_target(address, bytes, palette, version))
 #if defined(_WIN32)
     if (!state || !state->recording || bytes == 0u || (palette && bytes % 4u != 0u))
         return false;
@@ -2277,6 +2330,7 @@ bool gpu_source_in_target(std::uint32_t address, std::uint32_t bytes, bool palet
 #endif
 }
 bool gpu_overlay_targets(std::uint32_t address, std::uint32_t bytes, std::uint64_t &version) noexcept {
+    MOTORSTORM_VULKAN_ROUTE(overlay_targets(address, bytes, version))
 #if defined(_WIN32)
     if (!state || !state->recording || bytes == 0u)
         return false;
@@ -2301,6 +2355,7 @@ bool gpu_overlay_targets(std::uint32_t address, std::uint32_t bytes, std::uint64
 #endif
 }
 bool gpu_touches_surface(std::uint32_t address, std::uint32_t bytes) noexcept {
+    MOTORSTORM_VULKAN_ROUTE(touches_surface(address, bytes))
 #if defined(_WIN32)
     if (!state)
         return false;
@@ -2316,8 +2371,10 @@ bool gpu_touches_surface(std::uint32_t address, std::uint32_t bytes) noexcept {
 #endif
     return false;
 }
-void gpu_note_software_draw() noexcept { ++report.software_draws; }
+void gpu_note_software_draw() noexcept {
+    MOTORSTORM_VULKAN_ROUTE(note_software_draw()) ++report.software_draws; }
 bool gpu_feedback_available(std::uint32_t address, std::uint32_t stride, std::uint32_t format) noexcept {
+    MOTORSTORM_VULKAN_ROUTE(feedback_available(address, stride, format))
 #if defined(_WIN32)
     if (!state)
         return false;
@@ -2330,10 +2387,17 @@ bool gpu_feedback_available(std::uint32_t address, std::uint32_t stride, std::ui
 #endif
     return false;
 }
-GpuReport gpu_report() { return report; }
-std::uint64_t gpu_memory_epoch() noexcept { return gpu_publish_epoch; }
+GpuReport gpu_report() {
+    MOTORSTORM_VULKAN_ROUTE(report())
+    return report;
+}
+std::uint64_t gpu_memory_epoch() noexcept {
+    MOTORSTORM_VULKAN_ROUTE(memory_epoch())
+    return gpu_publish_epoch;
+}
 GpuImage gpu_capture(psprecomp::GuestMemory &memory, std::uint32_t framebuffer, std::uint32_t stride,
                      std::uint32_t format, std::uint32_t width, std::uint32_t height) {
+    MOTORSTORM_VULKAN_ROUTE(capture(memory, framebuffer, stride, format, width, height))
     GpuImage result;
 #if defined(_WIN32)
     if (!state || state->recording || !width || !height)
@@ -2863,6 +2927,7 @@ void release_swapchain(State &s) {
 } // namespace
 #endif
 bool gpu_widescreen_enabled() noexcept {
+    MOTORSTORM_VULKAN_ROUTE(widescreen_enabled())
 #if defined(_WIN32)
     return state && state->widescreen;
 #else
@@ -2875,12 +2940,22 @@ void gpu_output_size(std::uint32_t &width, std::uint32_t &height) noexcept {
     height = static_cast<std::uint32_t>(size);
 }
 void gpu_set_output_size(std::uint32_t width, std::uint32_t height) noexcept {
+    MOTORSTORM_VULKAN_FORWARD(set_output_size(width, height))
     if (width && height)
         output_size.store((static_cast<std::uint64_t>(width) << 32) | height, std::memory_order_relaxed);
 }
-void gpu_set_guest_widescreen(bool active) noexcept { guest_widescreen.store(active, std::memory_order_relaxed); }
+void gpu_set_guest_widescreen(bool active) noexcept {
+    MOTORSTORM_VULKAN_FORWARD(set_guest_widescreen(active))
+    guest_widescreen.store(active, std::memory_order_relaxed);
+}
 GpuImage gpu_debug_post(const GpuImage &input, const PostSettings &settings, float fade, bool reference,
                         const std::vector<std::uint32_t> *depth_words) {
+#if defined(MOTORSTORM_VULKAN)
+    if (use_vulkan || vulkan_selected()) {
+        use_vulkan = true;
+        return vulkan::debug_post(input, settings, fade, reference, depth_words);
+    }
+#endif
     GpuImage result;
 #if defined(_WIN32)
     if (!input.width || !input.height || input.rgba.size() != static_cast<std::size_t>(input.width) * input.height * 4)
@@ -2961,6 +3036,7 @@ GpuImage gpu_debug_post(const GpuImage &input, const PostSettings &settings, flo
 std::vector<std::uint32_t> gpu_debug_depth_words(psprecomp::GuestMemory &memory, std::uint32_t framebuffer,
                                                  std::uint32_t stride, std::uint32_t format, std::uint32_t width,
                                                  std::uint32_t height) {
+    MOTORSTORM_VULKAN_ROUTE(debug_depth_words(memory, framebuffer, stride, format, width, height))
     std::vector<std::uint32_t> words;
 #if defined(_WIN32)
     if (!state || state->recording || !width || !height)
@@ -3075,6 +3151,7 @@ void capture_post_frame(State &s, psprecomp::GuestMemory &memory, std::uint32_t 
 }
 bool gpu_present(psprecomp::GuestMemory &memory, void *window, std::uint32_t framebuffer,
                  std::uint32_t stride, std::uint32_t format, std::uint32_t width, std::uint32_t height) {
+    MOTORSTORM_VULKAN_ROUTE(present(memory, window, framebuffer, stride, format, width, height))
 #if defined(_WIN32)
     if (!state || !window || !width || !height)
         return false;
