@@ -1651,13 +1651,38 @@ std::uint64_t hash_bytes(std::uint64_t hash, const void *data, std::size_t bytes
     return hash;
 }
 
+// Content hash for bulk data (texels, palettes): four independent lanes of
+// the hash_bytes step so the multiplies overlap, 32 bytes per iteration.
+// Keys only live for the session, so the value may differ from hash_bytes.
+std::uint64_t hash_wide(std::uint64_t hash, const std::uint8_t *source, std::size_t bytes) {
+    std::uint64_t lanes[4]{hash, hash ^ 0x9E3779B97F4A7C15ull, hash ^ 0xC2B2AE3D27D4EB4Full,
+                           hash ^ 0x165667B19E3779F9ull};
+    while (bytes >= 32u) {
+        for (int lane = 0; lane < 4; ++lane) {
+            std::uint64_t word = 0;
+            std::memcpy(&word, source + lane * 8, sizeof(word));
+            lanes[lane] = (lanes[lane] ^ word) * 1099511628211ull;
+            lanes[lane] ^= lanes[lane] >> 29u;
+        }
+        source += 32u;
+        bytes -= 32u;
+    }
+    hash = hash_bytes(lanes[0], &lanes[1], sizeof(lanes[1]) * 3u);
+    return hash_bytes(hash, source, bytes);
+}
+
 // Reads the loaded palette bytes from guest memory.
 void load_clut(GuestMemory &memory) {
-    for (std::uint32_t i = 0u; i < g_state.clut_loaded_bytes; ++i) {
-        const auto at = g_state.texture_clut_address + i;
-        g_state.clut[i] = memory.contains(at, 1u) ? memory.aot_load8(at) : 0u;
+    const auto address = g_state.texture_clut_address, loaded = g_state.clut_loaded_bytes;
+    if (loaded != 0u && memory.contains(address, loaded)) {
+        memory.copy_out(address, {g_state.clut.data(), loaded});
+    } else {
+        for (std::uint32_t i = 0u; i < loaded; ++i) {
+            const auto at = address + i;
+            g_state.clut[i] = memory.contains(at, 1u) ? memory.aot_load8(at) : 0u;
+        }
     }
-    g_state.clut_hash = hash_bytes(14695981039346656037ull, g_state.clut.data(), g_state.clut.size());
+    g_state.clut_hash = hash_wide(14695981039346656037ull, g_state.clut.data(), g_state.clut.size());
     g_state.clut_gpu = false;
 }
 // A GPU palette is only valid until the next readback publish; after one the
@@ -1736,12 +1761,17 @@ const GpuTexture *gpu_texture(GuestMemory &memory) {
     for(std::uint32_t mip=0;mip<=max_level && !gpu_source && !gpu_overlay;++mip) {
         const auto &level=levels[mip];
         if(!memory.contains(level.address,level.bytes)) continue;
+        // Hash the texels in place when they are contiguous in host memory.
+        if(const auto *texels=memory.raw_pointer(level.address,level.bytes)) {
+            content_key=hash_wide(content_key,texels,level.bytes);
+            continue;
+        }
         std::uint32_t offset=0u;
         while(offset<level.bytes) {
             const auto count=std::min<std::uint32_t>(static_cast<std::uint32_t>(chunk.size()),
                                                      level.bytes-offset);
             memory.copy_out(level.address+offset,{chunk.data(),count});
-            content_key=hash_bytes(content_key,chunk.data(),count);
+            content_key=hash_wide(content_key,chunk.data(),count);
             offset+=count;
         }
     }
