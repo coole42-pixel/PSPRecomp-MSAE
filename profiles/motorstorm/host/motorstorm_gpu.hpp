@@ -71,7 +71,9 @@ struct GpuReport {
     std::uint64_t draws{}, hardware_transform_draws{}, vertices{}, submissions{}, texture_uploads{},
         feedback_syncs{}, feedback_draws{}, software_draws{}, presents{}, skipped_presents{}, superseded_presents{},
         replaced_draws{}, replacement_uploads{}, replacements_evicted{}, streamed_texture_updates{},
-        gpu_vertex_draws{};
+        gpu_vertex_draws{}, hardware_pixel_draws{}, ordered_pixel_draws{}, pixel_path_switches{},
+        hardware_alpha_draws{}, reject_feedback{}, reject_stencil{}, reject_color{}, reject_mask{}, reject_blend{},
+        reject_other{}, hw_packs{}, hw_pack_ns{}, pipelines_created{}, pipeline_create_ns{};
     // Optional asynchronous GPU timestamp totals: resolve, deband, colour.
     std::uint64_t post_gpu_frames{}, post_gpu_max_ns{};
     // Readback publishes by trigger: draw, sync, list end, CPU VRAM access,
@@ -80,6 +82,9 @@ struct GpuReport {
     std::array<std::uint64_t, 3> post_gpu_ns{};
     bool active{};
     std::uint32_t resolution_scale{1}, raster_half{2}, antialiasing{};  // raster scale in half units
+    // Latest retired GE-chunk GPU time from timestamp queries. Negative: none yet.
+    double last_gpu_ms{-1.0};
+    float render_scale{1.0f};
 };
 struct GpuImage {
     std::uint32_t width{}, height{};

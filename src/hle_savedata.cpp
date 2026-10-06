@@ -10,6 +10,7 @@
 
 namespace psprecomp {
 namespace {
+std::string last_error;
 struct Dialog {
     std::uint32_t status{}, parameter{}, size{};
     std::filesystem::path root;
@@ -220,6 +221,8 @@ std::uint32_t execute(Runtime &rt, const Dialog &d) {
 }
 }
 
+const std::string &savedata_last_error() { return last_error; }
+
 void install_savedata_hle(Runtime &rt, std::filesystem::path root,
                           std::function<void(std::uint32_t, std::uint32_t)> observer) {
     auto d = std::make_shared<Dialog>(); d->root = std::move(root); d->observer = std::move(observer);
@@ -241,8 +244,9 @@ void install_savedata_hle(Runtime &rt, std::filesystem::path root,
     rt.register_hle("sceUtility", 0xD4B95FFBu, [d](Runtime &r, AllegrexContext &c) {
         if (d->status != 2) { c.set_gpr(2, 0x80110001u); return; }
         std::uint32_t result = 0;
+        last_error.clear();
         try { result = execute(r, *d); }
-        catch (const std::filesystem::filesystem_error &) { result = 0x80110305u; }
+        catch (const std::filesystem::filesystem_error &error) { result = 0x80110305u; last_error = error.what(); }
         r.memory().store32(d->parameter + 0x1C, result);
         d->status = 3;
         if (d->observer) d->observer(d->parameter, result);

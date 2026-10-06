@@ -1,4 +1,5 @@
 #pragma once
+#include "motorstorm_parse_real.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -57,8 +58,7 @@ inline std::optional<float> parse_render_distance(std::string_view text) {
     if (value == "max") return 4.0f;
     if (!value.empty() && value.back() == 'x') value.pop_back();
     float number{};
-    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), number);
-    if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || !(number >= 0.5f && number <= 8.0f))
+    if (!parse_real(value, number) || !(number >= 0.5f && number <= 8.0f))
         return std::nullopt;
     return number;
 }

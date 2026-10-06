@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>Analog stick thumb cap (idle)</title>
+  <defs>
+    <radialGradient id="stick-cap-idle-shadow" gradientUnits="userSpaceOnUse" cx="128" cy="138" r="116"><stop offset="0" stop-color="#000000" stop-opacity="0.45"/><stop offset="0.78" stop-color="#000000" stop-opacity="0.35"/><stop offset="1" stop-color="#000000" stop-opacity="0"/></radialGradient>
+    <radialGradient id="stick-cap-idle-body" gradientUnits="userSpaceOnUse" cx="104" cy="92" r="150"><stop offset="0" stop-color="#5A6377" stop-opacity="0.86"/><stop offset="0.45" stop-color="#1E2330" stop-opacity="0.88"/><stop offset="1" stop-color="#090B10" stop-opacity="0.92"/></radialGradient>
+    <linearGradient id="stick-cap-idle-rim" gradientUnits="userSpaceOnUse" x1="0" y1="34" x2="0" y2="222"><stop offset="0" stop-color="#FFFFFF" stop-opacity="0.62"/><stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0.12"/><stop offset="1" stop-color="#FFFFFF" stop-opacity="0.24"/></linearGradient>
+    <radialGradient id="stick-cap-idle-dish" gradientUnits="userSpaceOnUse" cx="142" cy="156" r="110"><stop offset="0" stop-color="#2E3542" stop-opacity="0.9"/><stop offset="1" stop-color="#0E1117" stop-opacity="0.92"/></radialGradient>
+    <linearGradient id="stick-cap-idle-dishrim" gradientUnits="userSpaceOnUse" x1="0" y1="62" x2="0" y2="194"><stop offset="0" stop-color="#000000" stop-opacity="0.45"/><stop offset="1" stop-color="#FFFFFF" stop-opacity="0.28"/></linearGradient>
+    <linearGradient id="stick-cap-idle-sheen" gradientUnits="userSpaceOnUse" x1="0" y1="34" x2="0" y2="100"><stop offset="0" stop-color="#FFFFFF" stop-opacity="0.22"/><stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/></linearGradient>
+  </defs>
+  <g id="background" opacity="1">
+    <circle cx="128" cy="138" r="116" fill="url(#stick-cap-idle-shadow)"/>
+    <g>
+    <circle cx="128" cy="128" r="94" fill="url(#stick-cap-idle-body)"/>
+    <circle cx="128" cy="128" r="92.5" fill="none" stroke="url(#stick-cap-idle-rim)" stroke-width="3"/>
+    <circle cx="128" cy="128" r="66" fill="url(#stick-cap-idle-dish)"/>
+    <circle cx="128" cy="128" r="66" fill="none" stroke="url(#stick-cap-idle-dishrim)" stroke-width="2.5"/>
+    <path d="M 64 76 A 94 94 0 0 1 192 76 A 70 70 0 0 0 64 76 Z" fill="url(#stick-cap-idle-sheen)"/>
+    </g>
+  </g>
+  <g id="symbol" opacity="1">
+    <g>
+    <circle cx="208" cy="128" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="205.27" cy="148.71" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="197.28" cy="168" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="184.57" cy="184.57" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="168" cy="197.28" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="148.71" cy="205.27" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="128" cy="208" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="107.29" cy="205.27" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="88" cy="197.28" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="71.43" cy="184.57" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="58.72" cy="168" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="50.73" cy="148.71" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="48" cy="128" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="50.73" cy="107.29" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="58.72" cy="88" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="71.43" cy="71.43" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="88" cy="58.72" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="107.29" cy="50.73" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="128" cy="48" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="148.71" cy="50.73" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="168" cy="58.72" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="184.57" cy="71.43" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="197.28" cy="88" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="205.27" cy="107.29" r="2.6" fill="#FFFFFF" fill-opacity="0.22"/>
+    <circle cx="128" cy="128" r="28" fill="none" stroke="#8CCBFF" stroke-opacity="0.16" stroke-width="10"/>
+    <circle cx="128" cy="128" r="28" fill="none" stroke="#8CCBFF" stroke-opacity="0.55" stroke-width="3.5"/>
+    <circle cx="128" cy="128" r="6" fill="#8CCBFF" fill-opacity="0.6"/>
+    </g>
+  </g>
+</svg>

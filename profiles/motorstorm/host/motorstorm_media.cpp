@@ -110,7 +110,11 @@ void restart_audio(Movie &v) {
 bool decode_frame(Runtime &r, Movie &v) {
     if (v.video_eof && feeding_next_pass(r, v, v.video_loops)) restart_video(r, v);
     if (v.video_eof || v.source.empty() || !v.width || !v.height || v.width > 480 || v.height > 272) return false;
-    if (!v.video.is_open() && !v.video.open(v.source)) { v.video_eof = true; return false; }
+    if (!v.video.is_open() && !v.video.open(v.source)) {
+        v.video_eof = true;
+        log_line("MPEG", "video open failed source=" + v.source.string());
+        return false;
+    }
     // The game decodes one picture per game frame, so an unlocked frame rate
     // would play movies fast. Repeat the current picture until the stream's
     // own clock (one picture per 3003 ticks of 90 kHz) is due.
@@ -401,7 +405,31 @@ void install_mpeg_hle(Runtime &rt) {
         auto *v=movie(c.gpr[4]); if (!v || !r.memory().contains(c.gpr[6],8192)) {c.set_gpr(2,invalid);return;}
         std::array<std::uint8_t,8192> output{};
         if (v->audio_eof && feeding_next_pass(r,*v,v->audio_loops)) restart_audio(*v);
-        if (v->audio_eof || v->source.empty() || (!v->audio.is_open()&&!v->audio.open(v->source,v->audio_channel))) {v->audio_eof=true;c.set_gpr(2,no_data);return;}
+        if (v->source.empty()) { v->audio_eof = true; c.set_gpr(2, no_data); return; }
+        if (!v->audio.is_open() && !v->audio.open(v->source, v->audio_channel)) {
+            // The Android FFmpeg build has no ATRAC3+ decoder. Silence of the
+            // right length lets the movie player finish instead of waiting on
+            // a stream that will never produce a frame. There is no decrypt.
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                log_line("MPEG", "ATRAC3+ decoder unavailable; movie audio is silent");
+            }
+            const auto span = v->last > v->first ? v->last - v->first : 0ull;
+            const auto units = static_cast<std::uint32_t>(span / 4180ull);
+            if (v->audio_frames >= units) {
+                v->audio_eof = true;
+                log_line("MPEG", "audio EOF frames=" + std::to_string(v->audio_frames));
+                c.set_gpr(2, no_data);
+                return;
+            }
+            r.memory().copy_in(c.gpr[6], output);
+            ++v->audio_frames;
+            if (r.memory().contains(c.gpr[5], 24))
+                write_time(r.memory(), c.gpr[5], v->first + static_cast<std::uint64_t>(v->audio_frames) * 2048 * 90000 / 44100);
+            c.set_gpr(2, 0);
+            return;
+        }
         auto size=v->audio.read(output);
         if (!size && feeding_next_pass(r,*v,v->audio_loops)) {
             restart_audio(*v);

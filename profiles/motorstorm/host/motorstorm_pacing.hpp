@@ -14,6 +14,12 @@ void host_sleep_us(std::uint64_t microseconds) noexcept;
 // Waits against an absolute deadline so early wakeups cannot publish early.
 void host_sleep_until_us(std::uint64_t deadline) noexcept;
 
+// Called once per displayed frame on the guest thread with the time the frame
+// kept the thread busy (pacing sleeps and audio waits excluded) and the time a
+// frame has. Android forwards it to the performance hint API (ADPF) so the
+// governor raises the clock before frames run late; elsewhere it does nothing.
+void host_report_frame_work(std::uint64_t work_us, std::uint64_t frame_us) noexcept;
+
 // Maps the guest display timeline to host deadlines. Audio backpressure limits
 // average speed, but its buffer-sized wakes do not provide a frame cadence.
 class FramePacer {

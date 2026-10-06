@@ -1,10 +1,18 @@
 #include "motorstorm_textures.hpp"
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <wincodec.h>
 #include <wrl/client.h>
+#else
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_MAX_DIMENSIONS 16384
+#include "stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -29,7 +37,9 @@ void log_line(std::string_view category, std::string_view message);
 
 namespace motorstorm::textures {
 namespace {
+#if defined(_WIN32)
 using Microsoft::WRL::ComPtr;
+#endif
 
 constexpr std::uint32_t kMaxDimension = 16384u;
 // PNG decoding and mip building run here; DDS packs only read files. More
@@ -88,6 +98,7 @@ bool enabled(const char *name, bool fallback) {
     return !(text == "0" || text == "false" || text == "off" || text == "no");
 }
 
+#if defined(_WIN32)
 struct ComScope {
     HRESULT result;
     ComScope() : result(CoInitializeEx(nullptr, COINIT_MULTITHREADED)) {}
@@ -171,6 +182,35 @@ std::optional<Image> decode_wic(IWICImagingFactory *factory, const std::filesyst
     return image;
 }
 
+#else
+struct ComScope {};
+using IWICImagingFactory = void;
+using HRESULT = int;
+constexpr HRESULT S_OK = 0, E_FAIL = -1;
+bool SUCCEEDED(HRESULT result) { return result >= 0; }
+bool FAILED(HRESULT result) { return result < 0; }
+struct PortableFactory {
+    void *Get() const { return nullptr; }
+    explicit operator bool() const { return true; }
+};
+PortableFactory wic_factory() { return {}; }
+HRESULT write_png(void *, const std::filesystem::path &path, std::uint32_t width, std::uint32_t height,
+                  const std::uint32_t *rgba, const char *&step) {
+    step = "portable PNG encoder";
+    return stbi_write_png(path.string().c_str(), static_cast<int>(width), static_cast<int>(height), 4, rgba,
+        static_cast<int>(width * 4)) ? S_OK : E_FAIL;
+}
+std::optional<Image> decode_wic(void *, const std::filesystem::path &path, std::string &error) {
+    int width{}, height{}, channels{};
+    auto *data = stbi_load(path.string().c_str(), &width, &height, &channels, 4);
+    if (!data) { error = "portable image decode failed"; return std::nullopt; }
+    std::vector<std::uint8_t> pixels(data, data + static_cast<std::size_t>(width) * height * 4);
+    stbi_image_free(data);
+    Image image; image.source = path;
+    image.levels = build_mip_chain(static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height), std::move(pixels));
+    return image;
+}
+#endif
 std::optional<Image> load_file(IWICImagingFactory *factory, const std::filesystem::path &path, std::string &error) {
     auto extension = path.extension().string();
     std::transform(extension.begin(), extension.end(), extension.begin(),
@@ -186,10 +226,12 @@ std::optional<Image> load_file(IWICImagingFactory *factory, const std::filesyste
         }
         return image;
     }
+#if defined(_WIN32)
     if (factory == nullptr) {
         error = "Windows Imaging Component unavailable";
         return std::nullopt;
     }
+#endif
     return decode_wic(factory, path, error);
 }
 
@@ -208,7 +250,9 @@ void append_index(const std::filesystem::path &directory, const DumpJob &job) {
 
 void worker(bool dump_worker) {
     // Background work: never take CPU time from the emulation thread.
+#if defined(_WIN32)
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
     ComScope com;
     const auto factory = wic_factory();
     auto &m = manager();
@@ -497,7 +541,9 @@ void dump(std::uint64_t hash, std::uint32_t width, std::uint32_t height, std::sp
 }
 
 void identify_worker() {
+#if defined(_WIN32)
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
     auto &m = manager();
     std::unique_lock lock(m.mutex);
     for (;;) {

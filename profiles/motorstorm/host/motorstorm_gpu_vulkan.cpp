@@ -14,6 +14,7 @@
 //   - Every other GPU operation is serialized by a full memory barrier when
 //     the previous one wrote memory (the D3D12 resource-state transitions).
 #include "motorstorm_gpu_vulkan.hpp"
+#include "motorstorm_mobile.hpp"
 #include "motorstorm_bootstrap.hpp"
 #include "motorstorm_perf.hpp"
 #include "motorstorm_post.hpp"
@@ -25,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <climits>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -41,10 +43,38 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#if defined(__ANDROID__)
+#include <SDL3/SDL.h>
+#include <adrenotools/driver.h>
+#include <dlfcn.h>
+using HMODULE = void *;
+using HWND = SDL_Window *;
+using LONG = int;
+struct RECT { int left{}, top{}, right{}, bottom{}; };
+static void GetClientRect(SDL_Window *window, RECT *rect) {
+    SDL_GetWindowSizeInPixels(window, &rect->right, &rect->bottom);
+}
+static void FreeLibrary(void *library) { dlclose(library); }
+#endif
 
 namespace motorstorm::vulkan {
 using namespace api;
 namespace {
+using motorstorm::PixelPath;
+using motorstorm::PixelFeatures;
+using motorstorm::select_pixel_path;
+using motorstorm::classify_ge_draw;
+using motorstorm::GeDrawFacts;
+using motorstorm::DrawPixelRoute;
+using motorstorm::ScaleMode;
+using motorstorm::ScaleSettings;
+using motorstorm::step_render_scale;
+using motorstorm::select_upscaler;
+using motorstorm::Upscaler;
+using motorstorm::DriverRequest;
+using motorstorm::resolve_driver;
+using motorstorm::present_frame_rate_hz;
+using motorstorm::point_expansion_requires_geometry_shader;
 using UINT = std::uint32_t;
 using UINT64 = std::uint64_t;
 GpuReport stats{"Vulkan"};
@@ -62,6 +92,26 @@ std::atomic<std::uint64_t> output_size{(480ull << 32) | 272u};
 #include "motorstorm_spirv_VSPoint.h"
 #include "motorstorm_spirv_PS.h"
 #include "motorstorm_spirv_PointGS.h"
+#if defined(__ANDROID__)
+#include "motorstorm_spirv_PointVS.h"
+#include "motorstorm_spirv_PSLock.h"
+#include "motorstorm_spirv_PSNoRead.h"
+#include "motorstorm_spirv_PSTrivial.h"
+#include "motorstorm_spirv_PSNoShade.h"
+#include "motorstorm_spirv_PresentConvertCS.h"
+#include "motorstorm_spirv_VSFast.h"
+#include "motorstorm_spirv_PointVSFast.h"
+#include "motorstorm_spirv_PSFast.h"
+#include "motorstorm_spirv_PSFastAlpha.h"
+#include "motorstorm_spirv_PSFastAlphaEarly.h"
+#include "motorstorm_spirv_PSFastFeedback.h"
+#include "motorstorm_spirv_PSFastAlphaFeedback.h"
+#include "motorstorm_spirv_PSLoad.h"
+#include "motorstorm_spirv_PackColorCS.h"
+#include "motorstorm_spirv_PackDepthCS.h"
+#include <android/native_window.h>
+#include <dlfcn.h>
+#endif
 #include "motorstorm_spirv_PresentVS.h"
 #include "motorstorm_spirv_PresentPS.h"
 #include "motorstorm_spirv_ExpandCS.h"
@@ -81,6 +131,7 @@ std::atomic<std::uint64_t> output_size{(480ull << 32) | 272u};
 #include "motorstorm_spirv_DepthResolveCS.h"
 
 constexpr UINT64 kUploadBytes = 64ull * 1024 * 1024;
+constexpr UINT64 kVertexArenaBytes = 128ull * 1024 * 1024;
 void check(VkResult result, const char *operation) {
     if (result < 0)
         throw std::runtime_error(std::string("MotorStorm Vulkan ") + operation + " failed: " + std::to_string(result));
@@ -90,6 +141,17 @@ std::uint32_t physical(std::uint32_t address) {
     if (address >= 0x04000000u && address < 0x04800000u)
         address = 0x04000000u | (address & 0x1FFFFFu);
     return address;
+}
+// Lazy readback publication; see the D3D12 copy in motorstorm_gpu.cpp.
+// PSPRECOMP_MOTORSTORM_GPU_LAZY_PUBLISH=0 (or "false") restores the eager
+// list-start publication for A/B checks.
+bool lazy_publish_enabled() {
+    static const bool value = [] {
+        const char *text = std::getenv("PSPRECOMP_MOTORSTORM_GPU_LAZY_PUBLISH");
+        if (text == nullptr || *text == '\0') return true;
+        return std::strcmp(text, "0") != 0 && std::strcmp(text, "false") != 0;
+    }();
+    return value;
 }
 // Raster scales in half units; see motorstorm_gpu.cpp.
 constexpr UINT raster_extent(UINT native, UINT half) { return native * half / 2u; }
@@ -202,7 +264,7 @@ struct Image {
     }
     explicit operator bool() const noexcept { return image != VK_NULL_HANDLE; }
 };
-Image make_image(UINT width, UINT height, UINT mips, VkFormat format) {
+Image make_image(UINT width, UINT height, UINT mips, VkFormat format, VkImageUsageFlags extra_usage = 0) {
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.imageType = VK_IMAGE_TYPE_2D;
     info.format = format;
@@ -211,7 +273,7 @@ Image make_image(UINT width, UINT height, UINT mips, VkFormat format) {
     info.arrayLayers = 1;
     info.samples = VK_SAMPLE_COUNT_1_BIT;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | extra_usage;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VmaAllocationCreateInfo allocation{};
@@ -228,12 +290,61 @@ Image make_image(UINT width, UINT height, UINT mips, VkFormat format) {
     check(vkCreateImageView(g_device, &view, nullptr, &result.view), "create texture view");
     return result;
 }
+Image make_depth_image(UINT width, UINT height) {
+    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = VK_FORMAT_D16_UNORM;
+    info.extent = {width, height, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VmaAllocationCreateInfo allocation{};
+    allocation.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    Image result;
+    check(vmaCreateImage(g_allocator, &info, &allocation, &result.image, &result.allocation, nullptr),
+          "create depth image");
+    VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view.image = result.image;
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = VK_FORMAT_D16_UNORM;
+    view.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    check(vkCreateImageView(g_device, &view, nullptr, &result.view), "create depth view");
+    return result;
+}
 
 // ---------------------------------------------------------------------------
 struct Surface {
     std::uint32_t address{}, stride{}, height{}, bpp{};
     std::uint32_t raster_half{2}, format{4};
     Buffer image, native, readback;
+#if defined(__ANDROID__)
+    Image attachment;
+    Buffer locks;
+    bool locks_ready{};
+    // Ordered-attachment path: which copy holds the newest pixels. Draws
+    // write the attachment image; everything else reads/writes the packed
+    // buffer. Copies happen only when the other side is actually used.
+    bool image_newer{};   // attachment written since the buffer was synced
+    bool buffer_newer{};  // buffer written since the attachment was loaded
+    // Fixed-function path: compact color and real depth. hw_matches means those
+    // images agree with the newest of the packed buffer and the R32 attachment.
+    // hw_dirty means a hardware draw has not been packed back yet.
+    Image hw_color, hw_depth;
+    VkImageLayout hw_color_layout{VK_IMAGE_LAYOUT_UNDEFINED};
+    VkImageLayout hw_depth_layout{VK_IMAGE_LAYOUT_UNDEFINED};
+    bool hw_dirty{}, hw_matches{};
+    // Copy used when a draw both samples and writes this color image.
+    Image hw_sample;
+    VkImageLayout hw_sample_layout{VK_IMAGE_LAYOUT_UNDEFINED};
+    UINT hw_sample_width{}, hw_sample_height{};
+    UINT64 hw_sample_version{~0ull};
+    UINT64 hw_sample_list{};
+#endif
     UINT64 native_version{~0ull};
     std::vector<std::uint8_t> guest_shadow;
     bool loaded{}, dirty{}, readback_pending{};
@@ -243,6 +354,44 @@ struct Surface {
     UINT64 snapshot_bytes{};
     UINT64 snapshot_guest_epoch{~0ull};
     Buffer snapshot;
+    // Native-pixel rectangles written since the snapshot was taken. A draw
+    // that samples only clean pixels of its own render target can keep using
+    // the snapshot instead of ending the draw pass for a new copy. Too many
+    // rectangles collapse to "everything dirty".
+    struct Rect { int left, top, right, bottom; };
+    static constexpr std::size_t kSnapshotRects = 32;
+    std::vector<Rect> snapshot_dirty{Rect{0, 0, 1 << 20, 1 << 20}};
+    std::vector<Rect> hw_sample_dirty{Rect{0, 0, 1 << 20, 1 << 20}};
+    static void note_dirty(std::vector<Rect> &list, Rect rect) {
+        if (rect.left >= rect.right || rect.top >= rect.bottom)
+            return;
+        if (list.size() == 1 && list[0].right >= (1 << 20))
+            return;
+        if (list.size() >= kSnapshotRects)
+            list.assign(1, Rect{0, 0, 1 << 20, 1 << 20});
+        else
+            list.push_back(rect);
+    }
+    static bool rects_clean(const std::vector<Rect> &list, Rect rect) {
+        for (const auto &dirty : list)
+            if (dirty.left < rect.right && rect.left < dirty.right && dirty.top < rect.bottom && rect.top < dirty.bottom)
+                return false;
+        return true;
+    }
+    bool snapshot_all_dirty() const {
+        return snapshot_dirty.size() == 1 && snapshot_dirty[0].right >= (1 << 20);
+    }
+    void touch_rect(Rect rect) {
+        note_dirty(snapshot_dirty, rect);
+        note_dirty(hw_sample_dirty, rect);
+    }
+    void touch_all() {
+        const Rect all{0, 0, 1 << 20, 1 << 20};
+        snapshot_dirty.assign(1, all);
+        hw_sample_dirty.assign(1, all);
+    }
+    bool snapshot_clean(Rect rect) const { return rects_clean(snapshot_dirty, rect); }
+    bool hw_sample_clean(Rect rect) const { return rects_clean(hw_sample_dirty, rect); }
     UINT raster_stride() const { return raster_extent(stride, raster_half); }
     UINT raster_height() const { return raster_extent(height, raster_half); }
     UINT64 bytes() const { return static_cast<UINT64>(raster_stride()) * raster_height() * 4; }
@@ -256,13 +405,45 @@ struct Texture {
     std::uint64_t generation{};
 };
 // Chunked submission: see motorstorm_gpu.cpp (same defaults and overrides).
-constexpr UINT kCommandSlotCapacity = 4u;
+// Opening a slot waits for its previous submission, so the slot count bounds
+// how far the guest thread can run ahead of the GPU. Android shares one queue
+// with presentation and ends a tiled render pass at every submission, so it
+// uses more slots and larger chunks: with 3 x 128 the guest blocked on a slot
+// fence at every submission (about 9 a race frame).
+constexpr UINT kCommandSlotCapacity = 16u;
+#if defined(__ANDROID__)
+constexpr UINT kDefaultCommandSlots = 8u;
+constexpr UINT64 kDefaultChunkDraws = 512u;
+#else
+constexpr UINT kDefaultCommandSlots = 3u;
 constexpr UINT64 kDefaultChunkDraws = 128u;
+#endif
+#if defined(__ANDROID__)
+// Short side of the Android swapchain (see create_swapchain); 0 = panel size.
+UINT present_height_limit() {
+    static const UINT value = [] {
+        const char *text = std::getenv("PSPRECOMP_MOTORSTORM_PRESENT_HEIGHT");
+        return text ? static_cast<UINT>(std::strtoul(text, nullptr, 0)) : 1080u;
+    }();
+    return value >= 272u ? value : 0u;
+}
+// A display size reduced to the swapchain the present pass renders.
+void limit_to_present(UINT &width, UINT &height) {
+    const UINT limit = present_height_limit(), shorter = std::min(width, height);
+    if (!limit || shorter <= limit)
+        return;
+    const auto scaled = [&](UINT side) {
+        return std::max<UINT>(2u, static_cast<UINT>(static_cast<UINT64>(side) * limit / shorter) & ~1u);
+    };
+    width = scaled(width);
+    height = scaled(height);
+}
+#endif
 UINT command_slot_count() {
     static const UINT value = [] {
         const char *text = std::getenv("PSPRECOMP_MOTORSTORM_GPU_COMMAND_SLOTS");
         const unsigned long parsed = text != nullptr ? std::strtoul(text, nullptr, 0) : 0ul;
-        if (parsed < 2ul) return 3u;
+        if (parsed < 2ul) return kDefaultCommandSlots;
         return static_cast<UINT>(std::min<unsigned long>(parsed, kCommandSlotCapacity));
     }();
     return value;
@@ -272,6 +453,33 @@ UINT64 chunk_draws_limit() {
         const char *text = std::getenv("PSPRECOMP_MOTORSTORM_GPU_CHUNK_DRAWS");
         const unsigned long long parsed = text != nullptr ? std::strtoull(text, nullptr, 0) : 0ull;
         return parsed != 0ull ? static_cast<UINT64>(parsed) : kDefaultChunkDraws;
+    }();
+    return value;
+}
+// PSPRECOMP_MOTORSTORM_LAZY_ATTACHMENTS=0 reloads the attachments from the
+// packed buffers at every pass start (the original, copy-heavy behavior).
+bool pass_stats_enabled() {
+    static const bool value = std::getenv("PSPRECOMP_MOTORSTORM_PASS_STATS") != nullptr;
+    return value;
+}
+// PSPRECOMP_MOTORSTORM_SNAPSHOT_ROWS=0 snapshots render-target textures
+// after every draw to their surface, as before.
+bool row_tracking_enabled() {
+    static const bool value = [] {
+        const char *text = std::getenv("PSPRECOMP_MOTORSTORM_SNAPSHOT_ROWS");
+#if defined(__ANDROID__)
+        return !(text && std::strcmp(text, "0") == 0);
+#else
+        return text && std::strcmp(text, "1") == 0;
+#endif
+    }();
+    return value;
+}
+std::uint64_t snapshot_reuses{}, snapshot_copies{};
+bool lazy_attachments_disabled() {
+    static const bool value = [] {
+        const char *text = std::getenv("PSPRECOMP_MOTORSTORM_LAZY_ATTACHMENTS");
+        return text && std::strcmp(text, "0") == 0;
     }();
     return value;
 }
@@ -289,6 +497,9 @@ struct CommandSlot {
     VkCommandBuffer pre{};
     UINT64 fence_value{};
     bool pending{};
+    VkQueryPool queries{};
+    bool timed{};
+    bool pre_timed{};
 };
 constexpr UINT kConstantsStride = 1280;
 constexpr UINT kPresentConstantBytes = kConstantsStride;
@@ -322,7 +533,8 @@ struct Context {
     VmaAllocator allocator{};
     VkPhysicalDeviceProperties properties{};
     UINT queue_family{};
-    bool line_rasterization{}, depth_clamp{}, anisotropy{}, bc{};
+    bool line_rasterization{}, depth_clamp{}, anisotropy{}, bc{}, host_query_reset{};
+    bool hw_dynamic_depth{}, hw_dynamic_blend{};
     ~Context() {
         if (device)
             vkDeviceWaitIdle(device);
@@ -351,17 +563,60 @@ struct State {
     CommandSlot slots[kCommandSlotCapacity + 1];
     VkCommandBuffer cmd{};
     UINT slot_index{};
+    UINT ge_slot{};  // last GE chunk slot; lists continue the rotation from it
     UINT64 frame_fence{}, chunk_draws{};
     UINT64 readback_fence{}, arena_fence{};
+    // The upload and vertex arenas alternate between two halves (see begin()).
+    UINT arena_half{};
+    UINT64 arena_base{}, vertex_base{}, half_fence[2]{};
     VkDescriptorSetLayout push_layout{}, sampler_layout{};
     VkPipelineLayout layout{};
     VkDescriptorPool descriptor_pool{};
     VkDescriptorSet sampler_set{};
     VkSampler samplers[8]{};
     VkPipeline list_pipeline{}, strip_pipeline{}, line_pipeline{}, point_pipeline{};
+#if defined(__ANDROID__)
+    VkRenderPass attachment_pass{};
+    struct HwFramebuffer {
+        VkImageView color{}, depth{};
+        VkFramebuffer framebuffer{};
+    };
+    std::vector<VkFramebuffer> attachment_framebuffers;
+    std::vector<HwFramebuffer> ordered_framebuffers;
+    std::vector<HwFramebuffer> hw_framebuffers;
+    Surface *attachment_color{}, *attachment_depth{};
+    Surface attachment_dummy_depth;
+    VkRenderPass hw_pass_load{}, hw_pass_clear{};
+    struct HwPipeKey {
+    std::uint8_t topology{}, depth_test{}, depth_write{}, depth_compare{};
+        std::uint8_t blend{}, blend_op{}, src{}, dst{}, mask{}, cull{}, alpha{}, feedback{};
+        bool operator==(const HwPipeKey &other) const {
+            return std::memcmp(this, &other, sizeof(HwPipeKey)) == 0;
+        }
+    };
+    struct HwPipeHash {
+        std::size_t operator()(const HwPipeKey &key) const {
+            std::size_t hash = 0;
+            const auto *bytes = reinterpret_cast<const unsigned char *>(&key);
+            for (std::size_t index = 0; index < sizeof(key); ++index)
+                hash = hash * 131u + bytes[index];
+            return hash;
+        }
+    };
+    std::unordered_map<HwPipeKey, VkPipeline, HwPipeHash> hw_pipelines;
+    std::vector<HwPipeKey> hw_pipe_order;  // creation order, saved for prewarming
+    std::size_t hw_keys_saved{};
+    bool prewarming{};
+    VkPipeline hw_load_pipeline{}, pack_color_pipeline{}, pack_depth_pipeline{};
+    Buffer hw_depth_staging;
+    bool hw_depth_ok{};
+    bool rendering_hardware{};
+    Surface *hw_pass_color{}, *hw_pass_depth{};
+#endif
     VkPipeline expand_pipeline{}, resolve_pipeline{}, capture_pipeline{}, decode_pipeline{}, mip_pipeline{},
         vertex_pipeline{}, decode_target_pipeline{}, post_resolve_pipeline{}, deband_pipeline{},
-        post_capture_pipeline{}, post_color_pipeline{}, post_color_capture_pipeline{}, depth_resolve_pipeline{};
+        post_capture_pipeline{}, post_color_pipeline{}, post_color_capture_pipeline{}, depth_resolve_pipeline{},
+        present_convert_pipeline{};
     // Swapchain pipelines, created for the swapchain's format.
     VkPipeline present_pipeline{}, post_present_pipeline{};
     VkFormat pipelines_format{VK_FORMAT_UNDEFINED};
@@ -382,6 +637,7 @@ struct State {
     std::deque<IdentifyCopy> identify_copies;
     std::vector<std::uint64_t> identify_failed;
     UINT64 executions{};
+    UINT64 list_serial{1};
     UINT raster_half{2}, output_scale{1}, antialiasing{};
     UINT storage_alignment{16};
     Buffer upload;
@@ -428,6 +684,36 @@ struct State {
     VkSwapchainKHR swapchain{};
     VkFormat swap_format{VK_FORMAT_UNDEFINED};
     VkExtent2D swap_extent{};
+    // Persistent pipeline cache (see open_pipeline_cache); null when disabled.
+    VkPipelineCache pipeline_cache{};
+    std::filesystem::path pipeline_cache_file;
+    bool pipeline_cache_dirty{};
+    std::uint64_t pipeline_cache_saved_presents{};
+#if defined(__ANDROID__)
+    VkSurfaceTransformFlagBitsKHR presentation_transform{VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR};
+    PixelPath pixel_path{PixelPath::Unsupported};
+    bool dynamic_rendering{true};
+    VkRenderPass programmable_pass{};
+    VkRenderPass swapchain_pass{};
+    Image programmable_target;
+    VkFramebuffer programmable_framebuffer{};
+    UINT programmable_width{}, programmable_height{};
+    std::vector<VkFramebuffer> swap_framebuffers;
+    float render_scale{1.0f};
+    UINT base_raster_half{2};
+    double gpu_accum{};
+    int gpu_samples{};
+    ScaleSettings scale_settings{};
+    motorstorm::DynamicResolution dynamic_resolution;
+    double completed_gpu_ms{-1.0};
+    int thermal_status{};
+    std::uint64_t thermal_frames{};
+    std::string driver_fallback;
+    // The ANativeWindow the Vulkan surface was created for. SDL replaces it
+    // (or clears it) whenever Android destroys and recreates the surface.
+    void *native_window{};
+    std::atomic<bool> surface_lost{};
+#endif
     std::vector<VkImage> swap_images;
     std::vector<VkImageView> swap_views;
     std::vector<VkSemaphore> render_done;
@@ -460,11 +746,18 @@ struct State {
         UINT64 post_bytes{};
         VkQueryPool queries{};
         bool timed_post{};
+        bool timed_present{};
         UINT64 bytes{}, fence{}, copy_fence{};
         FrameState state{FrameState::Free};
         std::uint32_t width{}, height{}, stride{}, format{};
         bool racing{};
         float aspect_scale{1.0f};
+        // Raster scale of the snapshot; the GE side may have moved on.
+        UINT raster_half{2};
+        // Android: the snapshot as an RGBA8 texture for the present pass.
+        Buffer rgba_words;
+        Image rgba;
+        UINT rgba_width{}, rgba_height{};
     };
     int ready_frame{-1};
     static constexpr UINT kPresentFrames = 3;
@@ -476,6 +769,30 @@ struct State {
     float post_fade{};
     std::chrono::steady_clock::time_point post_clock{};
     std::uint32_t post_frames{};
+    // Writes the driver's pipeline cache through a temporary file, so a
+    // process killed mid-write leaves the previous cache intact.
+    void save_pipeline_cache() noexcept {
+        if (!pipeline_cache || pipeline_cache_file.empty() || !pipeline_cache_dirty)
+            return;
+        std::size_t size = 0;
+        if (vkGetPipelineCacheData(device, pipeline_cache, &size, nullptr) != VK_SUCCESS || size == 0)
+            return;
+        std::vector<char> data(size);
+        if (vkGetPipelineCacheData(device, pipeline_cache, &size, data.data()) != VK_SUCCESS)
+            return;
+        auto temporary = pipeline_cache_file;
+        temporary += ".tmp";
+        std::FILE *file = std::fopen(temporary.string().c_str(), "wb");
+        if (!file)
+            return;
+        const bool written = std::fwrite(data.data(), 1, size, file) == size;
+        if (std::fclose(file) != 0 || !written)
+            return;
+        std::error_code error;
+        std::filesystem::rename(temporary, pipeline_cache_file, error);
+        if (!error)
+            pipeline_cache_dirty = false;
+    }
     void stop_presenter() {
         if (!presenter.joinable())
             return;
@@ -490,6 +807,11 @@ struct State {
     void destroy_swapchain() noexcept {
         for (auto view : swap_views)
             vkDestroyImageView(device, view, nullptr);
+#if defined(__ANDROID__)
+        for (auto framebuffer : swap_framebuffers)
+            vkDestroyFramebuffer(device, framebuffer, nullptr);
+        swap_framebuffers.clear();
+#endif
         swap_views.clear();
         swap_images.clear();
         for (auto semaphore : render_done)
@@ -504,6 +826,23 @@ struct State {
         if (!device)
             return;
         vkDeviceWaitIdle(device);
+#if defined(__ANDROID__)
+        for (auto framebuffer : attachment_framebuffers) vkDestroyFramebuffer(device, framebuffer, nullptr);
+        for (const auto &framebuffer : hw_framebuffers)
+            vkDestroyFramebuffer(device, framebuffer.framebuffer, nullptr);
+        if (programmable_framebuffer) vkDestroyFramebuffer(device, programmable_framebuffer, nullptr);
+        if (attachment_pass) vkDestroyRenderPass(device, attachment_pass, nullptr);
+        if (hw_pass_load) vkDestroyRenderPass(device, hw_pass_load, nullptr);
+        if (hw_pass_clear) vkDestroyRenderPass(device, hw_pass_clear, nullptr);
+        if (programmable_pass) vkDestroyRenderPass(device, programmable_pass, nullptr);
+        if (swapchain_pass) vkDestroyRenderPass(device, swapchain_pass, nullptr);
+        if (hw_load_pipeline) vkDestroyPipeline(device, hw_load_pipeline, nullptr);
+        if (pack_color_pipeline) vkDestroyPipeline(device, pack_color_pipeline, nullptr);
+        if (pack_depth_pipeline) vkDestroyPipeline(device, pack_depth_pipeline, nullptr);
+        for (const auto &pipeline : hw_pipelines)
+            vkDestroyPipeline(device, pipeline.second, nullptr);
+        hw_pipelines.clear();
+#endif
         destroy_swapchain();
         if (surface)
             vkDestroySurfaceKHR(ctx.instance, surface, nullptr);
@@ -518,9 +857,12 @@ struct State {
             if (frame.queries)
                 vkDestroyQueryPool(device, frame.queries, nullptr);
         }
-        for (auto &slot : slots)
+        for (auto &slot : slots) {
+            if (slot.queries)
+                vkDestroyQueryPool(device, slot.queries, nullptr);
             if (slot.pool)
                 vkDestroyCommandPool(device, slot.pool, nullptr);
+        }
         for (VkPipeline pipeline : {list_pipeline, strip_pipeline, line_pipeline, point_pipeline, expand_pipeline,
                                     resolve_pipeline, capture_pipeline, decode_pipeline, mip_pipeline, vertex_pipeline,
                                     decode_target_pipeline, post_resolve_pipeline, deband_pipeline,
@@ -543,6 +885,10 @@ struct State {
                 vkDestroySampler(device, sampler, nullptr);
         if (timeline)
             vkDestroySemaphore(device, timeline, nullptr);
+        if (pipeline_cache) {
+            save_pipeline_cache();
+            vkDestroyPipelineCache(device, pipeline_cache, nullptr);
+        }
         // Buffers and images are released by their members, before ctx.
     }
 };
@@ -575,7 +921,24 @@ void wait_semaphore(VkDevice device, VkSemaphore semaphore, UINT64 value, const 
         throw std::runtime_error(std::string("MotorStorm Vulkan ") + what + " timeout");
     check(result, what);
 }
-void wait_value(State &s, UINT64 value) { wait_semaphore(s.device, s.timeline, value, "GPU fence wait"); }
+// GE-thread GPU waits by call site (diagnostics; logged with the frame stats).
+enum WaitSite { kWaitSlot, kWaitArena, kWaitSync, kWaitVertex, kWaitPublish, kWaitOther, kWaitSites };
+std::uint64_t wait_ns[kWaitSites]{}, wait_count[kWaitSites]{};
+std::uint64_t pass_begins{}, attachment_loads{}, buffer_syncs{}, draw_calls{};
+std::unordered_map<std::uint32_t, std::uint64_t> rejected_blends;
+double prepass_gpu_ms{};
+// Diagnostics only (wrong output): isolate GPU cost of the draws themselves
+// and of rasterization-order attachment access.
+bool diag_flag(const char *name) {
+    const char *text = std::getenv(name);
+    return text && std::strcmp(text, "1") == 0;
+}
+void wait_value(State &s, UINT64 value, WaitSite site = kWaitOther) {
+    const auto start = perf::now_ns();
+    wait_semaphore(s.device, s.timeline, value, "GPU fence wait");
+    wait_ns[site] += perf::now_ns() - start;
+    ++wait_count[site];
+}
 // Submits command buffers to the GE queue and signals the next timeline value.
 UINT64 submit_queue(State &s, const VkCommandBuffer *buffers, UINT count) {
     const UINT64 value = ++s.fence_value;
@@ -598,7 +961,7 @@ UINT64 submit_queue(State &s, const VkCommandBuffer *buffers, UINT count) {
     return value;
 }
 UINT64 signal_fence(State &s) { return submit_queue(s, nullptr, 0); }
-void wait(State &s) { wait_value(s, signal_fence(s)); }
+void wait(State &s, WaitSite site = kWaitOther) { wait_value(s, signal_fence(s), site); }
 void memory_barrier(VkCommandBuffer cmd, VkPipelineStageFlags source = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                     VkPipelineStageFlags destination = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                     VkAccessFlags destination_access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT) {
@@ -607,10 +970,69 @@ void memory_barrier(VkCommandBuffer cmd, VkPipelineStageFlags source = VK_PIPELI
     barrier.dstAccessMask = destination_access;
     vkCmdPipelineBarrier(cmd, source, destination, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
-void end_rendering(State &s) {
+void sync_buffer(State &s, Surface &surface);
+void transition_image(State &s, VkImage image, VkImageLayout &current, VkImageLayout next, VkImageAspectFlags aspect);
+// Diagnostics: where draw passes are ended (return addresses, symbolized offline).
+std::unordered_map<std::uintptr_t, std::uint64_t> pass_end_sites;
+std::unordered_map<std::uintptr_t, std::pair<std::uintptr_t, std::uintptr_t>> pass_end_pair_map;
+std::unordered_map<std::uintptr_t, std::pair<std::uintptr_t, std::uintptr_t>> *pass_end_pairs = &pass_end_pair_map;
+#if defined(_MSC_VER)
+#define MOTORSTORM_NOINLINE __declspec(noinline)
+#define MOTORSTORM_CALLER(level) reinterpret_cast<std::uintptr_t>(nullptr)
+#else
+#define MOTORSTORM_NOINLINE __attribute__((noinline))
+#define MOTORSTORM_CALLER(level) reinterpret_cast<std::uintptr_t>(__builtin_return_address(level))
+#endif
+MOTORSTORM_NOINLINE void note_pass_end(std::uintptr_t a, std::uintptr_t b) {
+    ++pass_end_sites[a ^ (b << 1)];
+    pass_end_pair_map[a ^ (b << 1)] = {a, b};
+}
+MOTORSTORM_NOINLINE void end_rendering(State &s) {
+    if (s.rendering && pass_stats_enabled())
+        note_pass_end(MOTORSTORM_CALLER(0), MOTORSTORM_CALLER(1));
     if (s.rendering) {
+#if defined(__ANDROID__)
+        vkCmdEndRenderPass(s.cmd);
+        if (s.pixel_path == PixelPath::FixedFunctionProgrammable) {
+            s.rendering = false;
+            s.unflushed = true;
+            return;
+        }
+        s.rendering = false;
+        if (s.rendering_hardware) {
+            // Compact attachments hold the newest pixels. Pack them when a
+            // later ordered draw or a guest readback needs the R32 buffers.
+            Surface *targets[]{s.hw_pass_color, s.hw_pass_depth};
+            for (auto target : targets) {
+                if (!target || target->address == 0)
+                    continue;
+                target->hw_dirty = true;
+                target->hw_matches = true;
+                target->image_newer = false;
+                target->buffer_newer = false;
+            }
+            s.rendering_hardware = false;
+            s.hw_pass_color = s.hw_pass_depth = nullptr;
+            s.unflushed = true;
+            return;
+        }
+        // The attachments now hold the newest pixels; their packed buffers are
+        // brought up to date only when something reads them (sync_buffer).
+        Surface *targets[]{s.attachment_color, s.attachment_depth};
+        for (auto target : targets) {
+            target->image_newer = true;
+            target->hw_matches = false;
+            target->hw_dirty = false;
+        }
+        s.attachment_color = s.attachment_depth = nullptr;
+        s.unflushed = true;
+        if (lazy_attachments_disabled())
+            for (auto target : targets)
+                sync_buffer(s, *target);
+#else
         vkCmdEndRendering(s.cmd);
         s.rendering = false;
+#endif
     }
 }
 // Before any non-draw command: leave the draw pass and make earlier writes
@@ -625,6 +1047,43 @@ void outside(State &s) {
 void wrote(State &s) {
     s.unflushed = true;
     s.has_commands = true;
+}
+// Before the packed buffer of a surface is read: copy the newer attachment
+// image into it (ordered-attachment path only; a no-op elsewhere).
+void pack_hardware(State &s, Surface &surface);
+void sync_buffer(State &s, Surface &surface) {
+#if defined(__ANDROID__)
+    end_rendering(s);
+    pack_hardware(s, surface);
+    if (!surface.image_newer || !surface.attachment)
+        return;
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(s.cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {surface.raster_stride(), surface.raster_height(), 1};
+    vkCmdCopyImageToBuffer(s.cmd, surface.attachment.image, VK_IMAGE_LAYOUT_GENERAL, surface.image.buffer, 1, &region);
+    surface.image_newer = false;
+    ++buffer_syncs;
+    wrote(s);
+#else
+    (void)s;
+    (void)surface;
+#endif
+}
+// After the packed buffer of a surface was (re)written outside a draw pass.
+void buffer_written(Surface &surface) {
+#if defined(__ANDROID__)
+    surface.buffer_newer = true;
+    surface.image_newer = false;
+    surface.hw_matches = false;
+    surface.hw_dirty = false;
+#else
+    (void)surface;
+#endif
 }
 // Layout transition of every mip of a texture (also a full memory barrier).
 void image_layout(State &s, VkImage image, UINT mips, VkImageLayout from, VkImageLayout to) {
@@ -661,7 +1120,48 @@ void bind_sets(State &s, VkCommandBuffer cmd) {
 void open_chunk(State &s, UINT index) {
     CommandSlot &slot = s.slots[index];
     if (slot.pending) {
-        wait_value(s, slot.fence_value);
+        wait_value(s, slot.fence_value, kWaitSlot);
+        if (slot.timed && slot.queries) {
+            UINT64 stamps[2]{};
+            if (vkGetQueryPoolResults(s.device, slot.queries, 0, 2, sizeof(stamps), stamps, sizeof(UINT64),
+                                      VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+                stamps[1] > stamps[0]) {
+#if defined(__ANDROID__)
+                {
+                    // Calibration: raw GPU ticks against host time over ~10 s.
+                    static UINT64 first_tick{}, first_ns{};
+                    static bool reported{};
+                    const auto now = perf::now_ns();
+                    if (!first_tick) {
+                        first_tick = stamps[1];
+                        first_ns = now;
+                    } else if (!reported && now - first_ns > 10'000'000'000ull && stamps[1] > first_tick) {
+                        reported = true;
+                        const double tick_ns = static_cast<double>(now - first_ns) / static_cast<double>(stamps[1] - first_tick);
+                        log_line("GE", "timestamp calibration: measured " + std::to_string(tick_ns) +
+                                           " ns/tick, driver reports " + std::to_string(s.timestamp_period));
+                    }
+                }
+                s.gpu_accum += static_cast<double>(stamps[1] - stamps[0]) * s.timestamp_period / 1.0e6;
+                ++s.gpu_samples;
+#else
+                stats.last_gpu_ms = static_cast<double>(stamps[1] - stamps[0]) * s.timestamp_period / 1.0e6;
+#endif
+            }
+            slot.timed = false;
+        }
+        if (slot.pre_timed && slot.queries) {
+            UINT64 stamps[2]{};
+            if (vkGetQueryPoolResults(s.device, slot.queries, 2, 2, sizeof(stamps), stamps, sizeof(UINT64),
+                                      VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && stamps[1] > stamps[0]) {
+                const double milliseconds = static_cast<double>(stamps[1] - stamps[0]) * s.timestamp_period / 1.0e6;
+                prepass_gpu_ms += milliseconds;
+#if defined(__ANDROID__)
+                s.gpu_accum += milliseconds;
+#endif
+            }
+            slot.pre_timed = false;
+        }
         slot.pending = false;
     }
     check(vkResetCommandPool(s.device, slot.pool, 0), "reset command pool");
@@ -669,6 +1169,8 @@ void open_chunk(State &s, UINT index) {
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check(vkBeginCommandBuffer(slot.cmd, &begin), "begin GE chunk");
     s.slot_index = index;
+    if (index != kCommandSlotCapacity)
+        s.ge_slot = index;
     s.cmd = slot.cmd;
     s.recording = true;
     s.has_commands = false;
@@ -679,31 +1181,60 @@ void open_chunk(State &s, UINT index) {
     s.bound_graphics = s.bound_compute = VK_NULL_HANDLE;
     s.pre_open = false;
     bind_sets(s, s.cmd);
+    if (slot.queries) {
+        if (s.ctx.host_query_reset && vkResetQueryPool)
+            vkResetQueryPool(s.device, slot.queries, 0, 4);
+        else if (vkCmdResetQueryPool)
+            vkCmdResetQueryPool(slot.cmd, slot.queries, 0, 4);
+        else
+            throw std::runtime_error("Vulkan device cannot reset timestamp queries");
+        vkCmdWriteTimestamp(slot.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, slot.queries, 0);
+        slot.timed = true;
+    }
 }
 constexpr UINT kPresentSlot = kCommandSlotCapacity;
-void begin(State &s, UINT slot = 0) {
+void begin(State &s, UINT slot = UINT_MAX) {
     if (s.recording)
         return;
-    if (s.arena_fence != 0u && completed_value(s) < s.arena_fence && s.used > kUploadBytes / 2u)
-        wait_value(s, s.arena_fence);
+    // The upload and vertex arenas are each split into two halves. Lists fill
+    // one half; once it is a quarter used, the next list moves to the other
+    // half, waiting only for the GPU to finish the last chunk that used it.
+    // Restarting only when the GPU was completely idle (as before) drained the
+    // whole queue every time the arena filled, which a deep queue never avoids.
     if (s.arena_fence == 0u || completed_value(s) >= s.arena_fence) {
-        s.used = 0;
-        s.vertex_used = 0;
+        s.used = s.arena_base;
+        s.vertex_used = s.vertex_base;
+    } else if (s.used - s.arena_base > kUploadBytes / 8u || s.vertex_used - s.vertex_base > kVertexArenaBytes / 8u) {
+        const UINT other = s.arena_half ^ 1u;
+        if (s.half_fence[other] != 0u && completed_value(s) < s.half_fence[other])
+            wait_value(s, s.half_fence[other], kWaitArena);
+        s.half_fence[s.arena_half] = s.arena_fence;
+        s.arena_half = other;
+        s.arena_base = other * (kUploadBytes / 2u);
+        s.vertex_base = other * (kVertexArenaBytes / 2u);
+        s.used = s.arena_base;
+        s.vertex_used = s.vertex_base;
     }
     s.frame_fence = 0;
+    // A new list continues the slot rotation. Always reopening slot 0 made
+    // every list wait for the first chunk of the previous one.
+    if (slot == UINT_MAX)
+        slot = (s.ge_slot + 1u) % command_slot_count();
     open_chunk(s, slot);
 }
 // Close and submit the recording chunk without waiting for it.
 void submit_chunk(State &s) {
     end_rendering(s);
+    CommandSlot &chunk = s.slots[s.slot_index];
     // Readback copies become host-visible, and the next submission on this
     // queue observes everything written here.
     memory_barrier(s.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
                    VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+    if (chunk.timed && chunk.queries)
+        vkCmdWriteTimestamp(s.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, chunk.queries, 1);
     check(vkEndCommandBuffer(s.cmd), "close GE chunk");
     s.upload.flush(s.used);
-    CommandSlot &chunk = s.slots[s.slot_index];
     if (s.pre_open) {
         // The decoded vertices become the chunk's vertex buffers.
         VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -711,6 +1242,8 @@ void submit_chunk(State &s) {
         barrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
         vkCmdPipelineBarrier(chunk.pre, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 1,
                              &barrier, 0, nullptr, 0, nullptr);
+        if (chunk.pre_timed)
+            vkCmdWriteTimestamp(chunk.pre, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, chunk.queries, 3);
         check(vkEndCommandBuffer(chunk.pre), "close vertex commands");
         const VkCommandBuffer buffers[]{chunk.pre, s.cmd};
         chunk.fence_value = submit_queue(s, buffers, 2);
@@ -736,13 +1269,13 @@ void flush_chunk(State &s) {
 // Submit the recording chunk and wait for it (diagnostics and captures).
 void submit_and_wait(State &s) {
     submit_chunk(s);
-    wait_value(s, s.slots[s.slot_index].fence_value);
+    wait_value(s, s.slots[s.slot_index].fence_value, kWaitSync);
     s.slots[s.slot_index].pending = false;
 }
 UINT64 allocate(State &s, UINT64 bytes, UINT64 alignment) {
     alignment = std::max<UINT64>(alignment, s.storage_alignment);
     s.used = (s.used + alignment - 1) & ~(alignment - 1);
-    if (bytes > kUploadBytes - s.used)
+    if (bytes > s.arena_base + kUploadBytes / 2u - s.used)
         throw std::runtime_error("MotorStorm Vulkan upload arena exhausted");
     const auto offset = s.used;
     s.used += bytes;
@@ -802,10 +1335,13 @@ void compute(State &s, VkPipeline pipeline, const Constants &constants, View sou
 // ---------------------------------------------------------------------------
 // Render targets.
 bool hud_tag_enabled(const State &s, const Surface &color, std::uint32_t stride) {
-    return s.racing && s.post.active() && s.post.hud_ungraded && (stride == 480u || stride == 512u) &&
+    const bool separate_hud = (s.post.active() && s.post.hud_ungraded) ||
+                              (select_upscaler(s.scale_settings) == Upscaler::Sgsr1Spatial && s.antialiasing != 1);
+    return s.racing && separate_hud && (stride == 480u || stride == 512u) &&
            color.address >= 0x04000000u && color.address < 0x04200000u;
 }
 VkBuffer resolve_surface(State &s, Surface &surface) {
+    sync_buffer(s, surface);
     if (surface.raster_half == 2)
         return surface.image.buffer;
     if (surface.native_version != surface.version) {
@@ -823,7 +1359,7 @@ void load_surface(State &s, Surface &surface, const psprecomp::GuestMemory &memo
     if (surface.loaded)
         return;
     std::vector<std::uint8_t> guest(static_cast<std::size_t>(surface.guest_bytes()));
-    if (surface.readback_pending) {
+    if (surface.readback_pending && !lazy_publish_enabled()) {
         memory.copy_out(surface.address, guest);
     } else {
         const bool armed = memory.vram_hook_armed();
@@ -846,6 +1382,7 @@ void load_surface(State &s, Surface &surface, const psprecomp::GuestMemory &memo
             std::memcpy(&value, surface.guest_shadow.data() + i * 2, 2);
             destination[i] = value;
         }
+    buffer_written(surface);
     if (surface.raster_half == 2) {
         outside(s);
         copy_buffer(s, surface.image.buffer, 0, s.upload.buffer, offset, surface.bytes());
@@ -860,6 +1397,7 @@ void load_surface(State &s, Surface &surface, const psprecomp::GuestMemory &memo
     surface.aspect_scale = 1.0f;
     surface.loaded = true;
     ++surface.version;
+    surface.touch_all();
     s.has_commands = true;
 }
 void gpu_sync_impl(psprecomp::GuestMemory &memory);
@@ -868,7 +1406,7 @@ Surface &get_surface(State &s, psprecomp::GuestMemory &memory, std::uint32_t add
     address = physical(address);
     for (const auto &candidate : s.surfaces)
         if (candidate->address == address && candidate->stride == stride && candidate->bpp == bpp &&
-            candidate->height >= height) {
+            candidate->height >= height && candidate->raster_half == s.raster_half) {
             candidate->format = format;
             load_surface(s, *candidate, memory);
             return *candidate;
@@ -899,8 +1437,12 @@ Surface &get_surface(State &s, psprecomp::GuestMemory &memory, std::uint32_t add
     target->raster_half = s.raster_half;
     target->format = format;
     target->image = make_buffer(target->bytes(), Memory::Device);
+#if defined(__ANDROID__)
+    if (s.pixel_path == PixelPath::FixedFunctionProgrammable)
+        target->locks = make_buffer(std::max<UINT64>(target->bytes(), 4), Memory::Device);
+#endif
     target->readback = make_buffer(target->native_bytes(), Memory::Readback);
-    if (s.raster_half > 2)
+    if (s.raster_half != 2)
         target->native = make_buffer(target->native_bytes(), Memory::Device);
     s.surfaces.push_back(std::move(target));
     load_surface(s, *s.surfaces.back(), memory);
@@ -1237,7 +1779,8 @@ void expand_into(State &s, View source, VkBuffer destination, UINT64 from, const
     s.transient.push_back(std::move(scratch));
 }
 VkBuffer feedback_snapshot(State &s, const psprecomp::GuestMemory &memory, const GpuTexture &texture,
-                           std::array<std::uint32_t, 4> &constants) {
+                           std::array<std::uint32_t, 4> &constants, const Surface::Rect *sampled = nullptr,
+                           VkImageView *hardware_view = nullptr, const Surface *draw_color = nullptr) {
     const auto address = physical(texture.feedback_address);
     const auto bpp = texture.feedback_format == 3 ? 4u : 2u;
     Surface *source = nullptr;
@@ -1250,8 +1793,8 @@ VkBuffer feedback_snapshot(State &s, const psprecomp::GuestMemory &memory, const
         }
     const UINT64 first = source ? (address - source->address) / bpp : 0;
     const UINT half = source ? source->raster_half : 2u;
-    const bool scaled = half > 2u;
-    UINT64 bytes = std::max(source ? source->native_bytes() : 0ull,
+    const bool scaled = half != 2u;
+    UINT64 bytes = std::max<UINT64>(source ? source->native_bytes() : 0ull,
                             (first + static_cast<UINT64>(texture.feedback_stride) * texture.height) * 4);
     const UINT raster_pitch = scaled ? source->raster_stride() : 0u;
     if (scaled) {
@@ -1318,6 +1861,69 @@ VkBuffer feedback_snapshot(State &s, const psprecomp::GuestMemory &memory, const
         s.transient.push_back(std::move(image));
         return result;
     }
+#if defined(__ANDROID__)
+    // Sample the compact color image instead of packing it back to R32. A draw
+    // that also writes the image samples a copy so the attachment stays writable.
+    if (!scaled && hardware_view && source->hw_color && source->hw_matches && !source->image_newer &&
+        source->raster_stride() > 0 && source->raster_height() > 0) {
+        const bool writing = draw_color == source;
+        const bool attached = s.rendering_hardware && (s.hw_pass_color == source || s.hw_pass_depth == source);
+        if (!writing && !attached && source->hw_color_layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+            *hardware_view = source->hw_color.view;
+            constants[0] = 3;
+            return source->image.buffer;
+        }
+        if (!writing) {
+            transition_image(s, source->hw_color.image, source->hw_color_layout,
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+            *hardware_view = source->hw_color.view;
+            constants[0] = 3;
+            s.unflushed = false;
+            return source->image.buffer;
+        }
+        const UINT width = source->raster_stride(), height = source->raster_height();
+        if (source->hw_sample && (source->hw_sample_width != width || source->hw_sample_height != height)) {
+            source->hw_sample.reset();
+            source->hw_sample_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+            source->hw_sample_version = ~0ull;
+        }
+        if (source->hw_sample && source->hw_sample_width == width && source->hw_sample_height == height &&
+            source->hw_sample_layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
+            source->hw_sample_list == s.list_serial) {
+            *hardware_view = source->hw_sample.view;
+            constants[0] = 3;
+            return source->image.buffer;
+        }
+        if (!source->hw_sample) {
+            source->hw_sample = make_image(width, height, 1, VK_FORMAT_R8G8B8A8_UNORM);
+            source->hw_sample_width = width;
+            source->hw_sample_height = height;
+            source->hw_sample_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        }
+        transition_image(s, source->hw_color.image, source->hw_color_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_IMAGE_ASPECT_COLOR_BIT);
+        transition_image(s, source->hw_sample.image, source->hw_sample_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_ASPECT_COLOR_BIT);
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.extent = {width, height, 1};
+        vkCmdCopyImage(s.cmd, source->hw_color.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, source->hw_sample.image,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        transition_image(s, source->hw_sample.image, source->hw_sample_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_IMAGE_ASPECT_COLOR_BIT);
+        transition_image(s, source->hw_color.image, source->hw_color_layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                         VK_IMAGE_ASPECT_COLOR_BIT);
+        source->hw_sample_version = source->version;
+        source->hw_sample_list = s.list_serial;
+        source->hw_sample_dirty.clear();
+        *hardware_view = source->hw_sample.view;
+        constants[0] = 3;
+        wrote(s);
+        s.unflushed = false;
+        return source->image.buffer;
+    }
+#endif
     const bool fresh = !source->snapshot || source->snapshot_bytes < bytes;
     if (fresh) {
         if (source->snapshot)
@@ -1326,15 +1932,45 @@ VkBuffer feedback_snapshot(State &s, const psprecomp::GuestMemory &memory, const
         source->snapshot_bytes = bytes;
         source->snapshot_version = ~0ull;
     }
-    if (source->snapshot_version != source->version) {
+    // Pixels this draw reads, in surface coordinates: the texels its UVs
+    // cover (plus a filter margin), else the whole texture.
+    const int origin_x = static_cast<int>(first % source->stride), origin_y = static_cast<int>(first / source->stride);
+    Surface::Rect read{origin_x, origin_y, origin_x + static_cast<int>(texture.width),
+                       origin_y + static_cast<int>(texture.height)};
+    if (sampled)
+        read = {origin_x + sampled->left, origin_y + sampled->top, origin_x + sampled->right,
+                origin_y + sampled->bottom};
+    const bool inside = read.left >= 0 && read.top >= 0 && read.right <= static_cast<int>(source->stride) &&
+                        read.bottom <= static_cast<int>(source->height);
+    const bool clean = row_tracking_enabled() && inside && source->snapshot_version != ~0ull &&
+                       source->snapshot_clean(read);
+    if (source->snapshot_version != source->version && clean) {
+        ++snapshot_reuses;
+    } else if (source->snapshot_version != source->version) {
         if (fresh || source->snapshot_guest_epoch != s.fence_value) {
             initialize_tail(source->snapshot.buffer, source->bytes());
             source->snapshot_guest_epoch = s.fence_value;
         }
+#if defined(__ANDROID__)
+        const bool was_attached = s.rendering && s.attachment_color == source;
+#else
+        const bool was_attached = false;
+#endif
+        sync_buffer(s, *source);
         outside(s);
         copy_buffer(s, source->snapshot.buffer, 0, source->image.buffer, 0, source->bytes());
         wrote(s);
         source->snapshot_version = source->version;
+        if (pass_stats_enabled() && snapshot_copies < 40)
+            log_line("GE", "snapshot src=" + std::to_string(source->address) + " stride=" + std::to_string(source->stride) +
+                               " h=" + std::to_string(source->height) + " tex=" + std::to_string(texture.width) + "x" +
+                               std::to_string(texture.height) + " read=" + std::to_string(read.left) + "," +
+                               std::to_string(read.top) + "-" + std::to_string(read.right) + "," +
+                               std::to_string(read.bottom) + " sampled=" + std::to_string(sampled != nullptr) +
+                               " dirty_rects=" + std::to_string(source->snapshot_dirty.size()) + " attached=" +
+                               std::to_string(was_attached));
+        source->snapshot_dirty.clear();
+        ++snapshot_copies;
     }
     return source->snapshot.buffer;
 }
@@ -1359,6 +1995,24 @@ const Spirv &spirv(std::string_view name) {
         MOTORSTORM_SPIRV(ExpandCS),    MOTORSTORM_SPIRV(ResolveCS),     MOTORSTORM_SPIRV(CaptureCS),
         MOTORSTORM_SPIRV(DecodeCS),    MOTORSTORM_SPIRV(MipCS),         MOTORSTORM_SPIRV(VertexCS),
         MOTORSTORM_SPIRV(DecodeTargetCS), MOTORSTORM_SPIRV(PostResolveCS), MOTORSTORM_SPIRV(DebandCS),
+#if defined(__ANDROID__)
+        MOTORSTORM_SPIRV(PointVS),
+        MOTORSTORM_SPIRV(PSLock),
+        MOTORSTORM_SPIRV(PSNoRead),
+        MOTORSTORM_SPIRV(PSTrivial),
+        MOTORSTORM_SPIRV(PSNoShade),
+        MOTORSTORM_SPIRV(PresentConvertCS),
+        MOTORSTORM_SPIRV(VSFast),
+        MOTORSTORM_SPIRV(PointVSFast),
+        MOTORSTORM_SPIRV(PSFast),
+        MOTORSTORM_SPIRV(PSFastAlpha),
+        MOTORSTORM_SPIRV(PSFastAlphaEarly),
+        MOTORSTORM_SPIRV(PSFastFeedback),
+        MOTORSTORM_SPIRV(PSFastAlphaFeedback),
+        MOTORSTORM_SPIRV(PSLoad),
+        MOTORSTORM_SPIRV(PackColorCS),
+        MOTORSTORM_SPIRV(PackDepthCS),
+#endif
         MOTORSTORM_SPIRV(PostPS),      MOTORSTORM_SPIRV(PostCaptureCS), MOTORSTORM_SPIRV(PostColorCS),
         MOTORSTORM_SPIRV(PostPresentPS), MOTORSTORM_SPIRV(PostColorCaptureCS), MOTORSTORM_SPIRV(DepthResolveCS)};
 #undef MOTORSTORM_SPIRV
@@ -1382,6 +2036,8 @@ VkShaderModule shader_module(State &s, std::string_view name) {
 const char *entry_of(std::string_view name) {
     if (name == "VSPoint")
         return "VS";
+    if (name == "PSNoRead" || name == "PSTrivial" || name == "PSNoShade")
+        return "PS";
     return spirv(name).name.data();
 }
 VkPipelineShaderStageCreateInfo stage(State &s, VkShaderStageFlagBits kind, std::string_view name) {
@@ -1391,12 +2047,77 @@ VkPipelineShaderStageCreateInfo stage(State &s, VkShaderStageFlagBits kind, std:
     info.pName = entry_of(name);
     return info;
 }
+// ---------------------------------------------------------------------------
+// Persistent pipeline cache. Hardware-path pipelines are built the first time
+// a GE state needs one, mid-race; without a cache every launch compiles them
+// again on the guest thread (a stall of tens to hundreds of milliseconds each
+// on mobile drivers). Android keeps it in the app's internal files directory.
+// PSPRECOMP_MOTORSTORM_PIPELINE_CACHE=<file> chooses the file (any platform);
+// =0 disables it. The header is checked against this device and driver, so a
+// switch between the system and an imported driver starts an empty cache.
+std::filesystem::path pipeline_cache_location() {
+    if (const char *path = std::getenv("PSPRECOMP_MOTORSTORM_PIPELINE_CACHE"))
+        return std::strcmp(path, "0") == 0 ? std::filesystem::path{} : std::filesystem::path(path);
+#if defined(__ANDROID__)
+    if (const char *files = SDL_GetAndroidInternalStoragePath())
+        return std::filesystem::path(files) / "vulkan-pipelines.bin";
+#endif
+    return {};
+}
+std::vector<char> read_file(const std::filesystem::path &path) {
+    std::vector<char> data;
+    std::FILE *file = std::fopen(path.string().c_str(), "rb");
+    if (!file)
+        return data;
+    char buffer[65536];
+    for (std::size_t got; (got = std::fread(buffer, 1, sizeof(buffer), file)) > 0;)
+        data.insert(data.end(), buffer, buffer + got);
+    std::fclose(file);
+    return data;
+}
+bool pipeline_cache_matches(const State &s, const std::vector<char> &data) {
+    VkPipelineCacheHeaderVersionOne header{};
+    if (data.size() < sizeof(header))
+        return false;
+    std::memcpy(&header, data.data(), sizeof(header));
+    return header.headerSize >= sizeof(header) && header.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+           header.vendorID == s.ctx.properties.vendorID && header.deviceID == s.ctx.properties.deviceID &&
+           std::memcmp(header.pipelineCacheUUID, s.ctx.properties.pipelineCacheUUID, VK_UUID_SIZE) == 0;
+}
+void open_pipeline_cache(State &s) {
+    s.pipeline_cache_file = pipeline_cache_location();
+    if (s.pipeline_cache_file.empty())
+        return;
+    std::vector<char> data = read_file(s.pipeline_cache_file);
+    const bool reused = pipeline_cache_matches(s, data);
+    if (!reused)
+        data.clear();
+    VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    info.initialDataSize = data.size();
+    info.pInitialData = data.empty() ? nullptr : data.data();
+    if (vkCreatePipelineCache(s.device, &info, nullptr, &s.pipeline_cache) != VK_SUCCESS) {
+        info.initialDataSize = 0;
+        info.pInitialData = nullptr;
+        if (vkCreatePipelineCache(s.device, &info, nullptr, &s.pipeline_cache) != VK_SUCCESS)
+            s.pipeline_cache = VK_NULL_HANDLE;
+    }
+    log_line("GE", "pipeline cache " + s.pipeline_cache_file.string() + ": " +
+                       (reused ? "loaded " + std::to_string(data.size()) + " bytes" : std::string("new")));
+}
+// Saves the cache when new pipelines were added, at most every ~10 s of
+// presents (Android often ends the process without a clean shutdown).
+void maybe_save_pipeline_cache(State &s, std::uint64_t presents) {
+    if (!s.pipeline_cache_dirty || presents < s.pipeline_cache_saved_presents + 300u)
+        return;
+    s.pipeline_cache_saved_presents = presents;
+    s.save_pipeline_cache();
+}
 VkPipeline create_compute(State &s, std::string_view name) {
     VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     info.stage = stage(s, VK_SHADER_STAGE_COMPUTE_BIT, name);
     info.layout = s.layout;
     VkPipeline pipeline{};
-    check(vkCreateComputePipelines(s.device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline),
+    check(vkCreateComputePipelines(s.device, s.pipeline_cache, 1, &info, nullptr, &pipeline),
           std::string(name).c_str());
     return pipeline;
 }
@@ -1408,7 +2129,8 @@ VkPipeline create_graphics(State &s, std::string_view vs, std::string_view gs, s
         stages.push_back(stage(s, VK_SHADER_STAGE_GEOMETRY_BIT, gs));
     stages.push_back(stage(s, VK_SHADER_STAGE_FRAGMENT_BIT, ps));
     const bool ge = color_format == VK_FORMAT_UNDEFINED;
-    const VkVertexInputBindingDescription binding{0, sizeof(GpuVertex), VK_VERTEX_INPUT_RATE_VERTEX};
+    const VkVertexInputBindingDescription binding{0, sizeof(GpuVertex),
+        vs == "PointVS" ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
     const VkVertexInputAttributeDescription attributes[]{{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},
                                                          {1, 0, VK_FORMAT_R32_UINT, 12},
                                                          {2, 0, VK_FORMAT_R32_UINT, 16},
@@ -1445,6 +2167,21 @@ VkPipeline create_graphics(State &s, std::string_view vs, std::string_view gs, s
     VkPipelineColorBlendStateCreateInfo blending{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     blending.attachmentCount = ge ? 0u : 1u;
     blending.pAttachments = &blend;
+#if defined(__ANDROID__)
+    VkPipelineColorBlendAttachmentState ordered_blend[2]{};
+    for (auto &attachment : ordered_blend) attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
+    VkPipelineColorBlendAttachmentState locked_blend{};
+    locked_blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
+    if (ge && s.pixel_path == PixelPath::OrderedAttachment) {
+        if (!diag_flag("PSPRECOMP_MOTORSTORM_DIAG_NO_ROAA"))
+            blending.flags = VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
+        blending.attachmentCount = 2;
+        blending.pAttachments = ordered_blend;
+    } else if (ge && s.pixel_path == PixelPath::FixedFunctionProgrammable) {
+        blending.attachmentCount = 1;
+        blending.pAttachments = &locked_blend;
+    }
+#endif
     VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     const VkDynamicState dynamic_states[]{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
@@ -1455,6 +2192,18 @@ VkPipeline create_graphics(State &s, std::string_view vs, std::string_view gs, s
     rendering.pColorAttachmentFormats = &color_format;
     VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     info.pNext = &rendering;
+#if defined(__ANDROID__)
+    if (ge && s.pixel_path == PixelPath::OrderedAttachment) {
+        info.pNext = nullptr;
+        info.renderPass = s.attachment_pass;
+    } else if (ge && s.pixel_path == PixelPath::FixedFunctionProgrammable) {
+        info.pNext = nullptr;
+        info.renderPass = s.programmable_pass;
+    } else if (!ge && !s.dynamic_rendering) {
+        info.pNext = nullptr;
+        info.renderPass = s.swapchain_pass;
+    }
+#endif
     info.stageCount = static_cast<UINT>(stages.size());
     info.pStages = stages.data();
     info.pVertexInputState = &input;
@@ -1467,23 +2216,597 @@ VkPipeline create_graphics(State &s, std::string_view vs, std::string_view gs, s
     info.pDynamicState = &dynamic;
     info.layout = s.layout;
     VkPipeline pipeline{};
-    check(vkCreateGraphicsPipelines(s.device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline),
+    check(vkCreateGraphicsPipelines(s.device, s.pipeline_cache, 1, &info, nullptr, &pipeline),
           (std::string("create pipeline ") + std::string(ps)).c_str());
     return pipeline;
 }
+void transition_image(State &s, VkImage image, VkImageLayout &current, VkImageLayout next, VkImageAspectFlags aspect) {
+    if (!image || current == next)
+        return;
+    // Layout-specific stages. ALL_COMMANDS barriers make Turnip flush the
+    // queue, and a hardware pack used to do several of them per draw.
+    end_rendering(s);
+    const auto stages_of = [](VkImageLayout layout) -> VkPipelineStageFlags {
+        switch (layout) {
+        case VK_IMAGE_LAYOUT_UNDEFINED:
+            return VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+            return VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+            return VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+            return VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+            return VK_PIPELINE_STAGE_TRANSFER_BIT;
+        default:
+            return VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        }
+    };
+    const auto access_of = [](VkImageLayout layout) -> VkAccessFlags {
+        switch (layout) {
+        case VK_IMAGE_LAYOUT_UNDEFINED:
+            return 0;
+        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+            return VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+            return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+            return VK_ACCESS_SHADER_READ_BIT;
+        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+            return VK_ACCESS_TRANSFER_READ_BIT;
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+            return VK_ACCESS_TRANSFER_WRITE_BIT;
+        default:
+            return VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        }
+    };
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.srcAccessMask = access_of(current);
+    barrier.dstAccessMask = access_of(next);
+    barrier.oldLayout = current;
+    barrier.newLayout = next;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange = {aspect, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(s.cmd, stages_of(current), stages_of(next), 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    current = next;
+    wrote(s);
+}
+void pack_hardware(State &s, Surface &surface) {
+#if !defined(__ANDROID__)
+    (void)s;
+    (void)surface;
+#else
+    if (!surface.hw_dirty || surface.address == 0)
+        return;
+    const auto pack_began = perf::now_ns();
+    end_rendering(s);
+    const UINT width = surface.raster_stride(), height = surface.raster_height();
+    Constants constants{};
+    constants.surface = {width, height, width, width};
+    constants.mode[0] = surface.format;
+    constants.render[0] = surface.raster_half;
+    const auto cb = allocate(s, sizeof(constants), 256);
+    std::memcpy(s.mapped + cb, &constants, sizeof(constants));
+    const VkDescriptorBufferInfo constant_info{s.upload.buffer, cb, sizeof(Constants)};
+    if (surface.hw_color) {
+        transition_image(s, surface.hw_color.image, surface.hw_color_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_IMAGE_ASPECT_COLOR_BIT);
+        if (s.bound_compute != s.pack_color_pipeline) {
+            vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.pack_color_pipeline);
+            s.bound_compute = s.pack_color_pipeline;
+        }
+        const VkDescriptorBufferInfo color_info{surface.image.buffer, 0, VK_WHOLE_SIZE};
+        const VkDescriptorImageInfo image_info{VK_NULL_HANDLE, surface.hw_color.view,
+                                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        const VkWriteDescriptorSet writes[]{buffer_write(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, &constant_info),
+                                            buffer_write(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &color_info),
+                                            image_write(3, &image_info)};
+        vkCmdPushDescriptorSetKHR(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.layout, 0, 3, writes);
+        vkCmdDispatch(s.cmd, (width + 7) / 8, (height + 7) / 8, 1);
+        transition_image(s, surface.hw_color.image, surface.hw_color_layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                         VK_IMAGE_ASPECT_COLOR_BIT);
+    }
+    if (surface.hw_depth) {
+        transition_image(s, surface.hw_depth.image, surface.hw_depth_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_IMAGE_ASPECT_DEPTH_BIT);
+        const UINT64 bytes = static_cast<UINT64>(width) * height * 2u + 4u;
+        if (!s.hw_depth_staging || s.hw_depth_staging.size < bytes) {
+            if (s.hw_depth_staging)
+                s.transient.push_back(std::move(s.hw_depth_staging));
+            s.hw_depth_staging = make_buffer(bytes, Memory::Device);
+        }
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+        region.imageExtent = {width, height, 1};
+        vkCmdCopyImageToBuffer(s.cmd, surface.hw_depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               s.hw_depth_staging.buffer, 1, &region);
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(s.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                             &barrier, 0, nullptr, 0, nullptr);
+        if (s.bound_compute != s.pack_depth_pipeline) {
+            vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.pack_depth_pipeline);
+            s.bound_compute = s.pack_depth_pipeline;
+        }
+        const VkDescriptorBufferInfo depth_info{surface.image.buffer, 0, VK_WHOLE_SIZE};
+        const VkDescriptorBufferInfo bits_info{s.hw_depth_staging.buffer, 0, VK_WHOLE_SIZE};
+        const VkWriteDescriptorSet writes[]{buffer_write(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, &constant_info),
+                                            buffer_write(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &depth_info),
+                                            buffer_write(12, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &bits_info)};
+        vkCmdPushDescriptorSetKHR(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.layout, 0, 3, writes);
+        vkCmdDispatch(s.cmd, (width + 7) / 8, (height + 7) / 8, 1);
+        transition_image(s, surface.hw_depth.image, surface.hw_depth_layout,
+                         VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+    }
+    // The compute writes land in the packed buffers. Make them visible to the
+    // snapshot copy and to the next fragment shader without a full queue flush.
+    VkMemoryBarrier packed{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    packed.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    packed.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(s.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &packed, 0, nullptr, 0, nullptr);
+    surface.hw_dirty = false;
+    surface.hw_matches = true;
+    surface.buffer_newer = true;
+    surface.image_newer = false;
+    wrote(s);
+    s.unflushed = false;
+    ++stats.hw_packs;
+    stats.hw_pack_ns += perf::now_ns() - pack_began;
+#endif
+}
+#if defined(__ANDROID__)
+VkRenderPass make_hw_pass(State &s, VkAttachmentLoadOp load) {
+    VkAttachmentDescription attachments[2]{};
+    attachments[0].format = VK_FORMAT_R8G8B8A8_UNORM;
+    attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachments[0].loadOp = load;
+    attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[0].initialLayout = attachments[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    attachments[1].format = VK_FORMAT_D16_UNORM;
+    attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachments[1].loadOp = load;
+    attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[1].initialLayout = attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    const VkAttachmentReference color{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    const VkAttachmentReference depth{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &color;
+    subpass.pDepthStencilAttachment = &depth;
+    VkSubpassDependency dependency{};
+    dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependency.dstSubpass = 0;
+    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                              VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    dependency.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                               VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                               VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                               VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    VkRenderPassCreateInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    info.attachmentCount = 2;
+    info.pAttachments = attachments;
+    info.subpassCount = 1;
+    info.pSubpasses = &subpass;
+    info.dependencyCount = 1;
+    info.pDependencies = &dependency;
+    VkRenderPass pass{};
+    check(vkCreateRenderPass(s.device, &info, nullptr, &pass), "create hardware render pass");
+    return pass;
+}
+VkPipeline create_hw_pipeline(State &s, std::string_view vs, std::string_view ps, VkPrimitiveTopology topology,
+                              bool depth_test, bool depth_write, std::uint8_t depth_compare, bool blend,
+                              std::uint8_t blend_op, std::uint8_t src_factor, std::uint8_t dst_factor,
+                              std::uint8_t write_mask, std::uint8_t cull, bool dynamic_state) {
+    const VkPipelineShaderStageCreateInfo stages[]{stage(s, VK_SHADER_STAGE_VERTEX_BIT, vs),
+                                                    stage(s, VK_SHADER_STAGE_FRAGMENT_BIT, ps)};
+    const VkVertexInputBindingDescription binding{0, sizeof(GpuVertex),
+        vs == "PointVSFast" ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
+    const VkVertexInputAttributeDescription attributes[]{{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},
+                                                         {1, 0, VK_FORMAT_R32_UINT, 12},
+                                                         {2, 0, VK_FORMAT_R32_UINT, 16},
+                                                         {3, 0, VK_FORMAT_R32G32B32_SFLOAT, 20},
+                                                         {4, 0, VK_FORMAT_R32_SFLOAT, 32}};
+    VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    input.vertexBindingDescriptionCount = 1;
+    input.pVertexBindingDescriptions = &binding;
+    input.vertexAttributeDescriptionCount = 5;
+    input.pVertexAttributeDescriptions = attributes;
+    VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    assembly.topology = topology;
+    VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    viewport.viewportCount = 1;
+    viewport.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.cullMode = static_cast<VkCullModeFlags>(cull);
+    raster.frontFace = VK_FRONT_FACE_CLOCKWISE;
+    raster.depthClampEnable = s.ctx.depth_clamp ? VK_TRUE : VK_FALSE;
+    raster.lineWidth = 1.0f;
+    VkPipelineRasterizationLineStateCreateInfoKHR line{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO_KHR};
+    line.lineRasterizationMode = VK_LINE_RASTERIZATION_MODE_BRESENHAM_KHR;
+    if (topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST && s.ctx.line_rasterization)
+        raster.pNext = &line;
+    VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    depth.depthTestEnable = depth_test ? VK_TRUE : VK_FALSE;
+    depth.depthWriteEnable = depth_write ? VK_TRUE : VK_FALSE;
+    depth.depthCompareOp = static_cast<VkCompareOp>(depth_compare);
+    VkPipelineColorBlendAttachmentState attachment{};
+    attachment.blendEnable = blend ? VK_TRUE : VK_FALSE;
+    attachment.srcColorBlendFactor = static_cast<VkBlendFactor>(src_factor);
+    attachment.dstColorBlendFactor = static_cast<VkBlendFactor>(dst_factor);
+    attachment.colorBlendOp = static_cast<VkBlendOp>(blend_op);
+    attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    attachment.alphaBlendOp = VK_BLEND_OP_ADD;
+    attachment.colorWriteMask = write_mask;
+    VkPipelineColorBlendStateCreateInfo blending{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    blending.attachmentCount = 1;
+    blending.pAttachments = &attachment;
+    VkDynamicState dynamic_states[16]{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                     VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+    UINT dynamic_count = 3;
+    if (dynamic_state) {
+        dynamic_states[dynamic_count++] = VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE;
+        dynamic_states[dynamic_count++] = VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE;
+        dynamic_states[dynamic_count++] = VK_DYNAMIC_STATE_DEPTH_COMPARE_OP;
+        dynamic_states[dynamic_count++] = VK_DYNAMIC_STATE_CULL_MODE;
+        dynamic_states[dynamic_count++] = VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT;
+        dynamic_states[dynamic_count++] = VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT;
+        dynamic_states[dynamic_count++] = VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT;
+    }
+    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamic.dynamicStateCount = dynamic_count;
+    dynamic.pDynamicStates = dynamic_states;
+    VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    info.stageCount = 2;
+    info.pStages = stages;
+    info.pVertexInputState = &input;
+    info.pInputAssemblyState = &assembly;
+    info.pViewportState = &viewport;
+    info.pRasterizationState = &raster;
+    info.pMultisampleState = &multisample;
+    info.pDepthStencilState = &depth;
+    info.pColorBlendState = &blending;
+    info.pDynamicState = &dynamic;
+    info.layout = s.layout;
+    info.renderPass = s.hw_pass_load;
+    VkPipeline pipeline{};
+    check(vkCreateGraphicsPipelines(s.device, s.pipeline_cache, 1, &info, nullptr, &pipeline),
+          (std::string("create hardware pipeline ") + std::string(ps)).c_str());
+    return pipeline;
+}
+VkPipeline hw_pipeline_for(State &s, const State::HwPipeKey &key) {
+    const bool dynamic = s.ctx.hw_dynamic_depth && s.ctx.hw_dynamic_blend && vkCmdSetDepthTestEnable &&
+                         vkCmdSetDepthWriteEnable && vkCmdSetDepthCompareOp && vkCmdSetCullMode &&
+                         vkCmdSetColorBlendEnableEXT && vkCmdSetColorBlendEquationEXT && vkCmdSetColorWriteMaskEXT;
+    State::HwPipeKey pipe = key;
+    if (dynamic) {
+        // depth_write selects an alpha-tested shader variant and must stay in
+        // the cache key even though the depth-write state itself is dynamic.
+        pipe.depth_test = pipe.depth_compare = 0;
+        pipe.blend = pipe.blend_op = pipe.src = pipe.dst = pipe.mask = pipe.cull = 0;
+    }
+    if (const auto found = s.hw_pipelines.find(pipe); found != s.hw_pipelines.end())
+        return found->second;
+    const char *vs = key.topology == 0 ? "PointVSFast" : "VSFast";
+    const char *ps = "PSFast";
+    if (key.feedback)
+        ps = key.alpha ? "PSFastAlphaFeedback" : "PSFastFeedback";
+    else if (key.alpha)
+        ps = key.depth_write ? "PSFastAlpha" : "PSFastAlphaEarly";
+    const VkPrimitiveTopology topology = key.topology == 1   ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST
+                                         : key.topology == 2 ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
+                                                             : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    const auto began = perf::now_ns();
+    const VkPipeline pipeline = create_hw_pipeline(s, vs, ps, topology, key.depth_test, key.depth_write, key.depth_compare,
+                                                   key.blend, key.blend_op, key.src, key.dst, key.mask, key.cull, dynamic);
+    const auto elapsed_ns = perf::now_ns() - began;
+    ++stats.pipelines_created;
+    stats.pipeline_create_ns += elapsed_ns;
+    s.hw_pipelines.emplace(pipe, pipeline);
+    s.hw_pipe_order.push_back(pipe);
+    s.pipeline_cache_dirty = true;
+    if (!s.prewarming)
+        log_line("GE", std::string("hardware pipeline ") + ps + " built during play in " +
+                           std::to_string(elapsed_ns / 1000u) + " us (" + std::to_string(s.hw_pipelines.size()) +
+                           " total)");
+    return pipeline;
+}
+// The hardware pipelines the previous runs needed, built before the first
+// frame from the warm pipeline cache: PSPRECOMP_MOTORSTORM_PIPELINE_CACHE's
+// file plus ".keys". Unknown or malformed files are ignored.
+constexpr std::uint32_t kHwKeysMagic = 0x4B504D53u;  // "SMPK"
+constexpr std::uint32_t kHwKeysVersion = 1u;
+std::filesystem::path hw_keys_file(const State &s) {
+    auto path = s.pipeline_cache_file;
+    path += ".keys";
+    return path;
+}
+void prewarm_hw_pipelines(State &s) {
+    if (s.pipeline_cache_file.empty() || !s.hw_pass_load)
+        return;
+    const std::vector<char> data = read_file(hw_keys_file(s));
+    std::uint32_t header[3]{};
+    if (data.size() < sizeof(header))
+        return;
+    std::memcpy(header, data.data(), sizeof(header));
+    const std::size_t count = header[2];
+    if (header[0] != kHwKeysMagic || header[1] != kHwKeysVersion ||
+        data.size() != sizeof(header) + count * sizeof(State::HwPipeKey) || count > 4096u)
+        return;
+    const auto began = perf::now_ns();
+    s.prewarming = true;
+    for (std::size_t index = 0; index < count; ++index) {
+        State::HwPipeKey key{};
+        std::memcpy(&key, data.data() + sizeof(header) + index * sizeof(key), sizeof(key));
+        if (key.topology > 3u)
+            continue;
+        hw_pipeline_for(s, key);
+    }
+    s.prewarming = false;
+    s.hw_keys_saved = s.hw_pipe_order.size();
+    log_line("GE", "prewarmed " + std::to_string(s.hw_pipelines.size()) + " hardware pipelines in " +
+                       std::to_string((perf::now_ns() - began) / 1000000u) + " ms");
+}
+void save_hw_keys(State &s) {
+    if (s.pipeline_cache_file.empty() || s.hw_pipe_order.size() == s.hw_keys_saved)
+        return;
+    const std::uint32_t header[3]{kHwKeysMagic, kHwKeysVersion, static_cast<std::uint32_t>(s.hw_pipe_order.size())};
+    auto temporary = hw_keys_file(s);
+    temporary += ".tmp";
+    std::FILE *file = std::fopen(temporary.string().c_str(), "wb");
+    if (!file)
+        return;
+    bool written = std::fwrite(header, sizeof(header), 1, file) == 1;
+    if (!s.hw_pipe_order.empty())
+        written = written && std::fwrite(s.hw_pipe_order.data(), sizeof(State::HwPipeKey), s.hw_pipe_order.size(),
+                                         file) == s.hw_pipe_order.size();
+    if (std::fclose(file) != 0 || !written)
+        return;
+    std::error_code error;
+    std::filesystem::rename(temporary, hw_keys_file(s), error);
+    if (!error)
+        s.hw_keys_saved = s.hw_pipe_order.size();
+}
+void draw_hw_load(State &s, Surface &color, Surface &depth) {
+    Constants constants{};
+    constants.surface = {color.raster_stride(), color.raster_height(), color.raster_stride(), depth.raster_stride()};
+    constants.mode[0] = color.format;
+    constants.render[0] = color.raster_half;
+    const auto cb = allocate(s, sizeof(constants), 256);
+    std::memcpy(s.mapped + cb, &constants, sizeof(constants));
+    GpuVertex triangle[3]{};
+    triangle[1].x = static_cast<float>(color.stride) * 2.0f;
+    triangle[2].y = static_cast<float>(color.height) * 2.0f;
+    const auto vertices = allocate(s, sizeof(triangle), 4);
+    std::memcpy(s.mapped + vertices, triangle, sizeof(triangle));
+    if (s.bound_graphics != s.hw_load_pipeline) {
+        vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.hw_load_pipeline);
+        s.bound_graphics = s.hw_load_pipeline;
+    }
+    const VkDescriptorBufferInfo buffers[]{{s.upload.buffer, cb, sizeof(Constants)},
+                                           {color.image.buffer, 0, VK_WHOLE_SIZE},
+                                           {depth.image.buffer, 0, VK_WHOLE_SIZE}};
+    const VkWriteDescriptorSet writes[]{buffer_write(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, &buffers[0]),
+                                        buffer_write(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &buffers[1]),
+                                        buffer_write(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &buffers[2])};
+    vkCmdPushDescriptorSetKHR(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.layout, 0, 3, writes);
+    const VkViewport viewport{0, 0, static_cast<float>(color.raster_stride()), static_cast<float>(color.raster_height()),
+                              0, 1};
+    vkCmdSetViewport(s.cmd, 0, 1, &viewport);
+    const VkRect2D scissor{{0, 0}, {color.raster_stride(), color.raster_height()}};
+    vkCmdSetScissor(s.cmd, 0, 1, &scissor);
+    const float blend[4]{};
+    vkCmdSetBlendConstants(s.cmd, blend);
+    const VkBuffer buffer = s.upload.buffer;
+    const VkDeviceSize offset = vertices;
+    vkCmdBindVertexBuffers(s.cmd, 0, 1, &buffer, &offset);
+    vkCmdDraw(s.cmd, 3, 1, 0, 0);
+    wrote(s);
+}
+void begin_hardware_pass(State &s, Surface &color, Surface &depth) {
+    // End first. An ordered pass clears hw_matches only when it ends, and the
+    // compact images have to be reloaded from that result.
+    end_rendering(s);
+    const bool load = !color.hw_matches || !depth.hw_matches;
+    if (load) {
+        if (color.image_newer)
+            sync_buffer(s, color);
+        if (depth.address != 0 && depth.image_newer)
+            sync_buffer(s, depth);
+    }
+    if (!color.hw_color) {
+        color.hw_color = make_image(color.raster_stride(), color.raster_height(), 1, VK_FORMAT_R8G8B8A8_UNORM,
+                                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        color.hw_color_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+    if (!depth.hw_depth) {
+        depth.hw_depth = make_depth_image(depth.raster_stride(), depth.raster_height());
+        depth.hw_depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+    transition_image(s, color.hw_color.image, color.hw_color_layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                     VK_IMAGE_ASPECT_COLOR_BIT);
+    transition_image(s, depth.hw_depth.image, depth.hw_depth_layout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                     VK_IMAGE_ASPECT_DEPTH_BIT);
+    const VkImageView views[]{color.hw_color.view, depth.hw_depth.view};
+    VkFramebuffer framebuffer = VK_NULL_HANDLE;
+    for (const auto &cached : s.hw_framebuffers)
+        if (cached.color == views[0] && cached.depth == views[1]) {
+            framebuffer = cached.framebuffer;
+            break;
+        }
+    if (!framebuffer) {
+        VkFramebufferCreateInfo framebuffer_info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        framebuffer_info.renderPass = s.hw_pass_load;
+        framebuffer_info.attachmentCount = 2;
+        framebuffer_info.pAttachments = views;
+        framebuffer_info.width = color.raster_stride();
+        framebuffer_info.height = color.raster_height();
+        framebuffer_info.layers = 1;
+        check(vkCreateFramebuffer(s.device, &framebuffer_info, nullptr, &framebuffer), "create hardware framebuffer");
+        s.hw_framebuffers.push_back({views[0], views[1], framebuffer});
+    }
+    auto begin_pass = [&](VkRenderPass render_pass) {
+        VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        pass.renderPass = render_pass;
+        pass.framebuffer = framebuffer;
+        pass.renderArea = {{0, 0}, {color.raster_stride(), color.raster_height()}};
+        vkCmdBeginRenderPass(s.cmd, &pass, VK_SUBPASS_CONTENTS_INLINE);
+        s.rendering = true;
+        s.rendering_hardware = true;
+        s.hw_pass_color = &color;
+        s.hw_pass_depth = &depth;
+        s.bound_graphics = VK_NULL_HANDLE;
+    };
+    if (load) {
+        // PSLoad writes gl_FragDepth. On a tiler that disables early-Z for the
+        // rest of the pass, so the copy gets its own pass and the scene pass
+        // only loads the stored depth.
+        begin_pass(s.hw_pass_clear);
+        draw_hw_load(s, color, depth);
+        vkCmdEndRenderPass(s.cmd);
+        s.rendering = false;
+        s.rendering_hardware = false;
+        s.hw_pass_color = s.hw_pass_depth = nullptr;
+        color.hw_matches = true;
+        depth.hw_matches = true;
+        color.hw_dirty = false;
+        depth.hw_dirty = false;
+        VkImageMemoryBarrier done[2]{};
+        done[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        done[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        done[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        done[0].oldLayout = done[0].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        done[0].srcQueueFamilyIndex = done[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        done[0].image = color.hw_color.image;
+        done[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        done[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        done[1].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        done[1].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        done[1].oldLayout = done[1].newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        done[1].srcQueueFamilyIndex = done[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        done[1].image = depth.hw_depth.image;
+        done[1].subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(s.cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, 0,
+                             0, nullptr, 0, nullptr, 2, done);
+    }
+    begin_pass(s.hw_pass_load);
+}
+#endif
+bool hardware_draws_enabled(const State &s) {
+#if !defined(__ANDROID__)
+    (void)s;
+    return false;
+#else
+    return s.pixel_path == PixelPath::OrderedAttachment && s.hw_depth_ok && s.raster_half == 2 &&
+           !diag_flag("PSPRECOMP_MOTORSTORM_DIAG_NO_INPUT_READ") &&
+           !diag_flag("PSPRECOMP_MOTORSTORM_DIAG_TRIVIAL_PS") && !diag_flag("PSPRECOMP_MOTORSTORM_DIAG_NO_SHADE");
+#endif
+}
 void create_pipelines(State &s) {
+#if defined(__ANDROID__)
+    if (s.pixel_path == PixelPath::FixedFunctionProgrammable) {
+        VkAttachmentDescription attachment{};
+        attachment.format = VK_FORMAT_R8_UNORM;
+        attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        attachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        const VkAttachmentReference reference{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments = &reference;
+        VkRenderPassCreateInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        pass.attachmentCount = 1;
+        pass.pAttachments = &attachment;
+        pass.subpassCount = 1;
+        pass.pSubpasses = &subpass;
+        check(vkCreateRenderPass(s.device, &pass, nullptr, &s.programmable_pass), "create programmable pass");
+        s.programmable_target = make_image(4096, 4096, 1, VK_FORMAT_R8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        const VkImageView view = s.programmable_target.view;
+        VkFramebufferCreateInfo framebuffer{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        framebuffer.renderPass = s.programmable_pass;
+        framebuffer.attachmentCount = 1;
+        framebuffer.pAttachments = &view;
+        framebuffer.width = framebuffer.height = 4096;
+        framebuffer.layers = 1;
+        check(vkCreateFramebuffer(s.device, &framebuffer, nullptr, &s.programmable_framebuffer),
+              "create programmable framebuffer");
+        s.programmable_width = s.programmable_height = 4096;
+    } else {
+    VkAttachmentDescription attachments[2]{};
+    for (auto &attachment : attachments) {
+        attachment.format = VK_FORMAT_R32_UINT;
+        attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        attachment.initialLayout = attachment.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+    const VkAttachmentReference references[2]{{0, VK_IMAGE_LAYOUT_GENERAL}, {1, VK_IMAGE_LAYOUT_GENERAL}};
+    VkSubpassDescription subpass{};
+    if (!diag_flag("PSPRECOMP_MOTORSTORM_DIAG_NO_ROAA"))
+        subpass.flags = VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT;
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.inputAttachmentCount = subpass.colorAttachmentCount = 2;
+    subpass.pInputAttachments = subpass.pColorAttachments = references;
+    VkRenderPassCreateInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    pass.attachmentCount = 2; pass.pAttachments = attachments;
+    pass.subpassCount = 1; pass.pSubpasses = &subpass;
+    check(vkCreateRenderPass(s.device, &pass, nullptr, &s.attachment_pass), "create ordered attachment pass");
+    VkFormatProperties depth_format{};
+    vkGetPhysicalDeviceFormatProperties(s.ctx.physical, VK_FORMAT_D16_UNORM, &depth_format);
+    const VkFormatFeatureFlags depth_features = depth_format.optimalTilingFeatures;
+    s.hw_depth_ok = (depth_features & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0 &&
+                    (depth_features & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) != 0 &&
+                    (depth_features & VK_FORMAT_FEATURE_TRANSFER_DST_BIT) != 0;
+    if (s.hw_depth_ok) {
+        s.hw_pass_load = make_hw_pass(s, VK_ATTACHMENT_LOAD_OP_LOAD);
+        s.hw_pass_clear = make_hw_pass(s, VK_ATTACHMENT_LOAD_OP_DONT_CARE);
+    }
+    }
+#endif
     // Set 0: per-draw push descriptors (the D3D12 root parameters).
     const VkDescriptorType types[]{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
                                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-                                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
-    VkDescriptorSetLayoutBinding bindings[9]{};
-    for (UINT i = 0; i < 9; ++i)
+                                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+#if defined(__ANDROID__)
+                                   , VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
+                                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+#endif
+    };
+    VkDescriptorSetLayoutBinding bindings[std::size(types)]{};
+    for (UINT i = 0; i < std::size(types); ++i)
         bindings[i] = {i, types[i], 1, VK_SHADER_STAGE_ALL, nullptr};
     VkDescriptorSetLayoutCreateInfo push{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     push.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-    push.bindingCount = 9;
+    push.bindingCount = static_cast<UINT>(std::size(types));
     push.pBindings = bindings;
     check(vkCreateDescriptorSetLayout(s.device, &push, nullptr, &s.push_layout), "create push descriptor layout");
     // Set 1: s0..s3 bilinear wrap/clamp combinations, s4..s7 the same with 8x
@@ -1526,12 +2849,27 @@ void create_pipelines(State &s) {
     layout.setLayoutCount = 2;
     layout.pSetLayouts = sets;
     check(vkCreatePipelineLayout(s.device, &layout, nullptr, &s.layout), "create pipeline layout");
-    s.list_pipeline = create_graphics(s, "VS", {}, "PS", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FORMAT_UNDEFINED);
-    s.strip_pipeline = create_graphics(s, "VS", {}, "PS", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_FORMAT_UNDEFINED);
-    s.line_pipeline = create_graphics(s, "VS", {}, "PS", VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_FORMAT_UNDEFINED);
+#if defined(__ANDROID__)
+    const char *pixel = s.pixel_path == PixelPath::FixedFunctionProgrammable ? "PSLock"
+                        : diag_flag("PSPRECOMP_MOTORSTORM_DIAG_NO_INPUT_READ") ? "PSNoRead"
+                        : diag_flag("PSPRECOMP_MOTORSTORM_DIAG_TRIVIAL_PS")    ? "PSTrivial"
+                        : diag_flag("PSPRECOMP_MOTORSTORM_DIAG_NO_SHADE")      ? "PSNoShade"
+                                                                                : "PS";
+    if (point_expansion_requires_geometry_shader(s.pixel_path))
+        throw std::runtime_error("point expansion requires a geometry shader");
+#else
+    const char *pixel = "PS";
+#endif
+    s.list_pipeline = create_graphics(s, "VS", {}, pixel, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FORMAT_UNDEFINED);
+    s.strip_pipeline = create_graphics(s, "VS", {}, pixel, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_FORMAT_UNDEFINED);
+    s.line_pipeline = create_graphics(s, "VS", {}, pixel, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_FORMAT_UNDEFINED);
     // Points: the geometry shader expands them and flips Y itself.
     s.point_pipeline =
+#if defined(__ANDROID__)
+        create_graphics(s, "PointVS", {}, pixel, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FORMAT_UNDEFINED);
+#else
         create_graphics(s, "VSPoint", "PointGS", "PS", VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_FORMAT_UNDEFINED);
+#endif
     s.expand_pipeline = create_compute(s, "ExpandCS");
     s.resolve_pipeline = create_compute(s, "ResolveCS");
     s.capture_pipeline = create_compute(s, "CaptureCS");
@@ -1545,6 +2883,15 @@ void create_pipelines(State &s) {
     s.post_color_pipeline = create_compute(s, "PostColorCS");
     s.post_color_capture_pipeline = create_compute(s, "PostColorCaptureCS");
     s.depth_resolve_pipeline = create_compute(s, "DepthResolveCS");
+#if defined(__ANDROID__)
+    s.present_convert_pipeline = create_compute(s, "PresentConvertCS");
+    if (s.hw_depth_ok && s.pixel_path == PixelPath::OrderedAttachment) {
+        s.hw_load_pipeline = create_hw_pipeline(s, "VS", "PSLoad", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, true, true, 7,
+                                                false, 0, 1, 0, 0x0F, 0, false);
+        s.pack_color_pipeline = create_compute(s, "PackColorCS");
+        s.pack_depth_pipeline = create_compute(s, "PackDepthCS");
+    }
+#endif
 }
 void setup_post(State &s) {
     s.post = post_settings_from_environment();
@@ -1577,11 +2924,33 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_message(VkDebugUtilsMessageSeverityFlagBits
 }
 void create_device(State &s) {
     auto &ctx = s.ctx;
+#if defined(__ANDROID__)
+    const char *driver_dir = std::getenv("MOTORSTORM_ANDROID_DRIVER_DIR");
+    const char *driver_name = std::getenv("MOTORSTORM_ANDROID_DRIVER_NAME");
+    const char *hooks = std::getenv("MOTORSTORM_ANDROID_NATIVE_LIB_DIR");
+    const char *temp = std::getenv("MOTORSTORM_ANDROID_DRIVER_TEMP");
+    const bool imported = driver_dir && driver_dir[0] && driver_name && driver_name[0] && hooks;
+    if (imported)
+        ctx.library = adrenotools_open_libvulkan(RTLD_NOW | RTLD_LOCAL, ADRENOTOOLS_DRIVER_CUSTOM,
+            temp, hooks, driver_dir, driver_name, nullptr, nullptr);
+    if (imported && !ctx.library) {
+        const auto decision = resolve_driver(DriverRequest::Imported, false, false);
+        s.driver_fallback = std::string(decision.message);
+        log_line("DRIVER", s.driver_fallback);
+    }
+    if (!ctx.library) ctx.library = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+#else
     ctx.library = LoadLibraryW(L"vulkan-1.dll");
+#endif
     if (!ctx.library)
         throw std::runtime_error("vulkan-1.dll (the Vulkan loader) is not installed");
     vkGetInstanceProcAddr =
-        reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(ctx.library, "vkGetInstanceProcAddr"));
+        reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+#if defined(__ANDROID__)
+            dlsym(ctx.library, "vkGetInstanceProcAddr"));
+#else
+            GetProcAddress(ctx.library, "vkGetInstanceProcAddr"));
+#endif
     if (!vkGetInstanceProcAddr)
         throw std::runtime_error("vulkan-1.dll has no vkGetInstanceProcAddr");
 #define MOTORSTORM_VK_LOAD_GLOBAL(name)                                                                            \
@@ -1592,13 +2961,18 @@ void create_device(State &s) {
 #undef MOTORSTORM_VK_LOAD_GLOBAL
     UINT api = 0;
     vkEnumerateInstanceVersion(&api);
-    if (api < VK_API_VERSION_1_3)
-        throw std::runtime_error("the Vulkan loader is older than Vulkan 1.3");
+    if (api < VK_API_VERSION_1_1)
+        throw std::runtime_error("the Vulkan loader is older than Vulkan 1.1");
     UINT count = 0;
     vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr);
     std::vector<VkExtensionProperties> instance_extensions(count);
     vkEnumerateInstanceExtensionProperties(nullptr, &count, instance_extensions.data());
-    std::vector<const char *> extensions{VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+    std::vector<const char *> extensions{VK_KHR_SURFACE_EXTENSION_NAME,
+#if defined(__ANDROID__)
+        VK_KHR_ANDROID_SURFACE_EXTENSION_NAME};
+#else
+        VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+#endif
     std::vector<const char *> layers;
     const char *validation = std::getenv("PSPRECOMP_MOTORSTORM_VK_VALIDATION");
     const bool validate = validation && *validation && std::strcmp(validation, "0") != 0;
@@ -1619,7 +2993,7 @@ void create_device(State &s) {
     VkApplicationInfo application{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     application.pApplicationName = "MotorStormNative";
     application.pEngineName = "PSPRecomp";
-    application.apiVersion = VK_API_VERSION_1_3;
+    application.apiVersion = api >= VK_API_VERSION_1_3 ? VK_API_VERSION_1_3 : VK_API_VERSION_1_1;
     VkInstanceCreateInfo instance{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     instance.pApplicationInfo = &application;
     instance.enabledExtensionCount = static_cast<UINT>(extensions.size());
@@ -1654,6 +3028,7 @@ void create_device(State &s) {
     int best_score = -1;
     std::string rejected;
     std::vector<VkExtensionProperties> chosen_extensions;
+    PixelPath best_path = PixelPath::Interlock;
     for (auto device : devices) {
         VkPhysicalDeviceProperties properties{};
         vkGetPhysicalDeviceProperties(device, &properties);
@@ -1664,8 +3039,8 @@ void create_device(State &s) {
             reject("software");
             continue;
         }
-        if (properties.apiVersion < VK_API_VERSION_1_3) {
-            reject("Vulkan 1.3 required");
+        if (properties.apiVersion < VK_API_VERSION_1_1) {
+            reject("Vulkan 1.1 required");
             continue;
         }
         UINT extension_count = 0;
@@ -1673,9 +3048,58 @@ void create_device(State &s) {
         std::vector<VkExtensionProperties> device_extensions(extension_count);
         vkEnumerateDeviceExtensionProperties(device, nullptr, &extension_count, device_extensions.data());
         if (!has_extension(device_extensions, VK_KHR_SWAPCHAIN_EXTENSION_NAME) ||
-            !has_extension(device_extensions, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME) ||
-            !has_extension(device_extensions, VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME)) {
-            reject("swapchain, push descriptors and fragment shader interlock required");
+            !has_extension(device_extensions, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) {
+            reject("swapchain and push descriptors required");
+            continue;
+        }
+        PixelPath path = PixelPath::Interlock;
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+#if defined(__ANDROID__)
+        const bool roaa = has_extension(device_extensions, VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME);
+        const bool timeline_ext = has_extension(device_extensions, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME) ||
+                                  properties.apiVersion >= VK_API_VERSION_1_2;
+        VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT order{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT};
+        VkPhysicalDeviceTimelineSemaphoreFeatures timeline_feature{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+        VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        const bool core13 = properties.apiVersion >= VK_API_VERSION_1_3 && roaa;
+        VkPhysicalDeviceExtendedDynamicStateFeaturesEXT dyn_query{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
+        VkPhysicalDeviceExtendedDynamicState3FeaturesEXT dyn3_query{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
+        dyn3_query.pNext = &dyn_query;
+        if (core13) {
+            order.pNext = &dyn3_query;
+            v13.pNext = &order;
+            v12.pNext = &v13;
+            features.pNext = &v12;
+        } else if (timeline_ext) {
+            features.pNext = &timeline_feature;
+        }
+        vkGetPhysicalDeviceFeatures2(device, &features);
+        const bool depth_dyn = core13 && dyn_query.extendedDynamicState == VK_TRUE;
+        const bool blend_dyn = depth_dyn && dyn3_query.extendedDynamicState3ColorBlendEnable == VK_TRUE &&
+                               dyn3_query.extendedDynamicState3ColorBlendEquation == VK_TRUE &&
+                               dyn3_query.extendedDynamicState3ColorWriteMask == VK_TRUE &&
+                               has_extension(device_extensions, VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
+        PixelFeatures pixel{};
+        pixel.ordered_color_attachment = core13 && order.rasterizationOrderColorAttachmentAccess == VK_TRUE;
+        path = select_pixel_path(pixel);
+        const bool stores = features.features.fragmentStoresAndAtomics == VK_TRUE;
+        const bool clip = features.features.shaderClipDistance == VK_TRUE;
+        const bool timeline = core13 ? v12.timelineSemaphore == VK_TRUE : timeline_feature.timelineSemaphore == VK_TRUE;
+        const bool dynamic = core13 && v13.dynamicRendering == VK_TRUE;
+        const bool ordered_ok = path == PixelPath::OrderedAttachment && pixel.ordered_color_attachment && stores &&
+                                clip && timeline && dynamic;
+        if (!ordered_ok) {
+            reject("ordered color attachment access is required; the unordered atomic fallback is disabled");
+            continue;
+        }
+#else
+        if (!has_extension(device_extensions, VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME)) {
+            reject("fragment shader interlock required");
             continue;
         }
         VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT interlock{
@@ -1684,15 +3108,17 @@ void create_device(State &s) {
         v13.pNext = &interlock;
         VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
         v12.pNext = &v13;
-        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         features.pNext = &v12;
         vkGetPhysicalDeviceFeatures2(device, &features);
-        if (!interlock.fragmentShaderPixelInterlock || !features.features.fragmentStoresAndAtomics ||
-            !features.features.shaderClipDistance || !features.features.geometryShader || !v12.timelineSemaphore ||
-            !v13.dynamicRendering) {
+        if (properties.apiVersion < VK_API_VERSION_1_3 || !interlock.fragmentShaderPixelInterlock ||
+            !features.features.fragmentStoresAndAtomics || !features.features.shaderClipDistance ||
+            !features.features.geometryShader || !v12.timelineSemaphore || !v13.dynamicRendering ||
+            select_pixel_path(PixelFeatures{true, false}) != PixelPath::Interlock) {
             reject("missing interlock, fragment stores, clip distance, geometry shader, timeline or dynamic rendering");
             continue;
         }
+        path = PixelPath::Interlock;
+#endif
         UINT families = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(device, &families, nullptr);
         std::vector<VkQueueFamilyProperties> family_list(families);
@@ -1719,12 +3145,51 @@ void create_device(State &s) {
             ctx.depth_clamp = features.features.depthClamp;
             ctx.anisotropy = features.features.samplerAnisotropy;
             ctx.bc = features.features.textureCompressionBC;
+            ctx.host_query_reset =
+#if defined(__ANDROID__)
+                v12.hostQueryReset == VK_TRUE;
+#else
+                false;
+#endif
+            ctx.hw_dynamic_depth = depth_dyn;
+            ctx.hw_dynamic_blend = blend_dyn;
             chosen_extensions = std::move(device_extensions);
+            best_path = path;
         }
     }
-    if (!ctx.physical)
-        throw std::runtime_error("No Vulkan 1.3 GPU with fragment shader interlock is available:" + rejected);
+    if (!ctx.physical) {
+#if defined(__ANDROID__)
+        if (imported) {
+            const auto decision = resolve_driver(DriverRequest::Imported, ctx.library != nullptr, false);
+            s.driver_fallback = std::string(decision.message);
+            log_line("DRIVER", s.driver_fallback + rejected);
+            unsetenv("MOTORSTORM_ANDROID_DRIVER_DIR");
+            unsetenv("MOTORSTORM_ANDROID_DRIVER_NAME");
+            if (ctx.messenger && vkDestroyDebugUtilsMessengerEXT)
+                vkDestroyDebugUtilsMessengerEXT(ctx.instance, ctx.messenger, nullptr);
+            ctx.messenger = VK_NULL_HANDLE;
+            if (ctx.instance)
+                vkDestroyInstance(ctx.instance, nullptr);
+            ctx.instance = VK_NULL_HANDLE;
+            ctx.physical = VK_NULL_HANDLE;
+            if (ctx.library)
+                dlclose(ctx.library);
+            ctx.library = nullptr;
+            create_device(s);
+            return;
+        }
+#endif
+        throw std::runtime_error("No usable Vulkan GPU is available:" + rejected);
+    }
     stats.adapter = ctx.properties.deviceName;
+#if defined(__ANDROID__)
+    s.pixel_path = best_path;
+    s.dynamic_rendering = best_path == PixelPath::OrderedAttachment;
+    log_line("GE", std::string("pixel path=") +
+                       (s.pixel_path == PixelPath::OrderedAttachment ? "ordered-attachment"
+                        : s.pixel_path == PixelPath::FixedFunctionProgrammable ? "programmable-lock"
+                                                                              : "interlock"));
+#endif
     // Line rasterization: KHR (Vulkan 1.4 drivers) or the EXT it was promoted from.
     const char *line_extension = has_extension(chosen_extensions, VK_KHR_LINE_RASTERIZATION_EXTENSION_NAME)
                                      ? VK_KHR_LINE_RASTERIZATION_EXTENSION_NAME
@@ -1748,30 +3213,75 @@ void create_device(State &s) {
     queue.queueFamilyIndex = ctx.queue_family;
     queue.queueCount = queue_count;
     queue.pQueuePriorities = priorities;
+#if defined(__ANDROID__)
+    VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT interlock{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT};
+    if (s.pixel_path == PixelPath::OrderedAttachment)
+        interlock.rasterizationOrderColorAttachmentAccess = VK_TRUE;
+#else
     VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT interlock{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
     interlock.fragmentShaderPixelInterlock = VK_TRUE;
+#endif
     VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     v13.pNext = &interlock;
     v13.dynamicRendering = VK_TRUE;
     VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     v12.pNext = &v13;
     v12.timelineSemaphore = VK_TRUE;
+#if defined(__ANDROID__)
+    v12.hostQueryReset = ctx.host_query_reset ? VK_TRUE : VK_FALSE;
+#endif
     VkPhysicalDeviceLineRasterizationFeaturesKHR line_enable{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_KHR};
     line_enable.bresenhamLines = VK_TRUE;
     if (ctx.line_rasterization)
         interlock.pNext = &line_enable;
+#if defined(__ANDROID__)
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT dyn_enable{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
+    dyn_enable.extendedDynamicState = VK_TRUE;
+    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT dyn3_enable{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
+    dyn3_enable.extendedDynamicState3ColorBlendEnable = VK_TRUE;
+    dyn3_enable.extendedDynamicState3ColorBlendEquation = VK_TRUE;
+    dyn3_enable.extendedDynamicState3ColorWriteMask = VK_TRUE;
+    if (ctx.hw_dynamic_depth) {
+        dyn_enable.pNext = interlock.pNext;
+        interlock.pNext = &dyn_enable;
+        if (ctx.hw_dynamic_blend) {
+            dyn3_enable.pNext = &dyn_enable;
+            interlock.pNext = &dyn3_enable;
+        }
+    }
+#endif
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features.pNext = &v12;
     features.features.fragmentStoresAndAtomics = VK_TRUE;
     features.features.shaderClipDistance = VK_TRUE;
+#if !defined(__ANDROID__)
     features.features.geometryShader = VK_TRUE;
+#endif
     features.features.depthClamp = ctx.depth_clamp;
     features.features.samplerAnisotropy = ctx.anisotropy;
     features.features.textureCompressionBC = ctx.bc;
-    std::vector<const char *> device_extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-                                                VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME};
+    std::vector<const char *> device_extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
+#if defined(__ANDROID__)
+    if (s.pixel_path == PixelPath::OrderedAttachment)
+        device_extensions.push_back(VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME);
+    if (ctx.hw_dynamic_depth && has_extension(chosen_extensions, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME))
+        device_extensions.push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
+    if (ctx.hw_dynamic_blend)
+        device_extensions.push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
+    else {
+        if (has_extension(chosen_extensions, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME))
+            device_extensions.push_back(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+        if (has_extension(chosen_extensions, "VK_KHR_spirv_1_4"))
+            device_extensions.push_back("VK_KHR_spirv_1_4");
+    }
+#else
+    device_extensions.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
+#endif
     if (ctx.line_rasterization)
         device_extensions.push_back(line_extension);
     VkDeviceCreateInfo device{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
@@ -1788,7 +3298,19 @@ void create_device(State &s) {
     if (!name)                                                                                                     \
         throw std::runtime_error("Vulkan device lacks " #name);
     MOTORSTORM_VK_DEVICE(MOTORSTORM_VK_LOAD_DEVICE)
+    MOTORSTORM_VK_MOBILE_DEVICE(MOTORSTORM_VK_LOAD_DEVICE)
 #undef MOTORSTORM_VK_LOAD_DEVICE
+#define MOTORSTORM_VK_LOAD_OPTIONAL_DEVICE(name)                                                                   \
+    name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(ctx.device, #name));
+    MOTORSTORM_VK_DEVICE_OPTIONAL(MOTORSTORM_VK_LOAD_OPTIONAL_DEVICE)
+#undef MOTORSTORM_VK_LOAD_OPTIONAL_DEVICE
+    if (!vkGetSemaphoreCounterValue)
+        vkGetSemaphoreCounterValue = reinterpret_cast<PFN_vkGetSemaphoreCounterValue>(
+            vkGetDeviceProcAddr(ctx.device, "vkGetSemaphoreCounterValueKHR"));
+    if (!vkWaitSemaphores)
+        vkWaitSemaphores = reinterpret_cast<PFN_vkWaitSemaphores>(vkGetDeviceProcAddr(ctx.device, "vkWaitSemaphoresKHR"));
+    if (!vkGetSemaphoreCounterValue || !vkWaitSemaphores)
+        throw std::runtime_error("Vulkan device lacks timeline semaphore waits");
     vkGetDeviceQueue(ctx.device, ctx.queue_family, 0, &s.queue);
     vkGetDeviceQueue(ctx.device, ctx.queue_family, queue_count - 1u, &s.present_queue);
     s.shared_queue = queue_count < 2u;
@@ -1796,7 +3318,8 @@ void create_device(State &s) {
     functions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
     VmaAllocatorCreateInfo allocator{};
-    allocator.vulkanApiVersion = VK_API_VERSION_1_3;
+    allocator.vulkanApiVersion = ctx.properties.apiVersion >= VK_API_VERSION_1_3 ? VK_API_VERSION_1_3
+                                                                                  : VK_API_VERSION_1_1;
     allocator.physicalDevice = ctx.physical;
     allocator.device = ctx.device;
     allocator.instance = ctx.instance;
@@ -1913,12 +3436,75 @@ bool initialize() {
         s.raster_half = s.antialiasing == 2 ? s.output_scale * 4
                       : s.antialiasing == 3 ? s.output_scale * 3
                                             : s.output_scale * 2;
+#if defined(__ANDROID__)
+        // "auto": full resolution is the output multiple that fills the
+        // display (5x on a 2560x1600 tablet). Menus always render at it;
+        // dynamic resolution may only lower it during gameplay.
+        if (const char *value = std::getenv("MOTORSTORM_ANDROID_RESOLUTION");
+            value && std::strcmp(value, "auto") == 0 && s.antialiasing != 2 && s.antialiasing != 3) {
+            std::uint32_t cap = 8u;
+            if (const char *limit = std::getenv("MOTORSTORM_ANDROID_RESOLUTION_CAP"))
+                cap = static_cast<std::uint32_t>(std::clamp(std::atoi(limit), 1, 8));
+            int display_width = 0, display_height = 0;
+            if (const SDL_DisplayMode *mode = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay())) {
+                display_width = mode->w;
+                display_height = mode->h;
+            }
+            UINT present_width = static_cast<UINT>(std::max(display_width, 0));
+            UINT present_height = static_cast<UINT>(std::max(display_height, 0));
+            limit_to_present(present_width, present_height);
+            display_width = static_cast<int>(present_width);
+            display_height = static_cast<int>(present_height);
+            s.output_scale = motorstorm::display_output_scale(static_cast<std::uint32_t>(std::max(display_width, 0)),
+                                                              static_cast<std::uint32_t>(std::max(display_height, 0)), cap);
+            s.raster_half = s.output_scale * 2;
+            log_line("GE", "Android full resolution: display " + std::to_string(display_width) + "x" +
+                               std::to_string(display_height) + " -> " + std::to_string(s.output_scale) + "x (" +
+                               std::to_string(480 * s.output_scale) + "x" + std::to_string(272 * s.output_scale) + ")");
+        }
+        s.base_raster_half = s.raster_half;
+        s.scale_settings.target_fps = 30;
+        if (const char *fps = std::getenv("PSPRECOMP_MOTORSTORM_FPS"))
+            s.scale_settings.target_fps = std::strcmp(fps, "60") == 0 ? 60 : 30;
+        if (const char *mode = std::getenv("PSPRECOMP_MOTORSTORM_SCALE_MODE")) {
+            if (std::strcmp(mode, "fixed") == 0)
+                s.scale_settings.mode = ScaleMode::Fixed;
+            else if (std::strcmp(mode, "dynamic") == 0)
+                s.scale_settings.mode = ScaleMode::Dynamic;
+        }
+        if (const char *value = std::getenv("PSPRECOMP_MOTORSTORM_SCALE"))
+            s.scale_settings.fixed_scale = std::strtof(value, nullptr);
+        if (const char *value = std::getenv("PSPRECOMP_MOTORSTORM_SCALE_MIN"))
+            s.scale_settings.min_scale = std::strtof(value, nullptr);
+        if (const char *value = std::getenv("PSPRECOMP_MOTORSTORM_SCALE_MAX"))
+            s.scale_settings.max_scale = std::strtof(value, nullptr);
+        if (const char *value = std::getenv("PSPRECOMP_MOTORSTORM_SGSR_SHARPNESS"))
+            s.scale_settings.sharpness = std::strtof(value, nullptr);
+        s.scale_settings.min_scale = std::clamp(s.scale_settings.min_scale, 0.2f, 1.0f);
+        s.scale_settings.max_scale = std::clamp(s.scale_settings.max_scale, s.scale_settings.min_scale, 1.0f);
+        s.scale_settings.fixed_scale = std::clamp(s.scale_settings.fixed_scale, 0.2f, 1.0f);
+        // Start at full resolution: the first screens are menus and movies.
+        s.raster_half = s.dynamic_resolution.update(s.base_raster_half, s.base_raster_half, false, -1.0,
+                                                    s.scale_settings, 0);
+        s.render_scale = static_cast<float>(s.raster_half) / static_cast<float>(s.base_raster_half);
+        log_line("GE", std::string("Android render scale: ") +
+                           (s.scale_settings.mode == ScaleMode::Dynamic ? "dynamic (gameplay only)"
+                            : s.scale_settings.mode == ScaleMode::Fixed ? "fixed"
+                                                                        : "off") +
+                           " min=" + std::to_string(s.scale_settings.min_scale) +
+                           " max=" + std::to_string(s.scale_settings.max_scale) +
+                           " upscaler=" + std::string(motorstorm::upscaler_name(select_upscaler(s.scale_settings))));
+#endif
         if (const char *filter = std::getenv("PSPRECOMP_MOTORSTORM_TEXTURE_FILTER"))
             s.enhanced_filtering = std::string_view(filter) == "enhanced";
         stats.resolution_scale = s.output_scale;
         stats.raster_half = s.raster_half;
         stats.antialiasing = s.antialiasing;
         create_device(s);
+#if defined(__ANDROID__)
+        if (!s.driver_fallback.empty())
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "Vulkan driver", s.driver_fallback.c_str(), nullptr);
+#endif
         VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
         type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
         VkSemaphoreCreateInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
@@ -1937,16 +3523,25 @@ bool initialize() {
             check(vkAllocateCommandBuffers(s.device, &allocate_info, buffers), "allocate command buffers");
             slot.cmd = buffers[0];
             slot.pre = buffers[1];
+            VkQueryPoolCreateInfo queries{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            queries.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            queries.queryCount = 4;
+            check(vkCreateQueryPool(s.device, &queries, nullptr, &slot.queries), "create chunk timestamps");
         }
         s.upload = make_buffer(kUploadBytes, Memory::Upload);
         s.mapped = s.upload.mapped;
         for (auto &scratch : s.decode_scratch)
             scratch = make_buffer(kDecodeScratchBytes, Memory::Device);
+        open_pipeline_cache(s);
         create_pipelines(s);
+#if defined(__ANDROID__)
+        if (s.pixel_path == PixelPath::OrderedAttachment && hardware_draws_enabled(s))
+            prewarm_hw_pipelines(s);
+#endif
         setup_post(s);
         state = std::move(native);
         stats.active = true;
-        std::cerr << "[Vulkan] hardware GE adapter=" << stats.adapter << " interlock=1 GPU_transform=1"
+        std::cerr << "[Vulkan] hardware GE adapter=" << stats.adapter << " GPU_transform=1"
                   << " output=" << state->output_scale * 480 << 'x' << state->output_scale * 272
                   << " raster=" << raster_extent(480, state->raster_half) << 'x'
                   << raster_extent(272, state->raster_half) << " AA=" << state->antialiasing
@@ -1959,8 +3554,12 @@ bool initialize() {
         std::cerr << "[Vulkan] initialization: " << error.what() << '\n';
         log_line("GE", std::string("Vulkan initialization failed: ") + error.what());
         const char *backend = std::getenv("PSPRECOMP_MOTORSTORM_RENDERER");
-        if (backend && std::strcmp(backend, "vulkan") == 0)
+        if (backend && std::strcmp(backend, "vulkan") == 0) {
+#if defined(__ANDROID__)
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "MotorStorm Vulkan unavailable", error.what(), nullptr);
+#endif
             throw;
+        }
     }
     return false;
 }
@@ -1968,6 +3567,9 @@ void shutdown(bool reset_report) noexcept {
     if (state) {
         try {
             wait(*state);
+#if defined(__ANDROID__)
+            save_hw_keys(*state);
+#endif
         } catch (...) {
         }
         state.reset();
@@ -1982,13 +3584,12 @@ namespace {
 // Uploads a VertexCS job and records its dispatch in the chunk's vertex
 // pre-pass; returns the offset of the decoded vertices in vertex_arena.
 UINT64 process_vertices(State &s, psprecomp::GuestMemory &memory, const GpuVertexJob &job, UINT output_bytes) {
-    constexpr UINT64 kVertexArenaBytes = 128ull * 1024 * 1024;
     if (!s.vertex_arena)
         s.vertex_arena = make_buffer(kVertexArenaBytes, Memory::Device);
-    if (s.vertex_used + output_bytes > kVertexArenaBytes) {
+    if (s.vertex_used + output_bytes > s.vertex_base + kVertexArenaBytes / 2u) {
         flush_chunk(s);
-        wait(s);
-        s.vertex_used = 0;
+        wait(s, kWaitVertex);
+        s.vertex_used = s.vertex_base;
     }
     const UINT64 output = s.vertex_used;
     s.vertex_used = (s.vertex_used + output_bytes + 255u) & ~UINT64{255u};
@@ -2009,6 +3610,10 @@ UINT64 process_vertices(State &s, psprecomp::GuestMemory &memory, const GpuVerte
         check(vkBeginCommandBuffer(chunk.pre, &begin_info), "begin vertex commands");
         vkCmdBindPipeline(chunk.pre, VK_PIPELINE_BIND_POINT_COMPUTE, s.vertex_pipeline);
         s.pre_open = true;
+        if (chunk.queries) {
+            vkCmdWriteTimestamp(chunk.pre, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, chunk.queries, 2);
+            chunk.pre_timed = true;
+        }
     }
     push_compute(s, chunk.pre, {}, upload_view(s, offset), {s.vertex_arena.buffer, output});
     vkCmdDispatch(chunk.pre, (job.decode_count + 63u) / 64u, 1, 1);
@@ -2030,12 +3635,14 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
     bool valid_depth =
         draw.depthbuffer && draw.depth_stride > 0 && draw.depth_stride <= 1024 &&
         memory.contains(draw.depthbuffer, static_cast<std::size_t>(draw.depth_stride) * height * 2);
-    if (!s.recording && s.readback_fence != 0u) {
+    if (!lazy_publish_enabled() && !s.recording && s.readback_fence != 0u) {
         PublishReason reason(0);
         publish_readbacks(s, memory);
     }
-    if (s.recording && s.used > kUploadBytes - 20 * 1024 * 1024)
+    if (s.recording && s.used - s.arena_base > kUploadBytes / 2u - 8 * 1024 * 1024)
         sync(memory);
+    if (!s.recording)
+        ++s.list_serial;
     begin(s);
     if (valid_depth)
         get_surface(s, memory, draw.depthbuffer, draw.depth_stride, height, 2);
@@ -2067,6 +3674,27 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
     }
     const bool widen = aspect > 1.0f && !full_screen;
     Surface *depth = &color;
+#if defined(__ANDROID__)
+    if (!valid_depth) {
+        auto &dummy = s.attachment_dummy_depth;
+        if (!dummy.image || dummy.stride != color.stride || dummy.height != color.height || dummy.raster_half != color.raster_half) {
+            if (dummy.image) { sync(memory); begin(s); }
+            dummy.stride = color.stride; dummy.height = color.height; dummy.raster_half = color.raster_half;
+            dummy.image = make_buffer(dummy.bytes(), Memory::Device);
+            dummy.attachment.reset();
+            dummy.hw_depth.reset();
+            dummy.hw_depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+            dummy.hw_matches = false;
+            dummy.hw_dirty = false;
+            // Initialize the dummy depth from known zero bytes, never uninitialized GPU memory.
+            const auto bytes = allocate(s, dummy.bytes(), 4);
+            std::memset(s.mapped + bytes, 0, static_cast<std::size_t>(dummy.bytes()));
+            copy_buffer(s, dummy.image.buffer, 0, s.upload.buffer, bytes, dummy.bytes());
+            buffer_written(dummy);
+        }
+        depth = &dummy;
+    }
+#endif
     if (valid_depth) {
         depth = nullptr;
         for (const auto &candidate : s.surfaces)
@@ -2081,7 +3709,11 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
         color.depth_address = depth->address;
         color.depth_stride = depth->stride;
     }
+#if defined(__ANDROID__)
+    DrawPixelRoute pixel_route;
+#endif
     VkBuffer feedback = VK_NULL_HANDLE;
+    VkImageView feedback_view = VK_NULL_HANDLE;
     VkImageView texture_view = VK_NULL_HANDLE, replacement_view = VK_NULL_HANDLE;
     UINT64 cb_offset = 0, vertex_offset = 0, index_offset = 0;
     {
@@ -2145,7 +3777,29 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
         constants.wide = {1.0f / aspect, 240.0f, widen ? 1.0f : 0.0f,
                           widen && guest_widescreen.load(std::memory_order_relaxed) ? 1.0f : 0.0f};
         if (texture && texture->feedback_address) {
-            feedback = feedback_snapshot(s, memory, *texture, constants.feedback);
+            Surface::Rect sampled{};
+            bool have_sampled = !job && !vertices.empty() && !draw.hardware_transform;
+            if (have_sampled) {
+                float u0 = 1e30f, v0 = 1e30f, u1 = -1e30f, v1 = -1e30f;
+                for (const auto &vertex : vertices) {
+                    const float u = vertex.u, v = vertex.v;
+                    u0 = std::min(u0, u); u1 = std::max(u1, u);
+                    v0 = std::min(v0, v); v1 = std::max(v1, v);
+                }
+                // Texels the edges can touch: nearest samples pixel centres
+                // inside [u0, u1); bilinear also reaches half a texel out.
+                const bool linear = ((draw.commands[0xC6] >> 8) & 1u) != 0 || (draw.commands[0xC6] & 1u) != 0;
+                const float pad = linear ? 0.5f : 0.0f;
+                sampled = {static_cast<int>(std::floor(u0 - pad)), static_cast<int>(std::floor(v0 - pad)),
+                           static_cast<int>(std::ceil(u1 + pad)), static_cast<int>(std::ceil(v1 + pad))};
+                // UVs outside the texture wrap or clamp to other texels.
+                have_sampled = u0 >= 0.0f && v0 >= 0.0f && u1 <= static_cast<float>(texture->width) &&
+                               v1 <= static_cast<float>(texture->height) && std::isfinite(u0) && std::isfinite(v1);
+                sampled.left = std::max(sampled.left, 0);
+                sampled.top = std::max(sampled.top, 0);
+            }
+            feedback = feedback_snapshot(s, memory, *texture, constants.feedback, have_sampled ? &sampled : nullptr,
+                                         &feedback_view, &color);
             ++stats.feedback_draws;
         }
         const State::Replacement *replacement = nullptr;
@@ -2177,25 +3831,191 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
             if (std::isfinite(lo_u) && std::isfinite(hi_u) && std::isfinite(lo_v) && std::isfinite(hi_v))
                 constants.uv_range = {lo_u, lo_v, hi_u, hi_v};
         }
+#if defined(__ANDROID__)
+        if (hardware_draws_enabled(s)) {
+            GeDrawFacts facts;
+            facts.format = draw.format;
+            facts.valid_depth = valid_depth;
+            // A copied feedback target is sampled by shade() through its
+            // packed buffer, or through the exact integer-load path for the
+            // compact R8 snapshot. A live/unavailable source stays ordered.
+            facts.feedback = texture && texture->feedback_address != 0u && !feedback;
+            facts.feedback_snapshot = texture && texture->feedback_address != 0u && feedback;
+            facts.soft_particles = soft_range != 0u;
+            facts.hud_tag = tag_hud;
+            facts.extended_color = extended_color;
+            facts.enhanced_filtering = s.enhanced_filtering;
+            facts.texture_replacement = replacement != nullptr;
+            facts.simple_texture_filter = !texture ||
+                (mip_count_for(s, *texture) == 1u && (draw.commands[0xC6] & 0x0Fu) == 1u &&
+                 ((draw.commands[0xC6] >> 8) & 0x0Fu) == 1u);
+            facts.primitive = draw.primitive;
+            facts.raster_half = s.raster_half;
+            static const bool wide_blends = [] {
+                const char *text = std::getenv("PSPRECOMP_MOTORSTORM_HW_BLENDS");
+                return !(text && std::strcmp(text, "0") == 0);
+            }();
+            facts.wide_blends = wide_blends;
+            pixel_route = classify_ge_draw(draw.commands.data(), facts);
+            if (pixel_route.hardware && (color.raster_stride() != depth->raster_stride() ||
+                                         color.raster_height() != depth->raster_height()))
+                pixel_route.hardware = false;
+            if (pixel_route.hardware && pixel_route.exact_pixel)
+                constants.render[3] |= 32u;
+        }
+#endif
         cb_offset = allocate(s, sizeof(constants), 256);
         std::memcpy(s.mapped + cb_offset, &constants, sizeof(constants));
         static const GpuTexture white{0, 1, 1, {{0xFFFFFFFFu}}};
-        texture_view = get_texture(s, texture && !feedback ? *texture : white).image.view;
+        texture_view = feedback_view ? feedback_view
+                                     : get_texture(s, texture && !feedback ? *texture : white).image.view;
         if (!replacement)
             replacement_view = texture_view;
     }
     {
         perf::Scope record_profile(perf::kGpuRecord);
-        const VkPipeline pipeline = draw.primitive == 0   ? s.point_pipeline
-                                    : draw.primitive == 1 ? s.line_pipeline
-                                    : job && job->strip   ? s.strip_pipeline
-                                                          : s.list_pipeline;
-        if (!s.rendering) {
+#if defined(__ANDROID__)
+        const bool hardware = pixel_route.hardware;
+        if (s.pixel_path == PixelPath::OrderedAttachment) {
+            if (hardware) {
+                ++stats.hardware_pixel_draws;
+                if (pixel_route.state.alpha_discard)
+                    ++stats.hardware_alpha_draws;
+            } else {
+                ++stats.ordered_pixel_draws;
+                if (texture && texture->feedback_address)
+                    ++stats.reject_feedback;
+                else if ((draw.commands[0x24] & 1u) && (draw.commands[0xD3] & 1u) == 0u)
+                    ++stats.reject_stencil;
+                else if ((draw.commands[0x27] & 1u) && (draw.commands[0xD3] & 1u) == 0u)
+                    ++stats.reject_color;
+                else if ((draw.commands[0x21] & 1u) && (draw.commands[0xD3] & 1u) == 0u) {
+                    ++stats.reject_blend;
+                    // Diagnostics: which blend modes stay ordered (format, then
+                    // the 0xDF factors/equation; FIX colors are not part of it).
+                    ++rejected_blends[(draw.format << 12) | (draw.commands[0xDF] & 0x7FFu)];
+                }
+                else if ((draw.commands[0xE8] & 0xFFFFFFu) != 0u || (draw.commands[0xE9] & 0xFFu) != 0u)
+                    ++stats.reject_mask;
+                else
+                    ++stats.reject_other;
+            }
+            if (s.rendering && s.rendering_hardware != hardware)
+                ++stats.pixel_path_switches;
+        }
+#else
+        const bool hardware = false;
+#endif
+        VkPipeline pipeline = draw.primitive == 0   ? s.point_pipeline
+                              : draw.primitive == 1 ? s.line_pipeline
+                              : job && job->strip   ? s.strip_pipeline
+                                                    : s.list_pipeline;
+#if defined(__ANDROID__)
+        if (hardware) {
+            State::HwPipeKey key{};
+            key.topology = draw.primitive == 0 ? 0 : draw.primitive == 1 ? 1 : job && job->strip ? 2 : 3;
+            key.depth_test = pixel_route.state.depth_test ? 1 : 0;
+            key.depth_write = pixel_route.state.depth_write ? 1 : 0;
+            key.depth_compare = pixel_route.state.depth_compare;
+            key.blend = pixel_route.state.blend ? 1 : 0;
+            key.blend_op = pixel_route.state.blend_op;
+            key.src = pixel_route.state.src_factor;
+            key.dst = pixel_route.state.dst_factor;
+            key.mask = pixel_route.state.color_write_mask;
+            key.cull = pixel_route.state.cull_mode;
+            key.alpha = pixel_route.state.alpha_discard ? 1 : 0;
+            key.feedback = feedback ? 1 : 0;
+            if (!s.rendering_hardware || s.hw_pass_color != &color || s.hw_pass_depth != depth)
+                begin_hardware_pass(s, color, *depth);
+            pipeline = hw_pipeline_for(s, key);
+        }
+#endif
+        if (!hardware && (!s.rendering
+#if defined(__ANDROID__)
+            || s.rendering_hardware ||
+            (s.pixel_path == PixelPath::OrderedAttachment &&
+                (s.attachment_color != &color || s.attachment_depth != depth))
+#endif
+        )) {
             outside(s);
+#if defined(__ANDROID__)
+            if (s.pixel_path == PixelPath::FixedFunctionProgrammable) {
+                bool filled = false;
+                for (Surface *target : {&color, depth}) {
+                    if (!target->locks || target->locks_ready)
+                        continue;
+                    vkCmdFillBuffer(s.cmd, target->locks.buffer, 0, VK_WHOLE_SIZE, 0);
+                    target->locks_ready = true;
+                    filled = true;
+                }
+                if (filled) {
+                    VkMemoryBarrier lock_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                    lock_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                    lock_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                    vkCmdPipelineBarrier(s.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                                         1, &lock_barrier, 0, nullptr, 0, nullptr);
+                }
+                VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+                pass.renderPass = s.programmable_pass;
+                pass.framebuffer = s.programmable_framebuffer;
+                pass.renderArea = {{0, 0}, {s.programmable_width, s.programmable_height}};
+                vkCmdBeginRenderPass(s.cmd, &pass, VK_SUBPASS_CONTENTS_INLINE);
+            } else {
+            pack_hardware(s, color);
+            if (depth != &color)
+                pack_hardware(s, *depth);
+            bool loaded_attachment = false;
+            for (auto target : {&color, depth}) {
+                if (!target->attachment) {
+                    target->attachment = make_image(target->raster_stride(), target->raster_height(), 1,
+                        VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                    image_layout(s, target->attachment.image, 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+                    target->buffer_newer = true;
+                    target->image_newer = false;
+                }
+                if (!target->buffer_newer && !lazy_attachments_disabled())
+                    continue;
+                VkBufferImageCopy copy{};
+                copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                copy.imageExtent = {target->raster_stride(), target->raster_height(), 1};
+                vkCmdCopyBufferToImage(s.cmd, target->image.buffer, target->attachment.image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+                target->buffer_newer = false;
+                loaded_attachment = true;
+                ++attachment_loads;
+            }
+            if (loaded_attachment)
+                memory_barrier(s.cmd);
+            ++pass_begins;
+            const VkImageView views[]{color.attachment.view, depth->attachment.view};
+            const UINT fb_width = std::min(color.raster_stride(), depth->raster_stride());
+            const UINT fb_height = std::min(color.raster_height(), depth->raster_height());
+            VkFramebuffer framebuffer = VK_NULL_HANDLE;
+            for (const auto &cached : s.ordered_framebuffers)
+                if (cached.color == views[0] && cached.depth == views[1]) {
+                    framebuffer = cached.framebuffer;
+                    break;
+                }
+            if (!framebuffer) {
+                VkFramebufferCreateInfo fb{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+                fb.renderPass = s.attachment_pass; fb.attachmentCount = 2; fb.pAttachments = views;
+                fb.width = fb_width; fb.height = fb_height; fb.layers = 1;
+                check(vkCreateFramebuffer(s.device, &fb, nullptr, &framebuffer), "create ordered framebuffer");
+                s.ordered_framebuffers.push_back({views[0], views[1], framebuffer});
+                s.attachment_framebuffers.push_back(framebuffer);
+            }
+            VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+            pass.renderPass = s.attachment_pass; pass.framebuffer = framebuffer;
+            pass.renderArea = {{0, 0}, {fb_width, fb_height}};
+            vkCmdBeginRenderPass(s.cmd, &pass, VK_SUBPASS_CONTENTS_INLINE);
+            s.attachment_color = &color; s.attachment_depth = depth;
+            }
+#else
             VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
             rendering.renderArea = {{0, 0}, s.render_area};
             rendering.layerCount = 1;
             vkCmdBeginRendering(s.cmd, &rendering);
+#endif
             s.rendering = true;
         }
         if (s.bound_graphics != pipeline) {
@@ -2216,6 +4036,27 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
                                             buffer_write(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &buffers[3]),
                                             image_write(7, &images[1])};
         vkCmdPushDescriptorSetKHR(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.layout, 0, 6, writes);
+#if defined(__ANDROID__)
+        if (!hardware) {
+        if (s.pixel_path == PixelPath::OrderedAttachment) {
+            const VkDescriptorImageInfo attachment_images[]{{VK_NULL_HANDLE, color.attachment.view, VK_IMAGE_LAYOUT_GENERAL},
+                {VK_NULL_HANDLE, depth->attachment.view, VK_IMAGE_LAYOUT_GENERAL}};
+            VkWriteDescriptorSet attachment_writes[2]{};
+            for (UINT index = 0; index < 2; ++index) {
+                attachment_writes[index] = image_write(9 + index, &attachment_images[index]);
+                attachment_writes[index].descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+            }
+            vkCmdPushDescriptorSetKHR(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.layout, 0, 2, attachment_writes);
+        }
+        if (s.pixel_path == PixelPath::FixedFunctionProgrammable) {
+            if (!color.locks)
+                color.locks = make_buffer(std::max<UINT64>(color.bytes(), 4), Memory::Device);
+            const VkDescriptorBufferInfo lock_info{color.locks.buffer, 0, VK_WHOLE_SIZE};
+            const VkWriteDescriptorSet lock_write = buffer_write(11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &lock_info);
+            vkCmdPushDescriptorSetKHR(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.layout, 0, 1, &lock_write);
+        }
+        }
+#endif
         const VkViewport viewport{0, 0, static_cast<float>(raster_extent(draw.stride, s.raster_half)),
                                   static_cast<float>(raster_extent(height, s.raster_half)), 0, 1};
         vkCmdSetViewport(s.cmd, 0, 1, &viewport);
@@ -2238,13 +4079,45 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
         const VkRect2D scissor{{left, top},
                                {static_cast<UINT>(std::max(right - left, 0)), static_cast<UINT>(std::max(bottom - top, 0))}};
         vkCmdSetScissor(s.cmd, 0, 1, &scissor);
+#if defined(__ANDROID__)
+        if (hardware) {
+            const float blend_constants[4]{pixel_route.state.constant_r / 255.0f, pixel_route.state.constant_g / 255.0f,
+                                           pixel_route.state.constant_b / 255.0f, 1.0f};
+            vkCmdSetBlendConstants(s.cmd, blend_constants);
+            if (s.ctx.hw_dynamic_depth && s.ctx.hw_dynamic_blend && vkCmdSetDepthTestEnable &&
+                vkCmdSetColorBlendEnableEXT) {
+                vkCmdSetDepthTestEnable(s.cmd, pixel_route.state.depth_test ? VK_TRUE : VK_FALSE);
+                vkCmdSetDepthWriteEnable(s.cmd, pixel_route.state.depth_write ? VK_TRUE : VK_FALSE);
+                vkCmdSetDepthCompareOp(s.cmd, static_cast<VkCompareOp>(pixel_route.state.depth_compare));
+                vkCmdSetCullMode(s.cmd, static_cast<VkCullModeFlags>(pixel_route.state.cull_mode));
+                const VkBool32 blend_enable = pixel_route.state.blend ? VK_TRUE : VK_FALSE;
+                vkCmdSetColorBlendEnableEXT(s.cmd, 0, 1, &blend_enable);
+                const VkColorBlendEquationEXT equation{static_cast<VkBlendFactor>(pixel_route.state.src_factor),
+                                                       static_cast<VkBlendFactor>(pixel_route.state.dst_factor),
+                                                       static_cast<VkBlendOp>(pixel_route.state.blend_op),
+                                                       VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD};
+                vkCmdSetColorBlendEquationEXT(s.cmd, 0, 1, &equation);
+                const VkColorComponentFlags mask = pixel_route.state.color_write_mask;
+                vkCmdSetColorWriteMaskEXT(s.cmd, 0, 1, &mask);
+            }
+        }
+#endif
         const VkBuffer vertex_buffer = job ? s.vertex_arena.buffer : s.upload.buffer;
         vkCmdBindVertexBuffers(s.cmd, 0, 1, &vertex_buffer, &vertex_offset);
-        if (job && !job->indices.empty()) {
+        static const bool skip_draws = diag_flag("PSPRECOMP_MOTORSTORM_DIAG_SKIP_DRAWS");
+        ++draw_calls;
+        if (skip_draws) {
+        } else if (job && !job->indices.empty()) {
             vkCmdBindIndexBuffer(s.cmd, s.upload.buffer, index_offset, VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(s.cmd, vertex_count, 1, 0, 0, 0);
         } else {
-            vkCmdDraw(s.cmd, vertex_count, 1, 0, 0);
+            vkCmdDraw(s.cmd,
+#if defined(__ANDROID__)
+                draw.primitive == 0 ? 6 : vertex_count, draw.primitive == 0 ? vertex_count : 1,
+#else
+                vertex_count, 1,
+#endif
+                0, 0);
         }
         wrote(s);
         if (draw_barriers())
@@ -2252,11 +4125,32 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
     }
     color.dirty = true;
     ++color.version;
+    // Pixels this draw may have written: its scissor (full width when the
+    // widescreen HUD remap moved it horizontally).
+    Surface::Rect written{widen ? 0 : std::max(draw.left, 0), std::max(draw.top, 0),
+                          widen ? static_cast<int>(draw.stride) : draw.right,
+                          std::min(draw.bottom, static_cast<int>(height))};
+    // 2D (through-mode) draws: their vertices bound the pixels they cover.
+    if (!job && !vertices.empty() && !draw.hardware_transform && !widen) {
+        float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+        for (const auto &vertex : vertices) {
+            x0 = std::min(x0, vertex.x); x1 = std::max(x1, vertex.x);
+            y0 = std::min(y0, vertex.y); y1 = std::max(y1, vertex.y);
+        }
+        if (std::isfinite(x0) && std::isfinite(y1)) {
+            written.left = std::max(written.left, static_cast<int>(std::floor(x0)) - 1);
+            written.top = std::max(written.top, static_cast<int>(std::floor(y0)) - 1);
+            written.right = std::min(written.right, static_cast<int>(std::ceil(x1)) + 1);
+            written.bottom = std::min(written.bottom, static_cast<int>(std::ceil(y1)) + 1);
+        }
+    }
+    color.touch_rect(written);
     const bool depth_write = (draw.commands[0xD3] & 1) ? (draw.commands[0xD3] & 0x400) != 0
                                                         : (draw.commands[0x23] & 1) && draw.commands[0xE7] == 0;
     if (valid_depth && depth_write) {
         depth->dirty = true;
         ++depth->version;
+        depth->touch_rect(written);
     }
     ++stats.draws;
     stats.vertices += vertex_count;
@@ -2280,6 +4174,8 @@ void finish_list(State &s) {
                 outside(s);
                 copied = true;
             }
+            if (surface->raster_half == 2)
+                sync_buffer(s, *surface);
             copy_buffer(s, surface->readback.buffer, 0,
                         surface->raster_half == 2 ? surface->image.buffer : surface->native.buffer, 0,
                         surface->native_bytes());
@@ -2313,7 +4209,7 @@ void publish_readbacks(State &s, psprecomp::GuestMemory &memory) {
         ++stats.publishes[publish_reason];
         if (completed_value(s) < s.readback_fence) {
             const auto begin_ns = perf::now_ns();
-            wait_value(s, s.readback_fence);
+            wait_value(s, s.readback_fence, kWaitPublish);
             ++stats.publish_waits[publish_reason];
             stats.publish_wait_ns[publish_reason] += perf::now_ns() - begin_ns;
         }
@@ -2380,6 +4276,14 @@ void publish_readbacks(State &s, psprecomp::GuestMemory &memory) {
     if (completed_value(s) >= s.fence_value) {
         s.transient.clear();
         s.transient_images.clear();
+#if defined(__ANDROID__)
+        for (auto framebuffer : s.attachment_framebuffers) vkDestroyFramebuffer(s.device, framebuffer, nullptr);
+        s.attachment_framebuffers.clear();
+        s.ordered_framebuffers.clear();
+        for (const auto &framebuffer : s.hw_framebuffers)
+            vkDestroyFramebuffer(s.device, framebuffer.framebuffer, nullptr);
+        s.hw_framebuffers.clear();
+#endif
     }
     if (s.replacement_bytes > textures::budget_bytes()) {
         std::vector<std::pair<UINT64, std::uint64_t>> oldest;
@@ -2614,6 +4518,7 @@ GpuImage capture(psprecomp::GuestMemory &memory, std::uint32_t framebuffer, std:
     constants.surface = {width, height, raster_extent(stride, s.raster_half), 0};
     constants.mode[0] = format;
     constants.render = {s.raster_half, s.output_scale, s.antialiasing, 0};
+    sync_buffer(s, *color);
     compute(s, s.capture_pipeline, constants, {color->image.buffer, 0}, {output.buffer, 0}, result.width,
             result.height);
     outside(s);
@@ -2674,9 +4579,10 @@ Surface *find_depth_surface(State &s, const Surface &color) {
     return nullptr;
 }
 void record_depth_resolve(State &s, Surface &depth, VkBuffer target, UINT width, UINT height) {
+    sync_buffer(s, depth);
     Constants constants{};
-    constants.surface = {width, height, 0, raster_extent(depth.stride, s.raster_half)};
-    constants.render = {s.raster_half, s.output_scale, s.antialiasing, 0};
+    constants.surface = {width, height, 0, raster_extent(depth.stride, depth.raster_half)};
+    constants.render = {depth.raster_half, s.output_scale, s.antialiasing, 0};
     compute(s, s.depth_resolve_pipeline, constants, {depth.image.buffer, 0}, {target, 0}, width * s.output_scale,
             height * s.output_scale);
 }
@@ -2749,6 +4655,15 @@ bool create_swapchain(State &s) {
         return false;
     if (caps.currentExtent.width != 0xFFFFFFFFu)
         extent = caps.currentExtent;
+#if defined(__ANDROID__)
+    // Phone and tablet panels are 1440-1600 pixels on the short side. The
+    // present pass (SGSR upscale and post effects) costs per output pixel and
+    // shares the GE queue, so render it at most this tall and let the display
+    // compositor scale the buffer to the panel (Android scales a swapchain
+    // whose extent differs from the window). PSPRECOMP_MOTORSTORM_PRESENT_HEIGHT
+    // sets the short side; 0 keeps the native panel size.
+    limit_to_present(extent.width, extent.height);
+#endif
     extent.width = std::clamp(extent.width, caps.minImageExtent.width, caps.maxImageExtent.width);
     extent.height = std::clamp(extent.height, caps.minImageExtent.height, caps.maxImageExtent.height);
     if (!extent.width || !extent.height)
@@ -2776,8 +4691,26 @@ bool create_swapchain(State &s) {
         s.present_mode = supports(VK_PRESENT_MODE_IMMEDIATE_KHR) ? VK_PRESENT_MODE_IMMEDIATE_KHR
                          : supports(VK_PRESENT_MODE_MAILBOX_KHR) ? VK_PRESENT_MODE_MAILBOX_KHR
                                                                  : VK_PRESENT_MODE_FIFO_KHR;
+#if defined(__ANDROID__)
+    // Android shares one queue between GE work and presentation on Adreno
+    // drivers that expose a single queue. A FIFO present batch waits for the
+    // display to release an image, and every GE chunk queued behind it waits
+    // too, which stalled the guest about one vsync per frame. MAILBOX always
+    // has a free image; the guest pacer already paces frames to 30/60 fps.
+    // MOTORSTORM_ANDROID_PRESENT_MODE=fifo restores FIFO for A/B checks.
+    {
+        const char *requested = std::getenv("MOTORSTORM_ANDROID_PRESENT_MODE");
+        const bool want_fifo = requested && std::strcmp(requested, "fifo") == 0;
+        if (s.vsync && !want_fifo && supports(VK_PRESENT_MODE_MAILBOX_KHR))
+            s.present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
+    }
+#endif
     s.immediate = s.present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR;
     UINT images = std::max(3u, caps.minImageCount);
+#if defined(__ANDROID__)
+    if (s.present_mode == VK_PRESENT_MODE_MAILBOX_KHR)
+        images = std::max(images, caps.minImageCount + 1u);
+#endif
     if (caps.maxImageCount)
         images = std::min(images, caps.maxImageCount);
     VkSwapchainCreateInfoKHR info{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
@@ -2790,6 +4723,21 @@ bool create_swapchain(State &s) {
     info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.preTransform = caps.currentTransform;
+#if defined(__ANDROID__)
+    const char *pre_rotate = std::getenv("MOTORSTORM_ANDROID_PRE_ROTATE");
+    if (pre_rotate && std::strcmp(pre_rotate, "0") == 0 && (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR))
+        info.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    s.presentation_transform = info.preTransform;
+    // Android capabilities report the oriented extent. Pre-rotated buffers
+    // use the display's identity extent; the shader rotates the fitted image.
+    if (info.preTransform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
+        info.preTransform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) {
+        std::swap(extent.width, extent.height);
+        info.imageExtent = extent;
+    }
+    log_line("GE", "Android swapchain " + std::to_string(extent.width) + "x" + std::to_string(extent.height) +
+        " pre_transform=" + std::to_string(info.preTransform));
+#endif
     info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     info.presentMode = s.present_mode;
     info.clipped = VK_TRUE;
@@ -2817,6 +4765,46 @@ bool create_swapchain(State &s) {
         check(vkCreateSemaphore(s.device, &binary, nullptr, &done), "create present semaphore");
         s.render_done.push_back(done);
     }
+#if defined(__ANDROID__)
+    if (!s.dynamic_rendering && s.pipelines_format != s.swap_format) {
+        if (s.swapchain_pass)
+            vkDestroyRenderPass(s.device, s.swapchain_pass, nullptr);
+        VkAttachmentDescription attachment{};
+        attachment.format = s.swap_format;
+        attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        attachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        attachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        const VkAttachmentReference reference{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments = &reference;
+        VkRenderPassCreateInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        pass.attachmentCount = 1;
+        pass.pAttachments = &attachment;
+        pass.subpassCount = 1;
+        pass.pSubpasses = &subpass;
+        check(vkCreateRenderPass(s.device, &pass, nullptr, &s.swapchain_pass), "create swapchain pass");
+    }
+    if (!s.dynamic_rendering) {
+        for (auto view : s.swap_views) {
+            VkFramebufferCreateInfo fb{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+            fb.renderPass = s.swapchain_pass;
+            fb.attachmentCount = 1;
+            fb.pAttachments = &view;
+            fb.width = s.swap_extent.width;
+            fb.height = s.swap_extent.height;
+            fb.layers = 1;
+            VkFramebuffer framebuffer{};
+            check(vkCreateFramebuffer(s.device, &fb, nullptr, &framebuffer), "create swapchain framebuffer");
+            s.swap_framebuffers.push_back(framebuffer);
+        }
+    }
+#endif
     create_present_pipelines(s);
     s.present_width = static_cast<UINT>(std::max<LONG>(1, client.right));
     s.present_height = static_cast<UINT>(std::max<LONG>(1, client.bottom));
@@ -2839,10 +4827,26 @@ void create_presentation(State &s, HWND window, UINT frame_width, UINT frame_hei
         s.exclusive_logged = true;
     }
     create_present_frames(s, frame_width, frame_height);
+#if defined(__ANDROID__)
+    VkAndroidSurfaceCreateInfoKHR info{VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR};
+    info.window = static_cast<ANativeWindow *>(SDL_GetPointerProperty(SDL_GetWindowProperties(window),
+        SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
+    if (!info.window) throw std::runtime_error("SDL window has no Android surface");
+    check(vkCreateAndroidSurfaceKHR(s.ctx.instance, &info, nullptr, &s.surface), "create Android surface");
+    s.native_window = info.window;
+    s.surface_lost = false;
+    // API 30. The NDK target is 29, so resolve the symbol instead of calling it directly.
+    using SetFrameRate = int (*)(ANativeWindow *, float, int);
+    // With MAILBOX the newest frame wins at each refresh: a 60 Hz display shows
+    // each 30 fps frame twice instead of dropping/duplicating on a 30 Hz one.
+    if (auto set_rate = reinterpret_cast<SetFrameRate>(dlsym(RTLD_DEFAULT, "ANativeWindow_setFrameRate")))
+        set_rate(info.window, static_cast<float>(present_frame_rate_hz(60)), 0);
+#else
     VkWin32SurfaceCreateInfoKHR info{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
     info.hinstance = GetModuleHandleW(nullptr);
     info.hwnd = window;
     check(vkCreateWin32SurfaceKHR(s.ctx.instance, &info, nullptr, &s.surface), "create window surface");
+#endif
     VkBool32 supported = VK_FALSE;
     vkGetPhysicalDeviceSurfaceSupportKHR(s.ctx.physical, s.ctx.queue_family, s.surface, &supported);
     if (!supported)
@@ -2865,7 +4869,21 @@ void update_present_target(State &s) {
     wait_present_idle(s);
     create_swapchain(s);
 }
+std::atomic<std::uint64_t> present_gpu_ns{}, present_gpu_frames{};
+std::atomic<std::uint64_t> present_scale_gpu_ns{}, present_scale_gpu_frames{};
 void collect_post_timings(State &s, State::PresentFrame &frame) {
+    if (frame.timed_present) {
+        UINT64 stamps[2]{};
+        if (vkGetQueryPoolResults(s.device, frame.queries, 0, 2, sizeof(stamps), stamps, sizeof(UINT64),
+                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && stamps[1] > stamps[0]) {
+            const auto elapsed = static_cast<UINT64>((stamps[1] - stamps[0]) * s.timestamp_period);
+            present_gpu_ns += elapsed;
+            ++present_gpu_frames;
+            present_scale_gpu_ns += elapsed;
+            ++present_scale_gpu_frames;
+        }
+        frame.timed_present = false;
+    }
     if (!frame.timed_post)
         return;
     UINT64 timestamps[4]{};
@@ -2877,6 +4895,8 @@ void collect_post_timings(State &s, State::PresentFrame &frame) {
             stats.post_gpu_ns[i] += ns;
             total += ns;
         }
+        present_scale_gpu_ns += total;
+        ++present_scale_gpu_frames;
         ++stats.post_gpu_frames;
         stats.post_gpu_max_ns = std::max(stats.post_gpu_max_ns, total);
     }
@@ -2919,6 +4939,60 @@ void record_post(State &s, State::PresentFrame &frame, View constants) {
 }
 // Scales the snapshot into the next swapchain image and presents it. Returns
 // the present-timeline value of the submission (0: nothing was submitted).
+#if defined(__ANDROID__)
+// PSPRECOMP_MOTORSTORM_PRESENT_TEXTURE=0 presents straight from the packed GE
+// buffer (every display pixel decodes buffer words; slow on Adreno).
+bool present_texture_enabled() {
+    static const bool value = [] {
+        const char *text = std::getenv("PSPRECOMP_MOTORSTORM_PRESENT_TEXTURE");
+        return !(text && std::strcmp(text, "0") == 0);
+    }();
+    return value;
+}
+// Converts the frame snapshot once to an RGBA8 texture (raster-sized, far
+// fewer pixels than the display) for the present pass to sample.
+void record_present_texture(State &s, State::PresentFrame &frame, View constants) {
+    const UINT width = std::max(1u, raster_extent(frame.width, frame.raster_half));
+    const UINT height = std::max(1u, raster_extent(frame.height, frame.raster_half));
+    if (!frame.rgba.image || frame.rgba_width != width || frame.rgba_height != height) {
+        // The frame's previous present completed before it was reused.
+        frame.rgba.reset();
+        frame.rgba = make_image(width, height, 1, VK_FORMAT_R8G8B8A8_UNORM);
+        frame.rgba_words = make_buffer(static_cast<UINT64>(width) * height * 4, Memory::Device);
+        frame.rgba_width = width;
+        frame.rgba_height = height;
+    }
+    VkCommandBuffer cmd = frame.cmd;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.present_convert_pipeline);
+    push_compute(s, cmd, constants, {frame.image.buffer, 0}, {frame.rgba_words.buffer, 0});
+    vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+    VkMemoryBarrier written{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    written.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    written.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    VkImageMemoryBarrier to_copy{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    to_copy.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    to_copy.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_copy.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_copy.srcQueueFamilyIndex = to_copy.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_copy.image = frame.rgba.image;
+    to_copy.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &written, 0, nullptr, 1, &to_copy);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {width, height, 1};
+    vkCmdCopyBufferToImage(cmd, frame.rgba_words.buffer, frame.rgba.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                           &region);
+    VkImageMemoryBarrier to_sample = to_copy;
+    to_sample.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_sample.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    to_sample.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_sample.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &to_sample);
+}
+#endif
 UINT64 present_snapshot(State &s, State::PresentFrame &frame) {
     if (!s.swapchain)
         return 0;
@@ -2935,6 +5009,14 @@ UINT64 present_snapshot(State &s, State::PresentFrame &frame) {
     }
     if (result == VK_TIMEOUT || result == VK_NOT_READY)
         return 0;
+#if defined(__ANDROID__)
+    // Android destroys the window surface when the app leaves the screen. The
+    // GE thread rebuilds presentation for the new surface on its next frame.
+    if (result == VK_ERROR_SURFACE_LOST_KHR) {
+        s.surface_lost = true;
+        return 0;
+    }
+#endif
     check(result, "acquire swapchain image");
     check(vkResetCommandPool(s.device, frame.pool, 0), "reset present pool");
     VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -2943,18 +5025,38 @@ UINT64 present_snapshot(State &s, State::PresentFrame &frame) {
     VkCommandBuffer cmd = frame.cmd;
     bind_sets(s, cmd);
     Constants constants{};
-    constants.surface = {frame.width, frame.height, raster_extent(frame.stride, s.raster_half), 0};
+    constants.surface = {frame.width, frame.height, raster_extent(frame.stride, frame.raster_half), 0};
     constants.mode[0] = frame.format;
-    constants.render = {s.raster_half, s.output_scale, s.antialiasing, 0};
+#if defined(__ANDROID__)
+    constants.mode[1] = s.presentation_transform;
+    const bool sgsr = select_upscaler(s.scale_settings) == Upscaler::Sgsr1Spatial && s.antialiasing != 1;
+    constants.mode[2] = sgsr ? 1u : 0u;
+    constants.mode[3] = frame.has_depth ? 1u : 0u;
+    constants.uv_range = {std::clamp(s.scale_settings.sharpness, 1.0f, 2.0f), 0, 0, 0};
+#endif
+    constants.render = {frame.raster_half, s.output_scale, s.antialiasing, 0};
     const float fade = s.post.active() ? update_post_fade(s, frame.racing) : 0.0f;
     const bool post = fade > 0.0f;
     if (post)
         set_post_constants(s.post, constants, fade, s.output_scale, ++s.post_frames, frame.has_depth);
+#if defined(__ANDROID__)
+    if (!post && present_texture_enabled())
+        constants.render[3] |= 16u;
+#endif
     std::memcpy(frame.constants.mapped, &constants, sizeof(constants));
     frame.constants.flush(sizeof(constants));
     const View constant_view{frame.constants.buffer, 0};
     if (post)
         record_post(s, frame, constant_view);
+    else if (frame.queries) {
+        vkCmdResetQueryPool(cmd, frame.queries, 0, 2);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, frame.queries, 0);
+    }
+#if defined(__ANDROID__)
+    const bool texture_present = !post && present_texture_enabled();
+    if (texture_present)
+        record_present_texture(s, frame, constant_view);
+#endif
     VkImageMemoryBarrier to_target{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     to_target.srcAccessMask = 0;
     to_target.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -2976,9 +5078,38 @@ UINT64 present_snapshot(State &s, State::PresentFrame &frame) {
     rendering.layerCount = 1;
     rendering.colorAttachmentCount = 1;
     rendering.pColorAttachments = &attachment;
+#if defined(__ANDROID__)
+    if (!s.dynamic_rendering) {
+        VkClearValue clear{};
+        clear.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+        VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        pass.renderPass = s.swapchain_pass;
+        pass.framebuffer = s.swap_framebuffers[image];
+        pass.renderArea = {{0, 0}, s.swap_extent};
+        pass.clearValueCount = 1;
+        pass.pClearValues = &clear;
+        vkCmdBeginRenderPass(cmd, &pass, VK_SUBPASS_CONTENTS_INLINE);
+    } else
+#endif
     vkCmdBeginRendering(cmd, &rendering);
-    const auto fitted = fit_game_presentation(s.swap_extent.width, s.swap_extent.height, frame.width, frame.height,
+    auto fitted = fit_game_presentation(
+#if defined(__ANDROID__)
+        (s.presentation_transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR || s.presentation_transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) ? s.swap_extent.height : s.swap_extent.width,
+        (s.presentation_transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR || s.presentation_transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) ? s.swap_extent.width : s.swap_extent.height,
+#else
+        s.swap_extent.width, s.swap_extent.height,
+#endif
+        frame.width, frame.height,
                                               frame.aspect_scale);
+#if defined(__ANDROID__)
+    if (s.presentation_transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR) {
+        const auto left = s.swap_extent.width - fitted.top - fitted.height;
+        fitted.top = fitted.left; fitted.left = left; std::swap(fitted.width, fitted.height);
+    } else if (s.presentation_transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) {
+        const auto top = s.swap_extent.height - fitted.left - fitted.width;
+        fitted.left = fitted.top; fitted.top = top; std::swap(fitted.width, fitted.height);
+    }
+#endif
     const VkViewport viewport{static_cast<float>(fitted.left), static_cast<float>(fitted.top),
                               static_cast<float>(std::max(1u, fitted.width)),
                               static_cast<float>(std::max(1u, fitted.height)), 0, 1};
@@ -2992,7 +5123,27 @@ UINT64 present_snapshot(State &s, State::PresentFrame &frame) {
     const VkWriteDescriptorSet writes[]{buffer_write(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, &buffers[0]),
                                         buffer_write(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &buffers[1])};
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.layout, 0, 2, writes);
-    vkCmdDraw(cmd, 3, 1, 0, 0);
+#if defined(__ANDROID__)
+    if (texture_present) {
+        const VkDescriptorImageInfo image_info{VK_NULL_HANDLE, frame.rgba.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        const VkWriteDescriptorSet image_write_set = image_write(3, &image_info);
+        vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.layout, 0, 1, &image_write_set);
+    }
+    if (!post) {
+        const VkDescriptorBufferInfo depth_info{frame.has_depth ? frame.depth_image.buffer : frame.image.buffer, 0,
+                                                VK_WHOLE_SIZE};
+        const VkWriteDescriptorSet depth_write = buffer_write(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &depth_info);
+        vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.layout, 0, 1, &depth_write);
+    }
+#endif
+    static const bool skip_present_draw = diag_flag("PSPRECOMP_MOTORSTORM_DIAG_SKIP_PRESENT");
+    if (!skip_present_draw)
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+#if defined(__ANDROID__)
+    if (!s.dynamic_rendering)
+        vkCmdEndRenderPass(cmd);
+    else
+#endif
     vkCmdEndRendering(cmd);
     VkImageMemoryBarrier to_present = to_target;
     to_present.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -3001,6 +5152,10 @@ UINT64 present_snapshot(State &s, State::PresentFrame &frame) {
     to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
                          0, nullptr, 0, nullptr, 1, &to_present);
+    if (!post && frame.queries) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, frame.queries, 1);
+        frame.timed_present = true;
+    }
     check(vkEndCommandBuffer(cmd), "close presentation commands");
     // GPU-side waits: the swapchain image and the snapshot copy on the GE queue.
     const VkSemaphore waits[]{s.acquire[slot], s.timeline};
@@ -3038,6 +5193,10 @@ UINT64 present_snapshot(State &s, State::PresentFrame &frame) {
     s.acquire_value[slot] = value;
     if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)
         s.present_width = s.present_height = 0;
+#if defined(__ANDROID__)
+    else if (result == VK_ERROR_SURFACE_LOST_KHR)
+        s.surface_lost = true;
+#endif
     else
         check(result, "present");
     return value;
@@ -3059,6 +5218,22 @@ void presenter_main(State &s) {
         }
         lock.lock();
         const int index = s.ready_frame;
+#if defined(__ANDROID__)
+        if (failed) {
+            // Swapchain recreation fails when the surface went away (app
+            // switch, screen off). Drop the frame; the GE thread rebuilds
+            // presentation, and a failure there is still reported as fatal.
+            s.surface_lost = true;
+            if (index >= 0) {
+                s.present_frames[index].state = State::FrameState::Free;
+                s.present_frames[index].fence = 0;
+                s.ready_frame = -1;
+            }
+            log_line("GE", "presenter: surface unavailable (" + error_text + ")");
+            s.present_cv.notify_all();
+            continue;
+        }
+#endif
         if (index < 0 || failed) {
             if (failed) {
                 s.present_failed = true;
@@ -3082,6 +5257,12 @@ void presenter_main(State &s) {
         // A frame that was not submitted is free at once (fence 0).
         frame.fence = value;
         frame.state = State::FrameState::Free;
+#if defined(__ANDROID__)
+        if (failed && s.surface_lost) {
+            log_line("GE", "presenter: surface lost (" + error_text + ")");
+            failed = false;
+        }
+#endif
         if (failed) {
             s.present_failed = true;
             s.present_error = error_text;
@@ -3260,11 +5441,39 @@ bool present(psprecomp::GuestMemory &memory, void *window, std::uint32_t framebu
     perf::Scope present_profile(perf::kPresent);
     auto &s = *state;
     Surface *color = find_surface(s, framebuffer, stride, format, height);
+#if defined(__ANDROID__)
+    // Movies/software display frames can use a framebuffer never drawn by GE.
+    // Windows has a GDI fallback; Android uploads it into the Vulkan path.
+    if (!color && !s.recording && framebuffer && stride && stride <= 1024 &&
+        memory.contains(framebuffer, static_cast<std::size_t>(stride) * height * (format == 3 ? 4u : 2u))) {
+        begin(s);
+        color = &get_surface(s, memory, framebuffer, stride, height, format == 3 ? 4u : 2u, format);
+        submit_chunk(s);
+    }
+#endif
     if (!color)
         return false;
     if (s.recording)
         return false;
     const bool current_on_gpu = color->readback_pending;
+#if defined(__ANDROID__)
+    {
+        void *native = SDL_GetPointerProperty(SDL_GetWindowProperties(static_cast<HWND>(window)),
+                                              SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr);
+        if (s.surface && (s.surface_lost || native != s.native_window)) {
+            log_line("GE", std::string("Android surface ") + (native ? "replaced" : "destroyed") +
+                               "; rebuilding presentation");
+            release_presentation(s);
+            s.native_window = nullptr;
+            s.surface_lost = false;
+            std::lock_guard lock(s.present_mutex);
+            s.present_failed = false;
+            s.present_error.clear();
+        }
+        if (!native)
+            return true;  // backgrounded: no surface to present to
+    }
+#endif
     if (s.surface && s.window != static_cast<HWND>(window))
         release_presentation(s);
     if (!s.surface)
@@ -3313,11 +5522,13 @@ bool present(psprecomp::GuestMemory &memory, void *window, std::uint32_t framebu
         frame.image = make_buffer(bytes, Memory::Device);
         frame.bytes = bytes;
     }
+    sync_buffer(s, *color);
     outside(s);
     copy_buffer(s, frame.image.buffer, 0, color->image.buffer, 0, bytes);
     wrote(s);
     frame.has_depth = false;
-    if (s.racing && s.post.needs_depth())
+    const bool sgsr_needs_depth = select_upscaler(s.scale_settings) == Upscaler::Sgsr1Spatial && s.antialiasing != 1;
+    if (s.racing && (s.post.needs_depth() || sgsr_needs_depth))
         if (Surface *depth = find_depth_surface(s, *color)) {
             const UINT64 depth_bytes = static_cast<UINT64>(width) * s.output_scale * height * s.output_scale * 4;
             if (!frame.depth_image || frame.depth_bytes < depth_bytes) {
@@ -3338,6 +5549,7 @@ bool present(psprecomp::GuestMemory &memory, void *window, std::uint32_t framebu
     frame.format = format;
     frame.racing = s.racing;
     frame.aspect_scale = color->aspect_scale;
+    frame.raster_half = color->raster_half;
     {
         std::lock_guard lock(s.present_mutex);
         if (s.ready_frame >= 0 && s.ready_frame != index) {
@@ -3349,6 +5561,109 @@ bool present(psprecomp::GuestMemory &memory, void *window, std::uint32_t framebu
     }
     s.present_cv.notify_all();
     ++stats.presents;
+    maybe_save_pipeline_cache(s, stats.presents);
+#if defined(__ANDROID__)
+    if (!s.pipeline_cache_dirty)
+        save_hw_keys(s);
+    {
+        double frame_gpu_ms = -1.0;
+        if (s.gpu_samples > 0) {
+            frame_gpu_ms = s.gpu_accum;
+            s.gpu_accum = 0;
+            s.gpu_samples = 0;
+        }
+        const auto present_samples = present_scale_gpu_frames.exchange(0);
+        const auto present_time_ns = present_scale_gpu_ns.exchange(0);
+        if (present_samples != 0) {
+            const double present_ms = static_cast<double>(present_time_ns) / present_samples / 1.0e6;
+            frame_gpu_ms = frame_gpu_ms < 0.0 ? present_ms
+                              : s.shared_queue ? frame_gpu_ms + present_ms
+                                               : std::max(frame_gpu_ms, present_ms);
+        }
+        if (frame_gpu_ms >= 0.0) {
+            s.completed_gpu_ms = frame_gpu_ms;
+            stats.last_gpu_ms = frame_gpu_ms;
+        }
+        // Thermal status changes slowly; poll it about once a second. The
+        // NDK thermal API is API 30, above minSdk, so it is resolved once.
+        if (s.scale_settings.mode == ScaleMode::Dynamic && s.thermal_frames++ % 30u == 0u) {
+            using AcquireThermal = void *(*)();
+            using ThermalStatus = int (*)(void *);
+            static const auto acquire = reinterpret_cast<AcquireThermal>(dlsym(RTLD_DEFAULT, "AThermal_acquireManager"));
+            static const auto status =
+                reinterpret_cast<ThermalStatus>(dlsym(RTLD_DEFAULT, "AThermal_getCurrentThermalStatus"));
+            static void *manager = acquire ? acquire() : nullptr;
+            if (manager && status)
+                s.thermal_status = status(manager);
+        }
+        // Full resolution outside gameplay (menus, pause, loading, movies);
+        // GPU-time driven resolution only while racing.
+        const UINT next = s.dynamic_resolution.update(s.base_raster_half, s.raster_half, s.racing, frame_gpu_ms,
+                                                      s.scale_settings, s.thermal_status);
+        if (next != s.raster_half) {
+            log_line("GE", "render scale " + std::to_string(s.raster_half) + "/" + std::to_string(s.base_raster_half) +
+                               " -> " + std::to_string(next) + "/" + std::to_string(s.base_raster_half) +
+                               (s.racing ? " (gameplay, gpu_ms=" + std::to_string(s.completed_gpu_ms) + ")"
+                                         : " (menu: full resolution)"));
+            s.raster_half = next;
+            s.render_scale = static_cast<float>(next) / static_cast<float>(s.base_raster_half);
+            stats.raster_half = s.raster_half;
+        }
+    }
+    stats.render_scale = s.render_scale;
+    if (std::getenv("PSPRECOMP_MOTORSTORM_WAIT_STATS") && stats.presents % 150u == 0u) {
+        static std::uint64_t previous_submissions{};
+        static const char *names[kWaitSites]{"slot", "arena", "sync", "vertex", "publish", "other"};
+        std::string line = "waits/150f submissions=" + std::to_string(stats.submissions - previous_submissions);
+        previous_submissions = stats.submissions;
+        for (int i = 0; i < kWaitSites; ++i) {
+            line += std::string(" ") + names[i] + "=" + std::to_string(wait_ns[i] / 1000000) + "ms/" +
+                    std::to_string(wait_count[i]);
+            wait_ns[i] = wait_count[i] = 0;
+        }
+        const auto present_frames = present_gpu_frames.exchange(0);
+        const auto present_ns = present_gpu_ns.exchange(0);
+        line += " passes=" + std::to_string(pass_begins) + " loads=" + std::to_string(attachment_loads) +
+                " syncs=" + std::to_string(buffer_syncs) + " draws=" + std::to_string(draw_calls) +
+                " snap_copy=" + std::to_string(snapshot_copies) + " snap_reuse=" + std::to_string(snapshot_reuses);
+        snapshot_copies = snapshot_reuses = 0;
+        pass_begins = attachment_loads = buffer_syncs = draw_calls = 0;
+        line += " prepass_ms/f=" + std::to_string(prepass_gpu_ms / 150.0);
+        prepass_gpu_ms = 0;
+        if (!rejected_blends.empty()) {
+            std::vector<std::pair<std::uint64_t, std::uint32_t>> top;
+            for (const auto &[mode, count] : rejected_blends)
+                top.emplace_back(count, mode);
+            std::sort(top.rbegin(), top.rend());
+            std::ostringstream modes;
+            for (std::size_t i = 0; i < std::min<std::size_t>(top.size(), 6); ++i)
+                modes << " fmt" << (top[i].second >> 12) << ":src" << (top[i].second & 0xFu) << "/dst"
+                      << ((top[i].second >> 4) & 0xFu) << "/eq" << ((top[i].second >> 8) & 7u) << "=" << top[i].first;
+            log_line("GE", "ordered blends/150f:" + modes.str());
+            rejected_blends.clear();
+        }
+        if (pass_stats_enabled() && pass_end_pairs) {
+            std::vector<std::pair<std::uint64_t, std::uintptr_t>> top;
+            for (const auto &[key, count] : pass_end_sites)
+                top.emplace_back(count, key);
+            std::sort(top.rbegin(), top.rend());
+            Dl_info info{};
+            dladdr(reinterpret_cast<void *>(&note_pass_end), &info);
+            const auto base = reinterpret_cast<std::uintptr_t>(info.dli_fbase);
+            std::ostringstream sites;
+            for (std::size_t i = 0; i < std::min<std::size_t>(top.size(), 8); ++i) {
+                const auto &pair = (*pass_end_pairs)[top[i].second];
+                sites << " " << top[i].first << "@0x" << std::hex << (pair.first - base) << "/0x" << (pair.second - base)
+                      << std::dec;
+            }
+            log_line("GE", "pass ends:" + sites.str());
+            pass_end_sites.clear();
+        }
+        log_line("GE", line + " gpu_ms=" + std::to_string(s.completed_gpu_ms) + " present_gpu_ms=" +
+                           std::to_string(present_frames ? present_ns / 1e6 / present_frames : 0.0) +
+                           " raster_half=" + std::to_string(s.raster_half));
+    }
+#endif
     if (s.racing && s.post.active())
         capture_post_frame(s, memory, framebuffer, stride, format, width, height, frame.has_depth);
     return true;

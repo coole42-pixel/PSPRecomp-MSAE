@@ -14,6 +14,13 @@
 #define VK_USE_PLATFORM_WIN32_KHR
 #endif
 #define VK_NO_PROTOTYPES
+#if defined(__ANDROID__)
+#include <android/native_window.h>
+#define VK_USE_PLATFORM_ANDROID_KHR
+#define MOTORSTORM_VK_PLATFORM_SURFACE(X) X(vkCreateAndroidSurfaceKHR)
+#else
+#define MOTORSTORM_VK_PLATFORM_SURFACE(X) X(vkCreateWin32SurfaceKHR)
+#endif
 #include <vulkan/vulkan.h>
 
 #define MOTORSTORM_VK_GLOBAL(X)                                                                                    \
@@ -34,7 +41,7 @@
     X(vkEnumerateDeviceExtensionProperties)                                                                        \
     X(vkCreateDevice)                                                                                              \
     X(vkGetDeviceProcAddr)                                                                                         \
-    X(vkCreateWin32SurfaceKHR)                                                                                     \
+    MOTORSTORM_VK_PLATFORM_SURFACE(X)                                                                              \
     X(vkDestroySurfaceKHR)                                                                                         \
     X(vkGetPhysicalDeviceSurfaceSupportKHR)                                                                        \
     X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)                                                                   \
@@ -59,8 +66,6 @@
     X(vkEndCommandBuffer)                                                                                          \
     X(vkCreateSemaphore)                                                                                           \
     X(vkDestroySemaphore)                                                                                          \
-    X(vkWaitSemaphores)                                                                                            \
-    X(vkGetSemaphoreCounterValue)                                                                                  \
     X(vkCreateShaderModule)                                                                                        \
     X(vkDestroyShaderModule)                                                                                       \
     X(vkCreateDescriptorSetLayout)                                                                                 \
@@ -99,10 +104,35 @@
     X(vkCmdPipelineBarrier)                                                                                        \
     X(vkCmdSetViewport)                                                                                            \
     X(vkCmdSetScissor)                                                                                             \
+    X(vkCmdSetBlendConstants)                                                                                      \
+    X(vkCmdFillBuffer)                                                                                             \
+    X(vkCmdWriteTimestamp)                                                                                         \
+    X(vkCreatePipelineCache)                                                                                       \
+    X(vkDestroyPipelineCache)                                                                                      \
+    X(vkGetPipelineCacheData)
+
+#define MOTORSTORM_VK_DEVICE_OPTIONAL(X)                                                                           \
+    X(vkWaitSemaphores)                                                                                            \
+    X(vkGetSemaphoreCounterValue)                                                                                  \
     X(vkCmdBeginRendering)                                                                                         \
     X(vkCmdEndRendering)                                                                                           \
-    X(vkCmdWriteTimestamp)                                                                                         \
-    X(vkCmdResetQueryPool)
+    X(vkCmdResetQueryPool)                                                                                         \
+    X(vkResetQueryPool)                                                                                            \
+    X(vkCmdSetCullMode)                                                                                            \
+    X(vkCmdSetDepthTestEnable)                                                                                     \
+    X(vkCmdSetDepthWriteEnable)                                                                                    \
+    X(vkCmdSetDepthCompareOp)                                                                                      \
+    X(vkCmdSetColorBlendEnableEXT)                                                                                 \
+    X(vkCmdSetColorBlendEquationEXT)                                                                               \
+    X(vkCmdSetColorWriteMaskEXT)
+
+#if defined(__ANDROID__)
+#define MOTORSTORM_VK_MOBILE_DEVICE(X) \
+    X(vkCreateRenderPass) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer) \
+    X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdCopyImage) X(vkCmdCopyImageToBuffer)
+#else
+#define MOTORSTORM_VK_MOBILE_DEVICE(X)
+#endif
 
 namespace motorstorm::vulkan::api {
 #define MOTORSTORM_VK_DECLARE(name) inline PFN_##name name{};
@@ -111,5 +141,7 @@ MOTORSTORM_VK_GLOBAL(MOTORSTORM_VK_DECLARE)
 MOTORSTORM_VK_INSTANCE(MOTORSTORM_VK_DECLARE)
 MOTORSTORM_VK_INSTANCE_OPTIONAL(MOTORSTORM_VK_DECLARE)
 MOTORSTORM_VK_DEVICE(MOTORSTORM_VK_DECLARE)
+MOTORSTORM_VK_DEVICE_OPTIONAL(MOTORSTORM_VK_DECLARE)
+MOTORSTORM_VK_MOBILE_DEVICE(MOTORSTORM_VK_DECLARE)
 #undef MOTORSTORM_VK_DECLARE
 } // namespace motorstorm::vulkan::api

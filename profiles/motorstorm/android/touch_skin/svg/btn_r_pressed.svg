@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>R shoulder button (pressed)</title>
+  <defs>
+    <linearGradient id="r-pressed-body" gradientUnits="userSpaceOnUse" x1="0" y1="72" x2="0" y2="186"><stop offset="0" stop-color="#8CCBFF" stop-opacity="0.48"/><stop offset="0.55" stop-color="#1A2233" stop-opacity="0.64"/><stop offset="1" stop-color="#0B0E14" stop-opacity="0.78"/></linearGradient>
+    <linearGradient id="r-pressed-rim" gradientUnits="userSpaceOnUse" x1="0" y1="72" x2="0" y2="186"><stop offset="0" stop-color="#FFFFFF" stop-opacity="0.95"/><stop offset="0.45" stop-color="#8CCBFF" stop-opacity="0.75"/><stop offset="1" stop-color="#8CCBFF" stop-opacity="0.55"/></linearGradient>
+    <linearGradient id="r-pressed-sheen" gradientUnits="userSpaceOnUse" x1="0" y1="72" x2="0" y2="134.7"><stop offset="0" stop-color="#FFFFFF" stop-opacity="0.12"/><stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/></linearGradient>
+  </defs>
+  <g id="background" opacity="1">
+    <path d="M 216 186 H 40 A 22 22 0 0 1 18 164 V 94 A 22 22 0 0 1 40 72 H 164 C 206 72 238 102 238 140 V 164 A 22 22 0 0 1 216 186 Z" fill="none" stroke="#8CCBFF" stroke-opacity="0.1" stroke-width="30" stroke-linejoin="round"/>
+    <path d="M 216 186 H 40 A 22 22 0 0 1 18 164 V 94 A 22 22 0 0 1 40 72 H 164 C 206 72 238 102 238 140 V 164 A 22 22 0 0 1 216 186 Z" fill="none" stroke="#8CCBFF" stroke-opacity="0.16" stroke-width="20" stroke-linejoin="round"/>
+    <path d="M 216 186 H 40 A 22 22 0 0 1 18 164 V 94 A 22 22 0 0 1 40 72 H 164 C 206 72 238 102 238 140 V 164 A 22 22 0 0 1 216 186 Z" fill="none" stroke="#8CCBFF" stroke-opacity="0.26" stroke-width="10" stroke-linejoin="round"/>
+    <g transform="translate(128 128) scale(0.955) translate(-128 -128)">
+    <path d="M 216 186 H 40 A 22 22 0 0 1 18 164 V 94 A 22 22 0 0 1 40 72 H 164 C 206 72 238 102 238 140 V 164 A 22 22 0 0 1 216 186 Z" fill="url(#r-pressed-body)"/>
+    <path d="M 216 186 H 40 A 22 22 0 0 1 18 164 V 94 A 22 22 0 0 1 40 72 H 164 C 206 72 238 102 238 140 V 164 A 22 22 0 0 1 216 186 Z" fill="url(#r-pressed-sheen)"/>
+    <path d="M 216 186 H 40 A 22 22 0 0 1 18 164 V 94 A 22 22 0 0 1 40 72 H 164 C 206 72 238 102 238 140 V 164 A 22 22 0 0 1 216 186 Z" fill="none" stroke="url(#r-pressed-rim)" stroke-width="3" stroke-linejoin="round"/>
+    </g>
+    <path d="M 60 172 H 196" stroke="#FFFFFF" stroke-opacity="0.10" stroke-width="2" stroke-linecap="round"/>
+  </g>
+  <g id="symbol" opacity="1">
+    <g transform="translate(128 128) scale(0.955) translate(-128 -128)">
+    <path d="M 112 154 V 104 H 132 A 13.5 13.5 0 0 1 132 131 H 112 M 128 131 L 146 154" fill="none" stroke="#8CCBFF" stroke-opacity="0.07" stroke-width="35.2" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 112 154 V 104 H 132 A 13.5 13.5 0 0 1 132 131 H 112 M 128 131 L 146 154" fill="none" stroke="#8CCBFF" stroke-opacity="0.1" stroke-width="28.6" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 112 154 V 104 H 132 A 13.5 13.5 0 0 1 132 131 H 112 M 128 131 L 146 154" fill="none" stroke="#8CCBFF" stroke-opacity="0.14" stroke-width="23.1" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 112 154 V 104 H 132 A 13.5 13.5 0 0 1 132 131 H 112 M 128 131 L 146 154" fill="none" stroke="#8CCBFF" stroke-opacity="0.22" stroke-width="17.6" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 112 154 V 104 H 132 A 13.5 13.5 0 0 1 132 131 H 112 M 128 131 L 146 154" fill="none" stroke="#FFFFFF" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+  </g>
+</svg>

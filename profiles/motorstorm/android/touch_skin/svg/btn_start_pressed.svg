@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>Start button (pressed)</title>
+  <defs>
+    <linearGradient id="start-pressed-body" gradientUnits="userSpaceOnUse" x1="0" y1="90" x2="0" y2="166"><stop offset="0" stop-color="#8CCBFF" stop-opacity="0.48"/><stop offset="0.55" stop-color="#1A2233" stop-opacity="0.64"/><stop offset="1" stop-color="#0B0E14" stop-opacity="0.78"/></linearGradient>
+    <linearGradient id="start-pressed-rim" gradientUnits="userSpaceOnUse" x1="0" y1="90" x2="0" y2="166"><stop offset="0" stop-color="#FFFFFF" stop-opacity="0.95"/><stop offset="0.45" stop-color="#8CCBFF" stop-opacity="0.75"/><stop offset="1" stop-color="#8CCBFF" stop-opacity="0.55"/></linearGradient>
+    <linearGradient id="start-pressed-sheen" gradientUnits="userSpaceOnUse" x1="0" y1="90" x2="0" y2="131.8"><stop offset="0" stop-color="#FFFFFF" stop-opacity="0.12"/><stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/></linearGradient>
+  </defs>
+  <g id="background" opacity="1">
+    <path d="M 56 90 H 200 A 38 38 0 0 1 238 128 V 128 A 38 38 0 0 1 200 166 H 56 A 38 38 0 0 1 18 128 V 128 A 38 38 0 0 1 56 90 Z" fill="none" stroke="#8CCBFF" stroke-opacity="0.1" stroke-width="30" stroke-linejoin="round"/>
+    <path d="M 56 90 H 200 A 38 38 0 0 1 238 128 V 128 A 38 38 0 0 1 200 166 H 56 A 38 38 0 0 1 18 128 V 128 A 38 38 0 0 1 56 90 Z" fill="none" stroke="#8CCBFF" stroke-opacity="0.16" stroke-width="20" stroke-linejoin="round"/>
+    <path d="M 56 90 H 200 A 38 38 0 0 1 238 128 V 128 A 38 38 0 0 1 200 166 H 56 A 38 38 0 0 1 18 128 V 128 A 38 38 0 0 1 56 90 Z" fill="none" stroke="#8CCBFF" stroke-opacity="0.26" stroke-width="10" stroke-linejoin="round"/>
+    <g transform="translate(128 128) scale(0.955) translate(-128 -128)">
+    <path d="M 56 90 H 200 A 38 38 0 0 1 238 128 V 128 A 38 38 0 0 1 200 166 H 56 A 38 38 0 0 1 18 128 V 128 A 38 38 0 0 1 56 90 Z" fill="url(#start-pressed-body)"/>
+    <path d="M 56 90 H 200 A 38 38 0 0 1 238 128 V 128 A 38 38 0 0 1 200 166 H 56 A 38 38 0 0 1 18 128 V 128 A 38 38 0 0 1 56 90 Z" fill="url(#start-pressed-sheen)"/>
+    <path d="M 56 90 H 200 A 38 38 0 0 1 238 128 V 128 A 38 38 0 0 1 200 166 H 56 A 38 38 0 0 1 18 128 V 128 A 38 38 0 0 1 56 90 Z" fill="none" stroke="url(#start-pressed-rim)" stroke-width="3" stroke-linejoin="round"/>
+    </g>
+  </g>
+  <g id="symbol" opacity="1">
+    <g transform="translate(128 128) scale(0.955) translate(-128 -128)">
+    <path d="M 11 4 C 10 2 8.2 1 6 1 C 3.2 1 1.2 2.6 1.2 5.1 C 1.2 7.8 3.6 8.8 6 9.6 C 8.7 10.5 11 11.6 11 14.6 C 11 17.4 8.8 19 6 19 C 3.6 19 1.7 18 0.9 16" transform="translate(70.6 114) scale(1.4)" fill="none" stroke="#8CCBFF" stroke-opacity="0.07" stroke-width="12.57" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 0.5 1 H 11.5 M 6 1 V 19" transform="translate(95.1 114) scale(1.4)" fill="none" stroke="#8CCBFF" stroke-opacity="0.07" stroke-width="12.57" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 0.6 19 L 6 1 L 11.4 19 M 2.6 12.6 H 9.4" transform="translate(119.6 114) scale(1.4)" fill="none" stroke="#8CCBFF" stroke-opacity="0.07" stroke-width="12.57" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 1.2 19 V 1 H 7 C 9.8 1 11.3 2.8 11.3 5.5 C 11.3 8.2 9.8 10 7 10 H 1.2 M 6.6 10 L 11.4 19" transform="translate(144.1 114) scale(1.4)" fill="none" stroke="#8CCBFF" stroke-opacity="0.07" stroke-width="12.57" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 0.5 1 H 11.5 M 6 1 V 19" transform="translate(168.6 114) scale(1.4)" fill="none" stroke="#8CCBFF" stroke-opacity="0.07" stroke-width="12.57" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 11 4 C 10 2 8.2 1 6 1 C 3.2 1 1.2 2.6 1.2 5.1 C 1.2 7.8 3.6 8.8 6 9.6 C 8.7 10.5 11 11.6 11 14.6 C 11 17.4 8.8 19 6 19 C 3.6 19 1.7 18 0.9 16" transform="translate(70.6 114) scale(1.4)" fill="none" stroke="#8CCBFF" stroke-opacity="0.1" stroke-width="10.21" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 0.5 1 H 11.5 M 6 1 V 19" transform="translate(95.1 114) scale(1.4)" fill="none" stroke="#8CCBFF" stroke-opacity="0.1" stroke-width="10.21" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 0.6 19 L 6 1 L 11.4 19 M 2.6 12.6 H 9.4" transform="translate(119.6 114) scale(1.4)" fill="none" stroke="#8CCBFF" stroke-opacity="0.1" stroke-width="10.21" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 1.2 19 V 1 H 7 C 9.8 1 11.3 2.8 11.3 5.5 C 11.3 8.2 9.8 10 7 10 H 1.2 M 6.6 10 L 11.4 19" transform="translate(144.1 114) scale(1.4)" fill="none" stroke="#8CCBFF" stroke-opacity="0.1" stroke-width="10.21" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 0.5 1 H 11.5 M 6 1 V 19" transform="translate(168.6 114) scale(1.4)" fill="none" stroke="#8CCBFF" stroke-opacity="0.1" stroke-width="10.21" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 11 4 C 10 2 8.2 1 6 1 C 3.2 1 1.2 2.6 1.2 5.1 C 1.2 7.8 3.6 8.8 6 9.6 C 8.7 10.5 11 11.6 11 14.6 C 11 17.4 8.8 19 6 19 C 3.6 19 1.7 18 0.9 16" transform="translate(70.6 114) scale(1.4)" fill="none" stroke="#8CCBFF" stroke-opacity="0.14" stroke-width="8.25" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 0.5 1 H 11.5 M 6 1 V 19" transform="translate(95.1 114) scale(1.4)" fill="none" stroke="#8CCBFF" stroke-opacity="0.14" stroke-width="8.25" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 0.6 19 L 6 1 L 11.4 19 M 2.6 12.6 H 9.4" transform="translate(119.6 114) scale(1.4)" fill="none" stroke="#8CCBFF" stroke-opacity="0.14" stroke-width="8.25" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 1.2 19 V 1 H 7 C 9.8 1 11.3 2.8 11.3 5.5 C 11.3 8.2 9.8 10 7 10 H 1.2 M 6.6 10 L 11.4 19" transform="translate(144.1 114) scale(1.4)" fill="none" stroke="#8CCBFF" stroke-opacity="0.14" stroke-width="8.25" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 0.5 1 H 11.5 M 6 1 V 19" transform="translate(168.6 114) scale(1.4)" fill="none" stroke="#8CCBFF" stroke-opacity="0.14" stroke-width="8.25" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 11 4 C 10 2 8.2 1 6 1 C 3.2 1 1.2 2.6 1.2 5.1 C 1.2 7.8 3.6 8.8 6 9.6 C 8.7 10.5 11 11.6 11 14.6 C 11 17.4 8.8 19 6 19 C 3.6 19 1.7 18 0.9 16" transform="translate(70.6 114) scale(1.4)" fill="none" stroke="#8CCBFF" stroke-opacity="0.22" stroke-width="6.29" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 0.5 1 H 11.5 M 6 1 V 19" transform="translate(95.1 114) scale(1.4)" fill="none" stroke="#8CCBFF" stroke-opacity="0.22" stroke-width="6.29" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 0.6 19 L 6 1 L 11.4 19 M 2.6 12.6 H 9.4" transform="translate(119.6 114) scale(1.4)" fill="none" stroke="#8CCBFF" stroke-opacity="0.22" stroke-width="6.29" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 1.2 19 V 1 H 7 C 9.8 1 11.3 2.8 11.3 5.5 C 11.3 8.2 9.8 10 7 10 H 1.2 M 6.6 10 L 11.4 19" transform="translate(144.1 114) scale(1.4)" fill="none" stroke="#8CCBFF" stroke-opacity="0.22" stroke-width="6.29" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 0.5 1 H 11.5 M 6 1 V 19" transform="translate(168.6 114) scale(1.4)" fill="none" stroke="#8CCBFF" stroke-opacity="0.22" stroke-width="6.29" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 11 4 C 10 2 8.2 1 6 1 C 3.2 1 1.2 2.6 1.2 5.1 C 1.2 7.8 3.6 8.8 6 9.6 C 8.7 10.5 11 11.6 11 14.6 C 11 17.4 8.8 19 6 19 C 3.6 19 1.7 18 0.9 16" transform="translate(70.6 114) scale(1.4)" fill="none" stroke="#FFFFFF" stroke-width="3.93" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 0.5 1 H 11.5 M 6 1 V 19" transform="translate(95.1 114) scale(1.4)" fill="none" stroke="#FFFFFF" stroke-width="3.93" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 0.6 19 L 6 1 L 11.4 19 M 2.6 12.6 H 9.4" transform="translate(119.6 114) scale(1.4)" fill="none" stroke="#FFFFFF" stroke-width="3.93" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 1.2 19 V 1 H 7 C 9.8 1 11.3 2.8 11.3 5.5 C 11.3 8.2 9.8 10 7 10 H 1.2 M 6.6 10 L 11.4 19" transform="translate(144.1 114) scale(1.4)" fill="none" stroke="#FFFFFF" stroke-width="3.93" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 0.5 1 H 11.5 M 6 1 V 19" transform="translate(168.6 114) scale(1.4)" fill="none" stroke="#FFFFFF" stroke-width="3.93" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+  </g>
+</svg>

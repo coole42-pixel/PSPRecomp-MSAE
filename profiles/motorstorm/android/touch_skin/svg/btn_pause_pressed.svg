@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>Pause button (pressed)</title>
+  <defs>
+    <radialGradient id="pause-pressed-halo" gradientUnits="userSpaceOnUse" cx="128" cy="128" r="124"><stop offset="0" stop-color="#8CCBFF" stop-opacity="0.55"/><stop offset="0.76" stop-color="#8CCBFF" stop-opacity="0.45"/><stop offset="1" stop-color="#8CCBFF" stop-opacity="0"/></radialGradient>
+    <radialGradient id="pause-pressed-body" gradientUnits="userSpaceOnUse" cx="128" cy="93.7" r="142.1"><stop offset="0" stop-color="#8CCBFF" stop-opacity="0.5"/><stop offset="0.55" stop-color="#1A2233" stop-opacity="0.62"/><stop offset="1" stop-color="#0B0E14" stop-opacity="0.78"/></radialGradient>
+    <linearGradient id="pause-pressed-rim" gradientUnits="userSpaceOnUse" x1="0" y1="30" x2="0" y2="226"><stop offset="0" stop-color="#FFFFFF" stop-opacity="0.95"/><stop offset="0.45" stop-color="#8CCBFF" stop-opacity="0.75"/><stop offset="1" stop-color="#8CCBFF" stop-opacity="0.55"/></linearGradient>
+    <linearGradient id="pause-pressed-sheen" gradientUnits="userSpaceOnUse" x1="0" y1="30" x2="0" y2="128"><stop offset="0" stop-color="#FFFFFF" stop-opacity="0.14"/><stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/></linearGradient>
+  </defs>
+  <g id="background" opacity="1">
+    <circle cx="128" cy="128" r="124" fill="url(#pause-pressed-halo)"/>
+    <g transform="translate(128 128) scale(0.955) translate(-128 -128)">
+    <circle cx="128" cy="128" r="98" fill="url(#pause-pressed-body)"/>
+    <circle cx="128" cy="128" r="88" fill="none" stroke="#FFFFFF" stroke-opacity="0.07" stroke-width="1.5"/>
+    <ellipse cx="128" cy="83.9" rx="68.6" ry="41.16" fill="url(#pause-pressed-sheen)"/>
+    <circle cx="128" cy="128" r="96.5" fill="none" stroke="url(#pause-pressed-rim)" stroke-width="3"/>
+    </g>
+  </g>
+  <g id="symbol" opacity="1">
+    <g transform="translate(128 128) scale(0.955) translate(-128 -128)">
+    <path d="M 103 94 H 113 A 3 3 0 0 1 116 97 V 159 A 3 3 0 0 1 113 162 H 103 A 3 3 0 0 1 100 159 V 97 A 3 3 0 0 1 103 94 Z" fill="#8CCBFF" fill-opacity="0.07" stroke="#8CCBFF" stroke-opacity="0.07" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 143 94 H 153 A 3 3 0 0 1 156 97 V 159 A 3 3 0 0 1 153 162 H 143 A 3 3 0 0 1 140 159 V 97 A 3 3 0 0 1 143 94 Z" fill="#8CCBFF" fill-opacity="0.07" stroke="#8CCBFF" stroke-opacity="0.07" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 103 94 H 113 A 3 3 0 0 1 116 97 V 159 A 3 3 0 0 1 113 162 H 103 A 3 3 0 0 1 100 159 V 97 A 3 3 0 0 1 103 94 Z" fill="#8CCBFF" fill-opacity="0.1" stroke="#8CCBFF" stroke-opacity="0.1" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 143 94 H 153 A 3 3 0 0 1 156 97 V 159 A 3 3 0 0 1 153 162 H 143 A 3 3 0 0 1 140 159 V 97 A 3 3 0 0 1 143 94 Z" fill="#8CCBFF" fill-opacity="0.1" stroke="#8CCBFF" stroke-opacity="0.1" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 103 94 H 113 A 3 3 0 0 1 116 97 V 159 A 3 3 0 0 1 113 162 H 103 A 3 3 0 0 1 100 159 V 97 A 3 3 0 0 1 103 94 Z" fill="#8CCBFF" fill-opacity="0.14" stroke="#8CCBFF" stroke-opacity="0.14" stroke-width="10.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 143 94 H 153 A 3 3 0 0 1 156 97 V 159 A 3 3 0 0 1 153 162 H 143 A 3 3 0 0 1 140 159 V 97 A 3 3 0 0 1 143 94 Z" fill="#8CCBFF" fill-opacity="0.14" stroke="#8CCBFF" stroke-opacity="0.14" stroke-width="10.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 103 94 H 113 A 3 3 0 0 1 116 97 V 159 A 3 3 0 0 1 113 162 H 103 A 3 3 0 0 1 100 159 V 97 A 3 3 0 0 1 103 94 Z" fill="#8CCBFF" fill-opacity="0.22" stroke="#8CCBFF" stroke-opacity="0.22" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 143 94 H 153 A 3 3 0 0 1 156 97 V 159 A 3 3 0 0 1 153 162 H 143 A 3 3 0 0 1 140 159 V 97 A 3 3 0 0 1 143 94 Z" fill="#8CCBFF" fill-opacity="0.22" stroke="#8CCBFF" stroke-opacity="0.22" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 103 94 H 113 A 3 3 0 0 1 116 97 V 159 A 3 3 0 0 1 113 162 H 103 A 3 3 0 0 1 100 159 V 97 A 3 3 0 0 1 103 94 Z" fill="#FFFFFF" stroke="#FFFFFF" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 143 94 H 153 A 3 3 0 0 1 156 97 V 159 A 3 3 0 0 1 153 162 H 143 A 3 3 0 0 1 140 159 V 97 A 3 3 0 0 1 143 94 Z" fill="#FFFFFF" stroke="#FFFFFF" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+  </g>
+</svg>

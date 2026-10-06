@@ -1586,6 +1586,25 @@ bool loading_activity(double seconds) {
 // Called once per displayed frame.
 void pace_frame(GuestMemory &memory) {
     ++g_pacer.frames;
+    // Busy time of the guest thread since the previous frame was paced:
+    // pacing sleeps and audio backpressure are idle time, not work.
+    static std::uint64_t previous_end{}, previous_audio{};
+    struct WorkStamp {
+        ~WorkStamp() { previous_end = host_time_us(); }
+    } work_stamp;
+    {
+        const auto now = host_time_us();
+        const auto audio = audio_blocked_us();
+        if (previous_end != 0u && now > previous_end) {
+            const auto blocked = audio - std::min(audio, previous_audio);
+            const auto elapsed = now - previous_end;
+            const auto frame_us = g_active_rate.game_fps > 0.0f
+                                      ? static_cast<std::uint64_t>(1e6f / g_active_rate.game_fps)
+                                      : 33'367u;
+            host_report_frame_work(elapsed - std::min(elapsed, blocked), frame_us);
+        }
+        previous_audio = audio;
+    }
     // Pace every visible frame, including with audio enabled. Audio's device
     // periods maintain average speed but wake the guest in uneven bursts.
     // Wait before publishing a snapshot, otherwise two early frames can
@@ -3520,6 +3539,42 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
                     << " out_len=" << out_length << " (returning success)";
                 log_line(category::kFilesystem, out.str());
             }
+            const auto arg = ctx.gpr[6];
+            const auto arg_length = ctx.gpr[7];
+            const bool stick = psp_path == "ms0:" || psp_path == "fatms0:" || psp_path == "mscmhc0:";
+            // A zeroed reply looks like an empty or missing stick. MotorStorm then
+            // shows "failed to save to memory stick" before it ever writes a file.
+            if (stick && command == 0x02025806u && out_length >= 4u && rt.memory().contains(out_data, 4u)) {
+                rt.memory().store32(out_data, 1u); // inserted
+                ctx.set_gpr(2, 0u);
+                return;
+            }
+            if (stick && command == 0x02425823u && rt.memory().contains(out_data, 4u)) {
+                rt.memory().store32(out_data, 1u); // FAT assigned
+                ctx.set_gpr(2, 0u);
+                return;
+            }
+            if (stick && command == 0x02425824u && out_length >= 4u && rt.memory().contains(out_data, 4u)) {
+                rt.memory().store32(out_data, 0u); // not write-protected
+                ctx.set_gpr(2, 0u);
+                return;
+            }
+            if (stick && command == 0x02425818u && arg_length >= 4u && rt.memory().contains(arg, 4u)) {
+                const auto info = rt.memory().load32(arg);
+                if (rt.memory().contains(info, 20u)) {
+                    constexpr std::uint32_t sector_size = 0x200u;
+                    constexpr std::uint32_t sector_count = 64u; // 32 KiB clusters
+                    constexpr std::uint64_t free_bytes = (1024ull + 512ull) * 1024ull * 1024ull;
+                    const auto clusters = static_cast<std::uint32_t>((free_bytes * 95ull / 100ull) / (sector_size * sector_count));
+                    rt.memory().store32(info, clusters);
+                    rt.memory().store32(info + 4u, clusters);
+                    rt.memory().store32(info + 8u, clusters);
+                    rt.memory().store32(info + 12u, sector_size);
+                    rt.memory().store32(info + 16u, sector_count);
+                }
+                ctx.set_gpr(2, 0u);
+                return;
+            }
             if (out_data != 0u && out_length != 0u && rt.memory().contains(out_data, out_length))
                 rt.memory().zero(out_data, out_length);
             ctx.set_gpr(2, 0u);
@@ -4898,7 +4953,11 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
     window_start();
     audio_start(44100u);
     if (window_enabled()) hle_line("native window enabled");
+#if defined(__ANDROID__)
+    if (audio_enabled()) hle_line("host audio sink enabled (SDL 44100 stereo)");
+#else
     if (audio_enabled()) hle_line("host audio sink enabled (waveOut 44100 stereo)");
+#endif
 
     install_mpeg_hle(runtime);
     install_atrac_hle(runtime);
@@ -4914,6 +4973,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
                 << " slot=" << memory.read_c_string(parameter + 0x4C, 20)
                 << " file=" << memory.read_c_string(parameter + 0x64, 13)
                 << " bytes=" << memory.load32(parameter + 0x7C) << " result=" << hex32(result);
+            if (!psprecomp::savedata_last_error().empty()) line << " host_error=\"" << psprecomp::savedata_last_error() << '"';
             // Delete-family modes carry their targets in saveNameList (offset 0x60);
             // dump it plus the surrounding parameter words so the HLE behavior for
             // these modes can be verified against the real request.
@@ -5020,7 +5080,22 @@ void report_summary() {
                 << " publish_wait_ms=" << gpu.publish_wait_ns[0] / 1000000u << '/' << gpu.publish_wait_ns[1] / 1000000u
                 << '/' << gpu.publish_wait_ns[2] / 1000000u << '/' << gpu.publish_wait_ns[3] / 1000000u << '/'
                 << gpu.publish_wait_ns[4] / 1000000u << '/' << gpu.publish_wait_ns[5] / 1000000u
-                << " feedback_syncs=" << gpu.feedback_syncs << " feedback_draws=" << gpu.feedback_draws << " software_draws=" << gpu.software_draws
+                << " feedback_syncs=" << gpu.feedback_syncs << " feedback_draws=" << gpu.feedback_draws
+                << " hardware_pixel_draws=" << gpu.hardware_pixel_draws
+                << " ordered_pixel_draws=" << gpu.ordered_pixel_draws
+                << " pixel_path_switches=" << gpu.pixel_path_switches
+                << " hardware_alpha_draws=" << gpu.hardware_alpha_draws
+                << " reject_feedback=" << gpu.reject_feedback
+                << " reject_stencil=" << gpu.reject_stencil
+                << " reject_color=" << gpu.reject_color
+                << " reject_mask=" << gpu.reject_mask
+                << " reject_blend=" << gpu.reject_blend
+                << " reject_other=" << gpu.reject_other
+                << " hw_packs=" << gpu.hw_packs
+                << " hw_pack_ms=" << (gpu.hw_pack_ns / 1000000u)
+                << " pipelines_created=" << gpu.pipelines_created
+                << " pipeline_create_ms=" << (gpu.pipeline_create_ns / 1000000u)
+                << " software_draws=" << gpu.software_draws
                 << " presents=" << gpu.presents << " skipped_presents=" << gpu.skipped_presents
                 << " superseded_presents=" << gpu.superseded_presents
                 << " streamed_texture_updates=" << gpu.streamed_texture_updates

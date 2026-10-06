@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>Circle button (idle)</title>
+  <defs>
+    <radialGradient id="circle-idle-halo" gradientUnits="userSpaceOnUse" cx="128" cy="132" r="124"><stop offset="0" stop-color="#000000" stop-opacity="0.3"/><stop offset="0.76" stop-color="#000000" stop-opacity="0.3"/><stop offset="1" stop-color="#000000" stop-opacity="0"/></radialGradient>
+    <radialGradient id="circle-idle-body" gradientUnits="userSpaceOnUse" cx="128" cy="93.7" r="142.1"><stop offset="0" stop-color="#3A4252" stop-opacity="0.5"/><stop offset="0.6" stop-color="#161A23" stop-opacity="0.62"/><stop offset="1" stop-color="#0B0E14" stop-opacity="0.72"/></radialGradient>
+    <linearGradient id="circle-idle-rim" gradientUnits="userSpaceOnUse" x1="0" y1="30" x2="0" y2="226"><stop offset="0" stop-color="#FFFFFF" stop-opacity="0.6"/><stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0.1"/><stop offset="1" stop-color="#FFFFFF" stop-opacity="0.26"/></linearGradient>
+    <linearGradient id="circle-idle-sheen" gradientUnits="userSpaceOnUse" x1="0" y1="30" x2="0" y2="128"><stop offset="0" stop-color="#FFFFFF" stop-opacity="0.2"/><stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/></linearGradient>
+  </defs>
+  <g id="background" opacity="1">
+    <circle cx="128" cy="132" r="124" fill="url(#circle-idle-halo)"/>
+    <g>
+    <circle cx="128" cy="128" r="98" fill="url(#circle-idle-body)"/>
+    <circle cx="128" cy="128" r="88" fill="none" stroke="#FFFFFF" stroke-opacity="0.07" stroke-width="1.5"/>
+    <ellipse cx="128" cy="83.9" rx="68.6" ry="41.16" fill="url(#circle-idle-sheen)"/>
+    <circle cx="128" cy="128" r="96.5" fill="none" stroke="url(#circle-idle-rim)" stroke-width="3"/>
+    </g>
+  </g>
+  <g id="symbol" opacity="1">
+    <g>
+    <path d="M 90 128 A 38 38 0 1 1 166 128 A 38 38 0 1 1 90 128 Z" fill="none" stroke="#FF6E7A" stroke-opacity="0.04" stroke-width="28.6" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 90 128 A 38 38 0 1 1 166 128 A 38 38 0 1 1 90 128 Z" fill="none" stroke="#FF6E7A" stroke-opacity="0.06" stroke-width="23.1" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 90 128 A 38 38 0 1 1 166 128 A 38 38 0 1 1 90 128 Z" fill="none" stroke="#FF6E7A" stroke-opacity="0.1" stroke-width="17.6" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 90 128 A 38 38 0 1 1 166 128 A 38 38 0 1 1 90 128 Z" fill="none" stroke="#FF6E7A" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+  </g>
+</svg>

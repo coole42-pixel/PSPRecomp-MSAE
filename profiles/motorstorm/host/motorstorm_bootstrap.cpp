@@ -8,6 +8,7 @@
 #include "psprecomp/common.hpp"
 #include "psprecomp/elf32.hpp"
 #include "psprecomp/runtime.hpp"
+#include "motorstorm_mobile.hpp"
 #include "psprecomp/sha256.hpp"
 
 #include <algorithm>
@@ -227,11 +228,22 @@ int run(const BootstrapPaths &paths) {
             "as the first command-line argument (PSPRECOMP_MOTORSTORM_EBOOT also overrides).");
     }
 
+    const auto executable_hash = psprecomp::sha256_file(paths.psp_executable);
+#if defined(__ANDROID__)
+    {
+        std::ifstream header(paths.psp_executable, std::ios::binary);
+        char magic[4]{};
+        header.read(magic, 4);
+        const auto decision = accept_decrypted_eboot(executable_hash, eboot_image_is_encrypted(std::string_view(magic, 4)));
+        if (decision != ExecutableReject::Ok)
+            throw psprecomp::Error(executable_reject_text(decision));
+    }
+#endif
     psprecomp::Elf32Image elf = psprecomp::Elf32Image::from_file(paths.psp_executable);
     log_line(category::kModule, "ELF type=" + psprecomp::hex32(elf.type()) +
                                     (elf.is_psp_prx() ? " (PSP PRX)" : " (plain ELF)") +
                                     " entry=" + psprecomp::hex32(elf.runtime_entry()));
-    log_line(category::kMemory, "loaded SHA-256=" + psprecomp::sha256_file(paths.psp_executable));
+    log_line(category::kMemory, "loaded SHA-256=" + executable_hash);
 
     psprecomp::Runtime runtime(32u * 1024u * 1024u);
     runtime.set_game_root(paths.disc_root);

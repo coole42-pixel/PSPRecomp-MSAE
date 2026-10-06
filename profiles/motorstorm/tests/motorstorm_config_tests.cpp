@@ -2,6 +2,7 @@
 #include "motorstorm_config.hpp"
 #include "motorstorm_draw_distance.hpp"
 #include "motorstorm_frame_rate.hpp"
+#include "motorstorm_mobile.hpp"
 #include "motorstorm_pacing.hpp"
 #include "motorstorm_presentation.hpp"
 
@@ -39,6 +40,268 @@ struct EnvironmentScope {
 
 int main() {
     try {
+        using motorstorm::PixelFeatures;
+        using motorstorm::PixelPath;
+        using motorstorm::ScaleMode;
+        using motorstorm::ScaleSettings;
+        const PixelFeatures ordered{false, true};
+        const PixelFeatures neither{};
+        const PixelFeatures interlock{true, false};
+        check(motorstorm::select_pixel_path(ordered) == PixelPath::OrderedAttachment,
+              "ordered colour attachments without interlock select the ordered path");
+        check(motorstorm::select_pixel_path(neither) == PixelPath::Unsupported,
+              "a pixel path without ordered attachment access is rejected");
+        check(motorstorm::select_pixel_path(interlock) == PixelPath::Interlock,
+              "fragment shader interlock stays on the desktop interlock path");
+        check(!motorstorm::point_expansion_requires_geometry_shader(PixelPath::Unsupported) &&
+                  !motorstorm::point_expansion_requires_geometry_shader(PixelPath::FixedFunctionProgrammable) &&
+                  !motorstorm::point_expansion_requires_geometry_shader(PixelPath::OrderedAttachment) &&
+                  !motorstorm::point_expansion_requires_geometry_shader(PixelPath::Interlock),
+              "point expansion does not require a geometry shader");
+
+        {
+            using motorstorm::CompactColorFormat;
+            using motorstorm::GeDrawFacts;
+            using motorstorm::classify_ge_draw;
+            std::array<std::uint32_t, 256> commands{};
+            GeDrawFacts facts;
+            const auto shader = std::filesystem::path(__FILE__).parent_path().parent_path() / "host" / "motorstorm_gpu.hlsl";
+            std::ifstream source(shader);
+            check(source.good(), "the shipped pixel shader is next to the classifier");
+            const std::string hlsl((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
+            const auto entry_body = [&](const char *signature) {
+                const auto at = hlsl.find(signature);
+                check(at != std::string::npos, "the hardware fragment entry is in the shipped shader");
+                const auto end = hlsl.find("\nfloat4 ", at + std::strlen(signature));
+                check(end != std::string::npos, "the hardware fragment entry has a body");
+                return hlsl.substr(at, end - at);
+            };
+            const auto fast = entry_body("float4 PSFast(");
+            const auto fast_alpha = entry_body("float4 PSFastAlpha(");
+            check(fast.find("pixelUpdate") == std::string::npos && fast.find("SubpassLoad") == std::string::npos,
+                  "PSFast does not call pixelUpdate");
+            check(fast_alpha.find("pixelUpdate") == std::string::npos && fast_alpha.find("SubpassLoad") == std::string::npos &&
+                      fast_alpha.find("discard") != std::string::npos,
+                  "PSFastAlpha discards for the alpha test and does not call pixelUpdate");
+            check(hlsl.find("if(live) pixelUpdate") != std::string::npos,
+                  "the ordered pixel shader still calls pixelUpdate");
+
+            commands[0x23] = 1u;
+            commands[0xDE] = 4u; // PSP LESS
+            const auto opaque = classify_ge_draw(commands.data(), facts);
+            std::printf("ff opaque: hardware=%d entry=%s format=%s pixelUpdate=%d depth=%d/%d compare=%u blend=%d\n",
+                        opaque.hardware ? 1 : 0, opaque.fragment_entry, motorstorm::compact_color_format_name(opaque.color_format),
+                        opaque.runs_pixel_update ? 1 : 0, opaque.state.depth_test ? 1 : 0, opaque.state.depth_write ? 1 : 0,
+                        opaque.state.depth_compare, opaque.state.blend ? 1 : 0);
+            check(opaque.hardware && opaque.state.depth_test && opaque.state.depth_write && !opaque.state.blend &&
+                      opaque.state.depth_compare == 1u && opaque.color_format == CompactColorFormat::Rgba8Unorm &&
+                      std::string(opaque.fragment_entry) == "PSFast" && !opaque.runs_pixel_update,
+                  "opaque depth-tested draws select hardware depth, R8G8B8A8, and PSFast");
+
+            commands[0x21] = 1u;
+            commands[0xDF] = 2u | (3u << 4); // source alpha, one-minus-source-alpha, add
+            const auto blended = classify_ge_draw(commands.data(), facts);
+            std::printf("ff src-alpha: hardware=%d entry=%s src=%u dst=%u op=%u alpha=%u/%u\n", blended.hardware ? 1 : 0,
+                        blended.fragment_entry, blended.state.src_factor, blended.state.dst_factor, blended.state.blend_op,
+                        blended.state.src_alpha_factor, blended.state.dst_alpha_factor);
+            check(blended.hardware && blended.state.blend && blended.state.src_factor == 6u &&
+                      blended.state.dst_factor == 7u && blended.state.blend_op == 0u &&
+                      blended.color_format == CompactColorFormat::Rgba8Unorm,
+                  "common 8888 source-alpha blending uses the attachment path");
+
+            commands[0x21] = 0u;
+            commands[0x22] = 1u;
+            commands[0xDB] = 6u | (0x80u << 8) | (0xFFu << 16); // greater than 128
+            const auto alpha = classify_ge_draw(commands.data(), facts);
+            std::printf("ff alpha-test: hardware=%d entry=%s format=%s pixelUpdate=%d\n", alpha.hardware ? 1 : 0,
+                        alpha.fragment_entry, motorstorm::compact_color_format_name(alpha.color_format),
+                        alpha.runs_pixel_update ? 1 : 0);
+            check(alpha.hardware && alpha.state.alpha_discard && std::string(alpha.fragment_entry) == "PSFastAlpha" &&
+                      alpha.color_format != CompactColorFormat::PackedR32Uint && !alpha.runs_pixel_update,
+                  "alpha test selects the discard fragment entry without pixelUpdate");
+
+            commands = {};
+            commands[0x21] = 1u;
+            commands[0xDF] = 6u | (3u << 4); // doubled source alpha: not a Vulkan factor
+            const auto doubled = classify_ge_draw(commands.data(), facts);
+            std::printf("ff dest-read: hardware=%d entry=%s format=%s pixelUpdate=%d\n", doubled.hardware ? 1 : 0,
+                        doubled.fragment_entry, motorstorm::compact_color_format_name(doubled.color_format),
+                        doubled.runs_pixel_update ? 1 : 0);
+            check(!doubled.hardware && std::string(doubled.fragment_entry) == "PS" && doubled.runs_pixel_update &&
+                      doubled.color_format == CompactColorFormat::PackedR32Uint,
+                  "a destination-read blend stays on the ordered attachment path");
+
+            commands[0xDF] = 2u | (3u << 4) | (5u << 8); // absolute difference
+            const auto absolute = classify_ge_draw(commands.data(), facts);
+            check(!absolute.hardware && absolute.runs_pixel_update, "an absolute-difference blend stays ordered");
+
+            commands[0xDF] = 2u | (10u << 4); // source alpha, FIX: additive with white
+            commands[0xE1] = 0xFFFFFFu;
+            const auto additive = classify_ge_draw(commands.data(), facts);
+            check(additive.hardware && additive.state.blend && additive.state.src_factor == 6u &&
+                      additive.state.dst_factor == 1u && additive.state.blend_op == 0u &&
+                      !additive.state.use_blend_constant,
+                  "an additive blend with a white FIX color uses ONE on the attachment path");
+            facts.wide_blends = false;
+            check(!classify_ge_draw(commands.data(), facts).hardware,
+                  "without wide blends only source-alpha/one-minus-source-alpha is hardware");
+            facts.wide_blends = true;
+
+            commands[0xDF] = 10u | (10u << 4) | (2u << 8); // FIX, FIX, reverse subtract
+            commands[0xE0] = 0x404040u;
+            commands[0xE1] = 0x404040u;
+            const auto shared = classify_ge_draw(commands.data(), facts);
+            check(shared.hardware && shared.state.use_blend_constant && shared.state.src_factor == 10u &&
+                      shared.state.dst_factor == 10u && shared.state.blend_op == 2u && shared.state.constant_r == 0x40u,
+                  "equal FIX colors share the blend constant");
+            commands[0xE1] = 0xBFBFBFu;
+            const auto complement = classify_ge_draw(commands.data(), facts);
+            check(complement.hardware && complement.state.dst_factor == 11u,
+                  "a complementary destination FIX color is ONE_MINUS_CONSTANT_COLOR");
+            commands[0xE1] = 0x102030u;
+            check(!classify_ge_draw(commands.data(), facts).hardware,
+                  "two unrelated FIX colors stay on the ordered attachment path");
+
+            commands[0xDF] = 0u | (1u << 4) | (4u << 8); // destination color, one-minus-source color, max
+            const auto colors = classify_ge_draw(commands.data(), facts);
+            check(colors.hardware && colors.state.src_factor == 4u && colors.state.dst_factor == 3u &&
+                      colors.state.blend_op == 4u,
+                  "color factors and MAX map to Vulkan blend state");
+            facts.format = 0u;
+            check(!classify_ge_draw(commands.data(), facts).hardware, "blends on 16-bit targets stay ordered");
+            facts.format = 3u;
+
+            commands = {};
+            commands[0x23] = 1u;
+            commands[0x27] = 1u;
+            const auto color_test = classify_ge_draw(commands.data(), facts);
+            std::printf("ff color-test: hardware=%d entry=%s format=%s\n", color_test.hardware ? 1 : 0, color_test.fragment_entry,
+                        motorstorm::compact_color_format_name(color_test.color_format));
+            check(!color_test.hardware && color_test.color_format == CompactColorFormat::PackedR32Uint &&
+                      std::string(color_test.fragment_entry) == "PS",
+                  "color test stays on the ordered attachment path");
+
+            commands[0x27] = 0u;
+            commands[0x24] = 1u;
+            check(!classify_ge_draw(commands.data(), facts).hardware, "stencil stays on the ordered attachment path");
+            commands[0x24] = 0u;
+            commands[0xE8] = 0x0Fu;
+            check(!classify_ge_draw(commands.data(), facts).hardware, "a partial bit mask stays on the ordered attachment path");
+            commands[0xE8] = 0u;
+            commands[0xE6] = 6u; // logic op, ignored by pixelUpdate
+            const auto logic = classify_ge_draw(commands.data(), facts);
+            check(logic.hardware && !logic.runs_pixel_update, "an ignored logic op does not leave the hardware path");
+            facts.feedback = true;
+            check(!classify_ge_draw(commands.data(), facts).hardware, "framebuffer feedback stays ordered");
+            facts.feedback = false;
+            facts.raster_half = 4u;
+            check(!classify_ge_draw(commands.data(), facts).hardware, "scales above native 1x stay ordered");
+        }
+
+        ScaleSettings dynamic;
+        dynamic.mode = ScaleMode::Dynamic;
+        dynamic.min_scale = 0.5f;
+        dynamic.max_scale = 1.0f;
+        dynamic.target_fps = 30;
+        check(motorstorm::frame_budget_ms(30) == 33.3 && motorstorm::frame_budget_ms(60) == 16.7,
+              "scale budgets are 33.3 ms at 30 fps and 16.7 ms at 60 fps");
+        const auto held = motorstorm::step_render_scale(0.80f, 33.3, dynamic, 0);
+        check(!held.changed && held.scale == 0.80f, "hysteresis holds the scale on budget noise");
+        const auto down = motorstorm::step_render_scale(0.80f, 40.0, dynamic, 0);
+        check(down.changed && down.scale < 0.80f && down.scale >= dynamic.min_scale,
+              "GPU time over the 30 fps budget steps the scale down");
+        dynamic.target_fps = 60;
+        const auto down60 = motorstorm::step_render_scale(1.0f, 20.0, dynamic, 0);
+        check(down60.changed && down60.scale < 1.0f, "GPU time over the 60 fps budget steps the scale down");
+        dynamic.target_fps = 30;
+        const auto clamped = motorstorm::step_render_scale(0.50f, 80.0, dynamic, 0);
+        check(clamped.scale == dynamic.min_scale, "scale clamps to the minimum");
+        const auto capped = motorstorm::step_render_scale(2.0f, 1.0, dynamic, 0);
+        check(capped.scale == dynamic.max_scale, "scale clamps to the maximum");
+        const auto hot = motorstorm::step_render_scale(1.0f, 1.0, dynamic, 4);
+        check(hot.scale <= 0.50f, "a raised thermal status lowers the scale ceiling");
+        ScaleSettings fixed = dynamic;
+        fixed.mode = ScaleMode::Fixed;
+        fixed.fixed_scale = 0.75f;
+        const auto fixed_step = motorstorm::step_render_scale(1.0f, 1.0, fixed, 0);
+        check(fixed_step.scale == 0.75f, "fixed scale ignores GPU time");
+        ScaleSettings off;
+        off.mode = ScaleMode::Off;
+        const auto off_step = motorstorm::step_render_scale(0.5f, 100.0, off, 0);
+        check(off_step.scale == 1.0f, "Off renders at full scale");
+        check(motorstorm::select_upscaler(off) != motorstorm::select_upscaler(dynamic) &&
+                  motorstorm::select_upscaler(dynamic) == motorstorm::Upscaler::Sgsr1Spatial &&
+                  motorstorm::upscaler_name(motorstorm::select_upscaler(dynamic)) == "sgsr1-spatial-single-pass",
+              "Off, fixed, and dynamic are distinct and the upscaler is SGSR 1 spatial single-pass");
+        check(off.sharpness != 0.0f && dynamic.sharpness == 2.0f, "SGSR sharpness is its own setting");
+        check(motorstorm::hud_composited_after_upscale(), "the HUD composite is ordered after SGSR");
+        check(motorstorm::present_frame_rate_hz(0) == 30 && motorstorm::present_frame_rate_hz(30) == 30 &&
+                  motorstorm::present_frame_rate_hz(60) == 60 && motorstorm::present_frame_rate_hz(120) == 60,
+              "the present target is 30 or 60 and never 120");
+
+        check(motorstorm::default_driver_request() == motorstorm::DriverRequest::System,
+              "System is the default driver");
+        const auto failed_load =
+            motorstorm::resolve_driver(motorstorm::DriverRequest::Imported, false, false);
+        const auto failed_device =
+            motorstorm::resolve_driver(motorstorm::DriverRequest::Imported, true, false);
+        const auto loaded = motorstorm::resolve_driver(motorstorm::DriverRequest::Imported, true, true);
+        check(failed_load.active == motorstorm::DriverRequest::System && failed_load.show_fallback_message &&
+                  !failed_load.message.empty(),
+              "a failed library load selects System and a visible message");
+        check(failed_device.active == motorstorm::DriverRequest::System && failed_device.show_fallback_message &&
+                  failed_device.message != failed_load.message,
+              "a failed VkDevice creation selects System and a visible message");
+        check(loaded.active == motorstorm::DriverRequest::Imported && !loaded.show_fallback_message,
+              "a successful imported driver stays selected");
+
+        const auto wrong = motorstorm::accept_decrypted_eboot("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", false);
+        const auto encrypted = motorstorm::accept_decrypted_eboot(motorstorm::kAcceptedEbootSha256, true);
+        const auto accepted = motorstorm::accept_decrypted_eboot(motorstorm::kAcceptedEbootSha256, false);
+        check(wrong == motorstorm::ExecutableReject::WrongHash && encrypted == motorstorm::ExecutableReject::Encrypted &&
+                  accepted == motorstorm::ExecutableReject::Ok,
+              "only the one decrypted executable hash is accepted");
+        check(motorstorm::eboot_image_is_encrypted("~PSP") && !motorstorm::eboot_image_is_encrypted("\x7f" "ELF"),
+              "an encrypted image is recognized without a decrypt step");
+        check(motorstorm::effects_default_off_on_windows_and_android(motorstorm::NativeConfig{}.post),
+              "effects that default off on Windows default off on Android");
+
+        check(motorstorm::display_output_scale(2560, 1600) == 5u && motorstorm::display_output_scale(1600, 2560) == 5u &&
+                  motorstorm::display_output_scale(2400, 1080) == 4u && motorstorm::display_output_scale(2560, 1600, 4) == 4u &&
+                  motorstorm::display_output_scale(0, 0) == 1u,
+              "full resolution matches the fitted landscape display");
+        {
+            motorstorm::DynamicResolution drs;
+            ScaleSettings settings = dynamic;
+            settings.target_fps = 30;
+            std::uint32_t half = 10u;
+            for (int i = 0; i < motorstorm::DynamicResolution::kWindowFrames; ++i)
+                half = drs.update(10u, half, false, 80.0, settings, 0);
+            check(half == 10u, "menus stay at full resolution whatever the GPU time");
+            for (int i = 0; i < motorstorm::DynamicResolution::kWindowFrames - 1; ++i)
+                half = drs.update(10u, half, true, 80.0, settings, 0);
+            check(half == 10u, "gameplay waits for a full timing window before changing resolution");
+            half = drs.update(10u, half, true, 80.0, settings, 0);
+            check(half == 9u, "slow gameplay drops one raster step per window");
+            for (int w = 0; w < 20; ++w)
+                for (int i = 0; i < motorstorm::DynamicResolution::kWindowFrames; ++i)
+                    half = drs.update(10u, half, true, 80.0, settings, 0);
+            check(half == 5u, "gameplay resolution stops at the minimum scale");
+            for (int i = 0; i < motorstorm::DynamicResolution::kWindowFrames; ++i)
+                half = drs.update(10u, half, true, 5.0, settings, 0);
+            check(half == 5u, "a recent drop holds before stepping back up");
+            for (int w = 0; w < 10; ++w)
+                for (int i = 0; i < motorstorm::DynamicResolution::kWindowFrames; ++i)
+                    half = drs.update(10u, half, true, 5.0, settings, 0);
+            check(half > 5u, "fast gameplay climbs back toward full resolution");
+            half = drs.update(10u, 5u, false, 80.0, settings, 0);
+            check(half == 10u, "leaving gameplay returns to full resolution at once");
+        }
+
+        const auto steer = motorstorm::touch_sample(0.16f, 0.74f);
+        const auto pedal = motorstorm::touch_sample(0.80f, 0.10f);
+        check(steer.axis_x >= 0 && pedal.buttons == 0x0200u, "the nub steers and R accelerates");
+
         const auto shipped = motorstorm::load_native_config(MOTORSTORM_CONFIG_TEMPLATE);
         check(shipped.loaded && shipped.resolution == 4u && shipped.antialiasing == "fxaa" &&
               shipped.renderer == "d3d12" && shipped.window && shipped.audio && shipped.fps == 60u && shipped.widescreen == "auto",

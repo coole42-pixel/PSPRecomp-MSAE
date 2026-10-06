@@ -37,4 +37,6 @@ void host_sleep_until_us(std::uint64_t deadline) noexcept {
         host_sleep_us(deadline - now);
 }
 
+void host_report_frame_work(std::uint64_t, std::uint64_t) noexcept {}
+
 } // namespace motorstorm

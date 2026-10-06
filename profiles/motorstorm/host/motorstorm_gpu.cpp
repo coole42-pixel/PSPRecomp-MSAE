@@ -108,6 +108,24 @@ std::uint32_t physical(std::uint32_t address) {
         address = 0x04000000u | (address & 0x1FFFFFu);
     return address;
 }
+// Lazy readback publication.  A finished GE list records its readbacks but
+// leaves them unpublished until something actually consumes guest VRAM: the
+// VRAM access hook publishes before the first real CPU read/write, and the
+// explicit sync/settle/transfer paths are unchanged.  A surface whose readback
+// is still pending has not been touched by the CPU (any access would have
+// published it), so load_surface compares the stale guest bytes against the
+// last published shadow without waiting and keeps the GPU image when they
+// match.  This removes the per-list publish wait and copy from the race path.
+// PSPRECOMP_MOTORSTORM_GPU_LAZY_PUBLISH=0 (or "false") restores the eager
+// list-start publication for A/B checks.
+bool lazy_publish_enabled() {
+    static const bool value = [] {
+        const char *text = std::getenv("PSPRECOMP_MOTORSTORM_GPU_LAZY_PUBLISH");
+        if (text == nullptr || *text == '\0') return true;
+        return std::strcmp(text, "0") != 0 && std::strcmp(text, "false") != 0;
+    }();
+    return value;
+}
 // Raster scales are kept in half units (2 = 1x, 3 = 1.5x, 4 = 2x, ...) so
 // SSAA2x can rasterize at 1.5x per axis. Raster pixel r belongs to native
 // pixel (2r+1)/half; native pixel n starts at raster pixel (n*half)/2. Every
@@ -755,7 +773,7 @@ void load_surface(State &s, Surface &surface, const psprecomp::GuestMemory &memo
     if (surface.loaded)
         return;
     std::vector<std::uint8_t> guest(static_cast<std::size_t>(surface.guest_bytes()));
-    if (surface.readback_pending) {
+    if (surface.readback_pending && !lazy_publish_enabled()) {
         // Reading this target's own bytes publishes its deferred readback.
         memory.copy_out(surface.address, guest);
     } else {
@@ -1766,7 +1784,9 @@ void gpu_submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<c
         draw.depthbuffer && draw.depth_stride > 0 && draw.depth_stride <= 1024 &&
         memory.contains(draw.depthbuffer, static_cast<std::size_t>(draw.depth_stride) * height * 2);
     // Targets compare guest bytes on load; publish any deferred readback first.
-    if (!s.recording && s.readback_fence != 0u) {
+    // With lazy publication the comparison uses the already-published shadow
+    // and the VRAM hook publishes on demand instead of on every list start.
+    if (!lazy_publish_enabled() && !s.recording && s.readback_fence != 0u) {
         PublishReason reason(0);
         publish_readbacks(s, memory);
     }
@@ -3081,6 +3101,7 @@ std::vector<std::uint32_t> gpu_debug_depth_words(psprecomp::GuestMemory &memory,
 // is written twice, <n>_base.png (the resolved game image) and <n>_post.png
 // (the same frame through the [enhancements] chain), so effects compare on
 // identical frames. The chain is re-run synchronously with the shared shaders.
+#if defined(_WIN32)
 void capture_post_frame(State &s, psprecomp::GuestMemory &memory, std::uint32_t framebuffer, std::uint32_t stride,
                         std::uint32_t format, std::uint32_t width, std::uint32_t height, bool has_depth) {
     static const char *directory = std::getenv("PSPRECOMP_MOTORSTORM_POST_CAPTURE_DIR");
@@ -3149,6 +3170,7 @@ void capture_post_frame(State &s, psprecomp::GuestMemory &memory, std::uint32_t 
     log_line("GE", "post capture: race frame " + std::to_string(race_frames) + " written to " + directory +
                        " (depth=" + std::to_string(has_depth) + ")");
 }
+#endif
 bool gpu_present(psprecomp::GuestMemory &memory, void *window, std::uint32_t framebuffer,
                  std::uint32_t stride, std::uint32_t format, std::uint32_t width, std::uint32_t height) {
     MOTORSTORM_VULKAN_ROUTE(present(memory, window, framebuffer, stride, format, width, height))

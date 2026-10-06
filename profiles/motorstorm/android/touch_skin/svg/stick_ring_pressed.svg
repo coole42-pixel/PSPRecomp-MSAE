@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>Analog stick outer ring (active)</title>
+  <defs>
+    <radialGradient id="stick-ring-pressed-halo" gradientUnits="userSpaceOnUse" cx="128" cy="128" r="128"><stop offset="0" stop-color="#8CCBFF" stop-opacity="0"/><stop offset="0.8" stop-color="#8CCBFF" stop-opacity="0.05"/><stop offset="0.88" stop-color="#8CCBFF" stop-opacity="0.3"/><stop offset="1" stop-color="#8CCBFF" stop-opacity="0"/></radialGradient>
+    <radialGradient id="stick-ring-pressed-well" gradientUnits="userSpaceOnUse" cx="128" cy="128" r="120"><stop offset="0" stop-color="#0B0E14" stop-opacity="0.3"/><stop offset="0.7" stop-color="#0B0E14" stop-opacity="0.44"/><stop offset="0.93" stop-color="#0B0E14" stop-opacity="0.62"/><stop offset="1" stop-color="#0B0E14" stop-opacity="0"/></radialGradient>
+    <linearGradient id="stick-ring-pressed-rim" gradientUnits="userSpaceOnUse" x1="0" y1="16" x2="0" y2="240"><stop offset="0" stop-color="#FFFFFF" stop-opacity="0.95"/><stop offset="0.5" stop-color="#8CCBFF" stop-opacity="0.8"/><stop offset="1" stop-color="#8CCBFF" stop-opacity="0.6"/></linearGradient>
+    <linearGradient id="stick-ring-pressed-trail0" gradientUnits="userSpaceOnUse" x1="33.74" y1="84.05" x2="102.84" y2="27.09"><stop offset="0" stop-color="#8CCBFF" stop-opacity="0"/><stop offset="1" stop-color="#8CCBFF" stop-opacity="0.9"/></linearGradient>
+    <linearGradient id="stick-ring-pressed-trail1" gradientUnits="userSpaceOnUse" x1="222.26" y1="171.95" x2="153.16" y2="228.91"><stop offset="0" stop-color="#8CCBFF" stop-opacity="0"/><stop offset="1" stop-color="#8CCBFF" stop-opacity="0.9"/></linearGradient>
+  </defs>
+  <g id="background" opacity="1">
+    <circle cx="128" cy="128" r="128" fill="url(#stick-ring-pressed-halo)"/>
+    <circle cx="128" cy="128" r="120" fill="url(#stick-ring-pressed-well)"/>
+    <circle cx="128" cy="128" r="100" fill="none" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="1.5"/>
+    <circle cx="128" cy="128" r="74" fill="none" stroke="#FFFFFF" stroke-opacity="0.05" stroke-width="1.5"/>
+    <circle cx="128" cy="128" r="46" fill="none" stroke="#FFFFFF" stroke-opacity="0.04" stroke-width="1.5"/>
+    <circle cx="128" cy="128" r="111" fill="none" stroke="url(#stick-ring-pressed-rim)" stroke-width="3"/>
+  </g>
+  <g id="symbol" opacity="1">
+    <path d="M 33.74 84.05 A 104 104 0 0 1 102.84 27.09" fill="none" stroke="url(#stick-ring-pressed-trail0)" stroke-width="5" stroke-linecap="round"/>
+    <path d="M 222.26 171.95 A 104 104 0 0 1 153.16 228.91" fill="none" stroke="url(#stick-ring-pressed-trail1)" stroke-width="5" stroke-linecap="round"/>
+    <path d="M 128 30 L 137 41 L 119 41 Z" transform="rotate(0 128 128)" fill="#8CCBFF" fill-opacity="0.95" stroke="#8CCBFF" stroke-opacity="0.95" stroke-width="3" stroke-linejoin="round"/>
+    <path d="M 128 30 L 137 41 L 119 41 Z" transform="rotate(90 128 128)" fill="#8CCBFF" fill-opacity="0.95" stroke="#8CCBFF" stroke-opacity="0.95" stroke-width="3" stroke-linejoin="round"/>
+    <path d="M 128 30 L 137 41 L 119 41 Z" transform="rotate(180 128 128)" fill="#8CCBFF" fill-opacity="0.95" stroke="#8CCBFF" stroke-opacity="0.95" stroke-width="3" stroke-linejoin="round"/>
+    <path d="M 128 30 L 137 41 L 119 41 Z" transform="rotate(270 128 128)" fill="#8CCBFF" fill-opacity="0.95" stroke="#8CCBFF" stroke-opacity="0.95" stroke-width="3" stroke-linejoin="round"/>
+  </g>
+</svg>

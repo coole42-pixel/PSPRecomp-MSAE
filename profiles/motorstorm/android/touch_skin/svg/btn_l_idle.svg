@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>L shoulder button (idle)</title>
+  <defs>
+    <linearGradient id="l-idle-body" gradientUnits="userSpaceOnUse" x1="0" y1="72" x2="0" y2="186"><stop offset="0" stop-color="#3A4252" stop-opacity="0.52"/><stop offset="0.55" stop-color="#161A23" stop-opacity="0.62"/><stop offset="1" stop-color="#0B0E14" stop-opacity="0.74"/></linearGradient>
+    <linearGradient id="l-idle-rim" gradientUnits="userSpaceOnUse" x1="0" y1="72" x2="0" y2="186"><stop offset="0" stop-color="#FFFFFF" stop-opacity="0.6"/><stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0.1"/><stop offset="1" stop-color="#FFFFFF" stop-opacity="0.26"/></linearGradient>
+    <linearGradient id="l-idle-sheen" gradientUnits="userSpaceOnUse" x1="0" y1="72" x2="0" y2="134.7"><stop offset="0" stop-color="#FFFFFF" stop-opacity="0.18"/><stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/></linearGradient>
+  </defs>
+  <g id="background" opacity="1">
+    <path d="M 40 186 H 216 A 22 22 0 0 0 238 164 V 94 A 22 22 0 0 0 216 72 H 92 C 50 72 18 102 18 140 V 164 A 22 22 0 0 0 40 186 Z" transform="translate(0 4)" fill="none" stroke="#000000" stroke-opacity="0.1" stroke-width="22" stroke-linejoin="round"/>
+    <path d="M 40 186 H 216 A 22 22 0 0 0 238 164 V 94 A 22 22 0 0 0 216 72 H 92 C 50 72 18 102 18 140 V 164 A 22 22 0 0 0 40 186 Z" transform="translate(0 4)" fill="none" stroke="#000000" stroke-opacity="0.16" stroke-width="12" stroke-linejoin="round"/>
+    <g>
+    <path d="M 40 186 H 216 A 22 22 0 0 0 238 164 V 94 A 22 22 0 0 0 216 72 H 92 C 50 72 18 102 18 140 V 164 A 22 22 0 0 0 40 186 Z" fill="url(#l-idle-body)"/>
+    <path d="M 40 186 H 216 A 22 22 0 0 0 238 164 V 94 A 22 22 0 0 0 216 72 H 92 C 50 72 18 102 18 140 V 164 A 22 22 0 0 0 40 186 Z" fill="url(#l-idle-sheen)"/>
+    <path d="M 40 186 H 216 A 22 22 0 0 0 238 164 V 94 A 22 22 0 0 0 216 72 H 92 C 50 72 18 102 18 140 V 164 A 22 22 0 0 0 40 186 Z" fill="none" stroke="url(#l-idle-rim)" stroke-width="3" stroke-linejoin="round"/>
+    </g>
+    <path d="M 60 172 H 196" stroke="#FFFFFF" stroke-opacity="0.10" stroke-width="2" stroke-linecap="round"/>
+  </g>
+  <g id="symbol" opacity="1">
+    <g>
+    <path d="M 114 104 V 154 H 146" fill="none" stroke="#8CCBFF" stroke-opacity="0.04" stroke-width="28.6" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 114 104 V 154 H 146" fill="none" stroke="#8CCBFF" stroke-opacity="0.06" stroke-width="23.1" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 114 104 V 154 H 146" fill="none" stroke="#8CCBFF" stroke-opacity="0.1" stroke-width="17.6" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 114 104 V 154 H 146" fill="none" stroke="#E9EFF8" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+  </g>
+</svg>

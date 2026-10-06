@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>Circle button (pressed)</title>
+  <defs>
+    <radialGradient id="circle-pressed-halo" gradientUnits="userSpaceOnUse" cx="128" cy="128" r="124"><stop offset="0" stop-color="#FF6E7A" stop-opacity="0.55"/><stop offset="0.76" stop-color="#FF6E7A" stop-opacity="0.45"/><stop offset="1" stop-color="#FF6E7A" stop-opacity="0"/></radialGradient>
+    <radialGradient id="circle-pressed-body" gradientUnits="userSpaceOnUse" cx="128" cy="93.7" r="142.1"><stop offset="0" stop-color="#FF6E7A" stop-opacity="0.5"/><stop offset="0.55" stop-color="#1A2233" stop-opacity="0.62"/><stop offset="1" stop-color="#0B0E14" stop-opacity="0.78"/></radialGradient>
+    <linearGradient id="circle-pressed-rim" gradientUnits="userSpaceOnUse" x1="0" y1="30" x2="0" y2="226"><stop offset="0" stop-color="#FFFFFF" stop-opacity="0.95"/><stop offset="0.45" stop-color="#FF6E7A" stop-opacity="0.75"/><stop offset="1" stop-color="#FF6E7A" stop-opacity="0.55"/></linearGradient>
+    <linearGradient id="circle-pressed-sheen" gradientUnits="userSpaceOnUse" x1="0" y1="30" x2="0" y2="128"><stop offset="0" stop-color="#FFFFFF" stop-opacity="0.14"/><stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/></linearGradient>
+  </defs>
+  <g id="background" opacity="1">
+    <circle cx="128" cy="128" r="124" fill="url(#circle-pressed-halo)"/>
+    <g transform="translate(128 128) scale(0.955) translate(-128 -128)">
+    <circle cx="128" cy="128" r="98" fill="url(#circle-pressed-body)"/>
+    <circle cx="128" cy="128" r="88" fill="none" stroke="#FFFFFF" stroke-opacity="0.07" stroke-width="1.5"/>
+    <ellipse cx="128" cy="83.9" rx="68.6" ry="41.16" fill="url(#circle-pressed-sheen)"/>
+    <circle cx="128" cy="128" r="96.5" fill="none" stroke="url(#circle-pressed-rim)" stroke-width="3"/>
+    </g>
+  </g>
+  <g id="symbol" opacity="1">
+    <g transform="translate(128 128) scale(0.955) translate(-128 -128)">
+    <path d="M 90 128 A 38 38 0 1 1 166 128 A 38 38 0 1 1 90 128 Z" fill="none" stroke="#FF6E7A" stroke-opacity="0.07" stroke-width="35.2" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 90 128 A 38 38 0 1 1 166 128 A 38 38 0 1 1 90 128 Z" fill="none" stroke="#FF6E7A" stroke-opacity="0.1" stroke-width="28.6" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 90 128 A 38 38 0 1 1 166 128 A 38 38 0 1 1 90 128 Z" fill="none" stroke="#FF6E7A" stroke-opacity="0.14" stroke-width="23.1" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 90 128 A 38 38 0 1 1 166 128 A 38 38 0 1 1 90 128 Z" fill="none" stroke="#FF6E7A" stroke-opacity="0.22" stroke-width="17.6" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M 90 128 A 38 38 0 1 1 166 128 A 38 38 0 1 1 90 128 Z" fill="none" stroke="#FFFFFF" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+  </g>
+</svg>

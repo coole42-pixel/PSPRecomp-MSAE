@@ -1,4 +1,5 @@
 #include "motorstorm_config.hpp"
+#include "motorstorm_parse_real.hpp"
 #include "motorstorm_draw_distance.hpp"
 #include "motorstorm_frame_rate.hpp"
 #include "motorstorm_input.hpp"
@@ -141,7 +142,11 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
         }
         if (section == "audio" && key == "enabled") config.audio = boolean();
         if (section == "audio" && key == "api") {
+#if defined(__ANDROID__)
+            if (choice != "sdl") invalid("must be sdl on Android");
+#else
             if (choice != "wasapi" && choice != "waveout") invalid("must be wasapi or waveout");
+#endif
             config.audio_api = choice;
         }
         if (section == "textures") {
@@ -184,8 +189,7 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
         if (section == "enhancements") {
             const auto real = [&](double minimum, double maximum) {
                 double result{};
-                const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result);
-                if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || result < minimum ||
+                if (!parse_real(value, result) || result < minimum ||
                     result > maximum)
                     invalid("is not a number in its documented range");
                 return value;

@@ -24,6 +24,26 @@
 #define VK_BIND(slot, group) [[vk::binding(slot, group)]]
 #define VK_COHERENT globallycoherent
 #define PIXEL_TARGET RWStructuredBuffer<uint>
+#if defined(MOTORSTORM_VK_ATOMIC)
+#define PS_INTERLOCK_MODE
+#define PS_INTERLOCK_BEGIN lockPixel(pixel)
+#define PS_INTERLOCK_END unlockPixel(pixel)
+#elif defined(MOTORSTORM_VK_ATTACHMENT)
+[[vk::binding(9, 0)]] [[vk::input_attachment_index(0)]] SubpassInput<uint> attachmentColor;
+[[vk::binding(10, 0)]] [[vk::input_attachment_index(1)]] SubpassInput<uint> attachmentDepth;
+static uint currentColor, currentDepth;
+struct PixelResult { uint color : SV_Target0; uint depth : SV_Target1; };
+#define COLOR_AT(index) currentColor
+#define DEPTH_AT(index) currentDepth
+#define PS_INTERLOCK_MODE
+#define PS_INTERLOCK_BEGIN
+#define PS_INTERLOCK_END
+#elif defined(MOTORSTORM_VK_HARDWARE)
+// Fixed-function pixel shaders. No fragment interlock and no subpass load.
+#define PS_INTERLOCK_MODE
+#define PS_INTERLOCK_BEGIN
+#define PS_INTERLOCK_END
+#else
 [[vk::ext_extension("SPV_EXT_fragment_shader_interlock")]] [[vk::ext_capability(5378)]]
 [[vk::ext_instruction(5364)]] void beginInvocationInterlock();
 [[vk::ext_extension("SPV_EXT_fragment_shader_interlock")]] [[vk::ext_capability(5378)]]
@@ -31,6 +51,7 @@
 #define PS_INTERLOCK_MODE vk::ext_execution_mode(5366)
 #define PS_INTERLOCK_BEGIN beginInvocationInterlock()
 #define PS_INTERLOCK_END endInvocationInterlock()
+#endif
 #else
 #define VK_BIND(slot, group)
 #define VK_COHERENT
@@ -38,6 +59,10 @@
 #define PS_INTERLOCK_MODE
 #define PS_INTERLOCK_BEGIN
 #define PS_INTERLOCK_END
+#endif
+#if !defined(MOTORSTORM_VK_ATTACHMENT)
+#define COLOR_AT(index) colorTarget[index]
+#define DEPTH_AT(index) depthTarget[index]
 #endif
 VK_BIND(0, 0) cbuffer DrawState : register(b0) {
     uint4 commands[64];
@@ -57,6 +82,23 @@ float rasterScale() { return render.x*0.5; }
 uint rasterExtent(uint native) { return native*render.x/2; }
 uint nativeOf(uint raster) { return (2*raster+1)/render.x; }
 VK_BIND(1, 0) VK_COHERENT PIXEL_TARGET colorTarget : register(u0);
+#if defined(MOTORSTORM_VK_ATOMIC)
+[[vk::binding(11, 0)]] globallycoherent RWStructuredBuffer<uint> pixelLocks : register(u6);
+void lockPixel(uint2 pixel) {
+    uint2 clamped = uint2(min(pixel.x, surface.z - 1), min(pixel.y, surface.y - 1));
+    uint index = clamped.y * surface.z + clamped.x;
+    uint seen;
+    [loop] do { InterlockedCompareExchange(pixelLocks[index], 0, 1, seen); } while (seen != 0);
+    AllMemoryBarrier();
+}
+void unlockPixel(uint2 pixel) {
+    AllMemoryBarrier();
+    uint2 clamped = uint2(min(pixel.x, surface.z - 1), min(pixel.y, surface.y - 1));
+    uint index = clamped.y * surface.z + clamped.x;
+    uint seen;
+    InterlockedExchange(pixelLocks[index], 0, seen);
+}
+#endif
 // 16-bit PSP depth in the low half of each word. Bit 16 (kHudTag) is set by
 // through-mode draws (the HUD) while render.w bit 2 is on; the post chain reads
 // it from the depth snapshot to keep the HUD out of the colour grade. Guest
@@ -172,6 +214,15 @@ void PointGS(point Varying inputVertices[1], inout TriangleStream<Varying> outpu
     v=a; v.position.xy=a.position.xy+radius*float2(1,-1); outputVertices.Append(v);
     outputVertices.RestartStrip();
 }
+// One instance per point, six vertices per quad. No geometry stage on mobile.
+Varying PointVS(Input i, uint corner : SV_VertexID) {
+    Varying o=VS(i);
+    static const float2 corners[6]={float2(-1,1),float2(1,1),float2(-1,-1),float2(-1,-1),float2(1,1),float2(1,-1)};
+    float2 radius=rasterScale()/float2(surface.xy)*o.position.w;
+    if(wide.z!=0) radius.x*=wide.x;
+    o.position.xy+=radius*corners[corner];
+    return o;
+}
 bool compare(uint v, uint r, uint f) {
     f &= 7;
     if (f==0) return false; if(f==1) return true;
@@ -202,6 +253,14 @@ uint4 texel(int2 p, uint level) {
     }
     else textureImage.GetDimensions(level,w,h,n);
     p = int2(wrap(p.x,w,(C(0xc7)&1)!=0),wrap(p.y,h,(C(0xc7)&256)!=0));
+    if(feedback.x==3) {
+        uint imageWidth,imageHeight,imageLevels;
+        textureImage.GetDimensions(0,imageWidth,imageHeight,imageLevels);
+        uint stride=max(feedback.z,1);
+        int2 pixel=int2(feedback.y%stride,feedback.y/stride)+p;
+        pixel=clamp(pixel,int2(0,0),int2(max(imageWidth,1),max(imageHeight,1))-1);
+        return uint4(saturate(textureImage.Load(int3(pixel,0)))*255+0.5);
+    }
     if(feedback.x) return bytes(unpackColor(feedbackImage[feedback.y+p.y*feedback.z+p.x],feedback.w));
     return uint4(textureImage.Load(int3(p,level))*255+0.5);
 }
@@ -336,16 +395,16 @@ uint3 factor(uint which, bool source, uint4 s, uint4 d, uint fixedColor) {
 // early return here only skips later writes; nothing returns to PS early.
 void pixelUpdate(uint2 pixel, uint4 s, bool clearing, uint z) {
     uint index = pixel.y*surface.z+pixel.x;
-    uint oldColor = unpackFrame(colorTarget[index]); uint4 d = bytes(oldColor);
+    uint oldColor = unpackFrame(COLOR_AT(index)); uint4 d = bytes(oldColor);
     uint oldStencil = mode.x==0 ? 0 : d.a;
     uint depthIndex = pixel.y*surface.w+pixel.x;
     bool stencil = !clearing && (C(0x24)&1);
     uint alphaMask = (C(0xe9)&255)<<24;
     if(stencil && !compare(((C(0xdc)>>8)&255)&((C(0xdc)>>16)&255),oldStencil&((C(0xdc)>>16)&255),C(0xdc))) {
-        colorTarget[index] = packFrame((oldColor&0xffffff) | ((stencilOp(C(0xdd),oldStencil)<<24)&~alphaMask) | (oldColor&alphaMask)); return;
+        COLOR_AT(index) = packFrame((oldColor&0xffffff) | ((stencilOp(C(0xdd),oldStencil)<<24)&~alphaMask) | (oldColor&alphaMask)); return;
     }
-    if(!clearing && mode.w && (C(0x23)&1) && !compare(z,depthTarget[depthIndex]&0xFFFF,C(0xde))) {
-        if(stencil) colorTarget[index] = packFrame((oldColor&0xffffff) | ((stencilOp(C(0xdd)>>8,oldStencil)<<24)&~alphaMask) | (oldColor&alphaMask));
+    if(!clearing && mode.w && (C(0x23)&1) && !compare(z,DEPTH_AT(depthIndex)&0xFFFF,C(0xde))) {
+        if(stencil) COLOR_AT(index) = packFrame((oldColor&0xffffff) | ((stencilOp(C(0xdd)>>8,oldStencil)<<24)&~alphaMask) | (oldColor&alphaMask));
         return;
     }
     // Soft particles: a billboard that cuts into the scene fades out over the
@@ -354,7 +413,7 @@ void pixelUpdate(uint2 pixel, uint4 s, bool clearing, uint z) {
     if(!clearing && mode.w && (render.w&8)!=0 && (C(0x21)&1) && (C(0x23)&1) && C(0xe7)!=0) {
         uint depthFunction=C(0xde)&7;
         if(depthFunction>=4) {
-            int scene=int(depthTarget[depthIndex]&0xFFFF);
+            int scene=int(DEPTH_AT(depthIndex)&0xFFFF);
             float behind=depthFunction>=6 ? float(int(z)-scene) : float(scene-int(z));
             float fade=saturate(behind/float(max((render.w>>8)&0xFFFF,1u)));
             uint sourceFactor=C(0xdf)&15;
@@ -375,22 +434,41 @@ void pixelUpdate(uint2 pixel, uint4 s, bool clearing, uint z) {
     // frame's depth clear removes it.
     if(mode.w && (clearing ? (C(0xd3)&1024)!=0 : (C(0x23)&1) && C(0xe7)==0)) {
         uint written=z;
-        if(!clearing && (render.w&4)!=0) written|=depthTarget[depthIndex]&kHudTag;
-        depthTarget[depthIndex]=written;
+        if(!clearing && (render.w&4)!=0) written|=DEPTH_AT(depthIndex)&kHudTag;
+        DEPTH_AT(depthIndex)=written;
     }
     // Through-mode draws (no hardware transform) are the HUD in a race. Only pixels the
     // draw visibly changes count (whatever its blend mode): the transparent corners of a
     // HUD quad stay part of the scene.
     if(!clearing && mode.w && mode.y==0 && (render.w&4)!=0) {
         int3 change=abs(int3(s.rgb)-int3(d.rgb));
-        if(max(change.x,max(change.y,change.z))>=8) depthTarget[depthIndex] |= kHudTag;
+        if(max(change.x,max(change.y,change.z))>=8) DEPTH_AT(depthIndex) |= kHudTag;
     }
     if(clearing) { if(!(C(0xd3)&256)) s.rgb=d.rgb; if(!(C(0xd3)&512)) s.a=d.a; }
     else if(stencil) s.a=stencilOp(C(0xdd)>>16,oldStencil);
     uint mask=(C(0xe8)&0xffffff)|alphaMask;
-    colorTarget[index]=packFrame((pack(s)&~mask)|(oldColor&mask));
+    COLOR_AT(index)=packFrame((pack(s)&~mask)|(oldColor&mask));
 }
+#if defined(MOTORSTORM_VK_HARDWARE) && !defined(MOTORSTORM_VK_ATTACHMENT) && !defined(MOTORSTORM_VK_ATOMIC)
+// This translation unit exports the fixed-function entries below. The ordered
+// and interlock pixel shaders stay in their own compiles and still call pixelUpdate().
+#else
+#if defined(MOTORSTORM_VK_ATTACHMENT)
+PixelResult PS(Varying i, bool front : SV_IsFrontFace) {
+#if defined(MOTORSTORM_VK_TRIVIAL)
+    { PixelResult trivial; trivial.color=0xFF808080u; trivial.depth=0; return trivial; }
+#endif
+#if defined(MOTORSTORM_VK_NOREAD)
+    currentColor=0; currentDepth=0;
+#else
+    currentColor=attachmentColor.SubpassLoad();
+    currentDepth=attachmentDepth.SubpassLoad();
+#endif
+#elif defined(MOTORSTORM_VK_ATOMIC)
+float PS(Varying i, bool front : SV_IsFrontFace) : SV_Target0 {
+#else
 void PS(Varying i, bool front : SV_IsFrontFace) {
+#endif
     PS_INTERLOCK_MODE;
     // Tests that need no target pixel come first. A failing pixel still passes
     // through the (Vulkan) interlock once, at the top level, but skips the update.
@@ -398,7 +476,9 @@ void PS(Varying i, bool front : SV_IsFrontFace) {
     bool clearing = (C(0xd3)&1)!=0;
     bool live = all(pixel<surface.xy) && (clearing || !((C(0x1d)&1) && (front != ((C(0x9b)&1)!=0))));
     uint4 s = uint4(clamp(i.color,0,255));
+#if !defined(MOTORSTORM_VK_NOSHADE)
     if(live && !clearing && (C(0x1e)&1)) s = shade(i.uvq.xy/i.uvq.z,s,1/i.position.w);
+#endif
     s.rgb = min(255,s.rgb+uint3(clamp(i.secondary,0,255)));
     if(!clearing && (C(0x22)&1) && !compare(s.a&((C(0xdb)>>16)&255),(C(0xdb)>>8)&((C(0xdb)>>16)&255),C(0xdb))) live = false;
     uint z = uint(clamp(i.depthFog.x,0,65535));
@@ -410,7 +490,224 @@ void PS(Varying i, bool front : SV_IsFrontFace) {
     PS_INTERLOCK_BEGIN;
     if(live) pixelUpdate(pixel, s, clearing, z);
     PS_INTERLOCK_END;
+#if defined(MOTORSTORM_VK_ATTACHMENT)
+    PixelResult result; result.color=currentColor; result.depth=currentDepth; return result;
+#elif defined(MOTORSTORM_VK_ATOMIC)
+    return 0;
+#endif
 }
+#endif
+#if defined(MOTORSTORM_VK_HARDWARE)
+// Window Z in the vertex is noperspective (depthFog.x). Writing it as z*w makes
+// the hardware depth interpolator match that affine window depth. D16 then
+// stores round(z) for an integer window Z in 0..65535.
+Varying VSFast(Input i) {
+    Varying o = VS(i);
+    o.position.z = saturate(o.depthFog.x * (1.0 / 65535.0)) * o.position.w;
+    return o;
+}
+Varying PointVSFast(Input i, uint corner : SV_VertexID) {
+    Varying o = VSFast(i);
+    static const float2 corners[6] = {float2(-1, 1), float2(1, 1), float2(-1, -1), float2(-1, -1), float2(1, 1), float2(1, -1)};
+    float2 radius = rasterScale() / float2(surface.xy) * o.position.w;
+    if (wide.z != 0) radius.x *= wide.x;
+    o.position.xy += radius * corners[corner];
+    return o;
+}
+float4 fastSample(float2 uv) {
+    uint w, h, levels;
+    textureImage.GetDimensions(0, w, h, levels);
+    float2 st = uv / float2(max(w, 1), max(h, 1));
+    bool clampU = (C(0xc7) & 1) != 0, clampV = (C(0xc7) & 256) != 0;
+    // Hardware LOD. SampleLevel(0) kept every distant fragment on the base mip.
+    float4 t;
+    if (clampU && clampV) t = textureImage.Sample(samplerClampClamp, st);
+    else if (clampU) t = textureImage.Sample(samplerClampWrap, st);
+    else if (clampV) t = textureImage.Sample(samplerWrapClamp, st);
+    else t = textureImage.Sample(samplerWrapWrap, st);
+    return saturate(t);
+}
+// A framebuffer texture was copied into feedbackImage before this draw. Read
+// that copy with the ordered shader's texel filter. Not used by PSFast, so the
+// scene entry stays a small sample.
+float4 feedbackColor(int2 p) {
+    uint w = 1u << (C(0xb8) & 15);
+    uint h = 1u << ((C(0xb8) >> 8) & 15);
+    p = int2(wrap(p.x, w, (C(0xc7) & 1) != 0), wrap(p.y, h, (C(0xc7) & 256) != 0));
+    uint stride = max(feedback.z, 1);
+    uint imgW, imgH, levels;
+    textureImage.GetDimensions(0, imgW, imgH, levels);
+    int2 pixel = int2(feedback.y % stride, feedback.y / stride) + p;
+    pixel = clamp(pixel, int2(0, 0), int2(max(imgW, 1), max(imgH, 1)) - 1);
+    return textureImage.Load(int3(pixel, 0));
+}
+float4 fastFeedback(float2 uv, float clipW) {
+    // feedback.x == 3: textureImage is the compact color surface. One load, no pack.
+    if (feedback.x == 3) {
+        bool filterLinear = (C(0xc6) & 257) != 0;
+        if (!filterLinear) return saturate(feedbackColor(int2(floor(uv))));
+        float2 base = uv - 0.5;
+        int2 p = int2(floor(base));
+        float2 f = saturate(base - float2(p));
+        float4 row0 = lerp(feedbackColor(p), feedbackColor(p + int2(1, 0)), f.x);
+        float4 row1 = lerp(feedbackColor(p + int2(0, 1)), feedbackColor(p + int2(1, 1)), f.x);
+        return saturate(lerp(row0, row1, f.y));
+    }
+    if (feedback.x == 2) uv *= rasterScale();
+    uint lodMode = C(0xc8) & 3;
+    float footprint = max(max(abs(ddx_coarse(uv.x)), abs(ddy_coarse(uv.x))),
+                          max(abs(ddx_coarse(uv.y)), abs(ddy_coarse(uv.y))));
+    float delta = lodMode == 0 ? footprint : lodMode == 2 ? 2 * clipW * asfloat(C(0xd0) << 8) : 1;
+    uint bits = asuint(delta);
+    int detail = lodMode == 0 || lodMode == 2
+                     ? (delta > 0 ? (int((bits >> 23) & 255) - 127) * 16 + int((bits >> 19) & 15) : -2048)
+                     : 0;
+    detail += (int(C(0xc8) << 8) >> 24);
+    bool filterLinear = detail > 0 ? (C(0xc6) & 1) != 0 : (C(0xc6) & 256) != 0;
+    return saturate(float4(sampleLevel(uv, 0, filterLinear)) / 255.0);
+}
+float4 fastPixel(Varying i, float4 sampled) {
+    bool clearing = (C(0xd3) & 1) != 0;
+    float4 s = saturate(i.color / 255.0);
+    if (!clearing && (C(0x1e) & 1)) {
+        float4 t = sampled;
+        bool modulateAlpha = (C(0xc9) & 256) != 0;
+        float scale = (C(0xc9) & 65536) ? 2.0 : 1.0;
+        float a = modulateAlpha ? t.a * s.a : s.a;
+        uint function = C(0xc9) & 7;
+        float3 rgb;
+        if (function == 0) rgb = t.rgb * s.rgb * scale;
+        else if (function == 1) rgb = (modulateAlpha ? (t.rgb * t.a + s.rgb * (1 - t.a)) : t.rgb) * scale;
+        else if (function == 2) {
+            float3 env = float3(bytes(C(0xca)).rgb) / 255.0;
+            rgb = (s.rgb * (1 - t.rgb) + env * t.rgb) * scale;
+        } else if (function == 3) {
+            rgb = t.rgb * scale;
+            a = modulateAlpha ? t.a : s.a;
+        } else rgb = (t.rgb + s.rgb) * scale;
+        s = float4(rgb, a);
+    }
+    s.rgb += saturate(i.secondary / 255.0);
+    if (!clearing && (C(0x1f) & 1) && i.depthFog.y < 1) {
+        float fog = saturate(i.depthFog.y);
+        s.rgb = s.rgb * fog + float3(bytes(C(0xcf)).rgb) / 255.0 * (1 - fog);
+    }
+    // The packed PSP path truncates each final channel to an integer byte.
+    return floor(saturate(s) * 255.0) / 255.0;
+}
+// Fast attachment route with the same integer texture, color, secondary,
+// fog, and target-format math as PS. Blending/stencil/feedback stay ordered.
+uint4 fastPixelExact(Varying i) {
+    bool clearing = (C(0xd3) & 1) != 0;
+    uint4 s = uint4(clamp(i.color, 0, 255));
+    if (!clearing && (C(0x1e) & 1))
+        s = shade(i.uvq.xy / i.uvq.z, s, 1.0 / i.position.w);
+    s.rgb = min(255, s.rgb + uint3(clamp(i.secondary, 0, 255)));
+    if (!clearing && (C(0x1f) & 1) && i.depthFog.y < 1) {
+        uint fog = uint(saturate(i.depthFog.y) * 255.0);
+        s.rgb = (s.rgb * fog + bytes(C(0xcf)).rgb * (255 - fog) + 255) >> 8;
+    }
+    return s;
+}
+uint4 fastQuantize(uint4 color) {
+    return bytes(unpackFrame(packFrame(pack(color))));
+}
+// Opaque and blended draws. No discard. Force the depth test before shading so
+// occluded fragments never sample a texture.
+[earlydepthstencil]
+float4 PSFast(Varying i) : SV_Target0 {
+    if ((render.w & 32u) != 0u)
+        return float4(fastQuantize(fastPixelExact(i))) / 255.0;
+    float4 sampled = 1;
+    if ((C(0xd3) & 1) == 0 && (C(0x1e) & 1)) sampled = fastSample(i.uvq.xy / i.uvq.z);
+    return fastPixel(i, sampled);
+}
+// Alpha test only. Kept separate so the opaque pipeline does not discard.
+// Depth-write draws stay late-Z: a discarded pixel must not update depth.
+// Draws that do not write depth can reject occluded pixels before the sample.
+[earlydepthstencil]
+float4 PSFastAlphaEarly(Varying i) : SV_Target0 {
+    if ((render.w & 32u) != 0u) {
+        uint4 exact = fastPixelExact(i);
+        if ((C(0xd3) & 1) == 0 && (C(0x22) & 1)) {
+            uint mask = (C(0xdb) >> 16) & 255;
+            if (!compare(exact.a & mask, ((C(0xdb) >> 8) & 255) & mask, C(0xdb))) discard;
+        }
+        return float4(fastQuantize(exact)) / 255.0;
+    }
+    float4 sampled = 1;
+    if ((C(0xd3) & 1) == 0 && (C(0x1e) & 1)) sampled = fastSample(i.uvq.xy / i.uvq.z);
+    float4 s = fastPixel(i, sampled);
+    if ((C(0xd3) & 1) == 0 && (C(0x22) & 1)) {
+        uint a = uint(saturate(s.a) * 255.0 + 0.5);
+        uint mask = (C(0xdb) >> 16) & 255;
+        if (!compare(a & mask, ((C(0xdb) >> 8) & 255) & mask, C(0xdb))) discard;
+    }
+    return s;
+}
+float4 PSFastAlpha(Varying i) : SV_Target0 {
+    if ((render.w & 32u) != 0u) {
+        uint4 exact = fastPixelExact(i);
+        if ((C(0xd3) & 1) == 0 && (C(0x22) & 1)) {
+            uint mask = (C(0xdb) >> 16) & 255;
+            if (!compare(exact.a & mask, ((C(0xdb) >> 8) & 255) & mask, C(0xdb))) discard;
+        }
+        return float4(fastQuantize(exact)) / 255.0;
+    }
+    float4 sampled = 1;
+    if ((C(0xd3) & 1) == 0 && (C(0x1e) & 1)) sampled = fastSample(i.uvq.xy / i.uvq.z);
+    float4 s = fastPixel(i, sampled);
+    if ((C(0xd3) & 1) == 0 && (C(0x22) & 1)) {
+        uint a = uint(saturate(s.a) * 255.0 + 0.5);
+        uint mask = (C(0xdb) >> 16) & 255;
+        if (!compare(a & mask, ((C(0xdb) >> 8) & 255) & mask, C(0xdb))) discard;
+    }
+    return s;
+}
+// Same fixed-function depth and blend, sampling the feedback copy.
+[earlydepthstencil]
+float4 PSFastFeedback(Varying i) : SV_Target0 {
+    return float4(fastQuantize(fastPixelExact(i))) / 255.0;
+}
+float4 PSFastAlphaFeedback(Varying i) : SV_Target0 {
+    uint4 s = fastPixelExact(i);
+    if ((C(0xd3) & 1) == 0 && (C(0x22) & 1)) {
+        uint a = s.a;
+        uint mask = (C(0xdb) >> 16) & 255;
+        if (!compare(a & mask, ((C(0xdb) >> 8) & 255) & mask, C(0xdb))) discard;
+    }
+    return float4(fastQuantize(s)) / 255.0;
+}
+struct LoadResult { float4 color : SV_Target0; float depth : SV_Depth; };
+// Copies the packed R32 buffers into the compact color attachment and the real
+// depth attachment when a hardware draw follows an ordered draw.
+LoadResult PSLoad(Varying i) {
+    uint2 pixel = uint2(i.position.xy);
+    LoadResult result;
+    result.color = 0;
+    result.depth = 0;
+    if (any(pixel >= surface.xy)) return result;
+    uint4 c = bytes(unpackFrame(colorTarget[pixel.y * surface.z + pixel.x]));
+    result.color = float4(c) / 255.0;
+    result.depth = float(depthTarget[pixel.y * surface.w + pixel.x] & 0xFFFF) / 65535.0;
+    return result;
+}
+VK_BIND(12, 0) ByteAddressBuffer hwDepthBits : register(t6);
+[numthreads(8, 8, 1)]
+void PackColorCS(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= surface.xy)) return;
+    uint4 c = uint4(saturate(textureImage.Load(int3(id.xy, 0))) * 255.0 + 0.5);
+    colorTarget[id.y * surface.z + id.x] = packFrame(pack(min(c, 255)));
+}
+[numthreads(8, 8, 1)]
+void PackDepthCS(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= surface.xy)) return;
+    uint i = id.y * surface.w + id.x;
+    uint pair = hwDepthBits.Load((i & ~1u) * 2u);
+    uint z = (i & 1u) ? (pair >> 16) : (pair & 0xFFFF);
+    depthTarget[i] = z;
+}
+#endif
 // Direct swapchain presentation reads the GE's resident packed framebuffer.
 VK_BIND(4, 0) StructuredBuffer<uint> presentColor : register(t1);
 VK_BIND(6, 0) RWStructuredBuffer<uint> computeOutput : register(u2);
@@ -429,6 +726,10 @@ void ResolveCS(uint3 id : SV_DispatchThreadID) {
     // The raster pixels whose centres lie inside this native pixel.
     uint2 base=uint2(rasterExtent(id.x),rasterExtent(id.y));
     uint2 size=uint2(rasterExtent(id.x+1),rasterExtent(id.y+1))-base;
+    // A raster below native resolution covers some native pixels with no
+    // raster centre: use the covering raster pixel instead.
+    base=min(base,uint2(surface.z,rasterExtent(surface.y))-1);
+    size=max(size,1);
     uint center=presentColor[(base.y+size.y/2)*surface.z+base.x+size.x/2];
     if(mode.x==4) { computeOutput[id.y*surface.x+id.x]=center; return; }
     uint4 total=0;
@@ -457,6 +758,12 @@ float3 outputPixel(int2 p) {
         return sum/(255.0*max(weight,1e-6));
     }
     uint ratio=render.x/(2*render.y);
+    if(ratio*2*render.y!=render.x) {
+        // Android dynamic resolution: the raster can be smaller than (or not a
+        // whole multiple of) the output grid. Sample the covering raster pixel.
+        int2 q=min(int2((float2(p)+0.5)*rasterScale()/float(render.y)),int2(surface.z,rasterExtent(surface.y))-1);
+        return channels(unpackFrame(presentColor[q.y*surface.z+q.x])).rgb/255;
+    }
     uint2 base=uint2(p)*ratio;
     if(render.z==2) {
         float3 sum=0;
@@ -499,10 +806,126 @@ void CaptureCS(uint3 id : SV_DispatchThreadID) {
 struct PresentVarying { float4 position : SV_Position; float2 uv : TEXCOORD0; };
 PresentVarying PresentVS(uint id : SV_VertexID) {
     PresentVarying o; o.uv=float2((id<<1)&2,id&2);
-    o.position=float4(o.uv*float2(2,-2)+float2(-1,1),0,1); return o;
+    o.position=float4(o.uv*float2(2,-2)+float2(-1,1),0,1);
+#if defined(MOTORSTORM_VK_ATTACHMENT)
+    if(mode.y==2) o.uv=float2(o.uv.y,1-o.uv.x);
+    else if(mode.y==4) o.uv=1-o.uv;
+    else if(mode.y==8) o.uv=float2(1-o.uv.y,o.uv.x);
+#endif
+    return o;
 }
+#if defined(MOTORSTORM_VK_ATTACHMENT)
+// SGSR 1 (BSD-3-Clause, Qualcomm). Spatial, single pass, RGBA mode.
+// Samples the GE colour buffer instead of a texture gather. EdgeSharpness is
+// ViewportInfo.x (1..2). The HUD test below runs after this upscale.
+float sgsrFastLanczos2(float x) {
+    float wA = x - 4.0;
+    float wB = x * wA - wA;
+    wA *= wA;
+    return wB * wA;
+}
+float2 sgsrWeight(float dx, float dy, float c, float stddev) {
+    float x = ((dx * dx) + (dy * dy)) * 0.5 + clamp(abs(c) * stddev, 0.0, 1.0);
+    float w = sgsrFastLanczos2(x);
+    return float2(w, w * c);
+}
+float sgsrLuma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
+// Present source pixels: the raster itself, whatever its scale relative to
+// the output grid (dynamic resolution moves it in half-pixel steps).
+int2 rasterSize() { return int2(rasterExtent(surface.x), rasterExtent(surface.y)); }
+// render.w bit 4: the frame was converted to an RGBA8 texture (PresentConvertCS)
+// and is read through the texture cache with hardware filtering.
+bool presentTexture() { return (render.w & 16u) != 0; }
+float3 rasterPixel(int2 p) {
+    p = clamp(p, 0, rasterSize() - 1);
+    if (presentTexture()) return textureImage.Load(int3(p, 0)).rgb;
+    return channels(unpackFrame(presentColor[p.y * surface.z + p.x])).rgb / 255;
+}
+float3 rasterLinear(float2 uv) {
+    if (presentTexture()) return textureImage.SampleLevel(samplerClampClamp, uv, 0).rgb;
+    float2 pos = uv * float2(rasterSize()) - 0.5;
+    int2 lo = int2(floor(pos));
+    float2 f = pos - floor(pos);
+    return lerp(lerp(rasterPixel(lo), rasterPixel(lo + int2(1, 0)), f.x),
+                lerp(rasterPixel(lo + int2(0, 1)), rasterPixel(lo + 1), f.x), f.y);
+}
+float3 sgsr1(float2 uv, float sharpness) {
+    float3 pix = rasterLinear(uv);
+    float2 imgCoord = uv * float2(rasterSize()) + float2(-0.5, 0.5);
+    float2 imgCoordPixel = floor(imgCoord);
+    float2 pl = imgCoord - imgCoordPixel;
+    int2 base = int2(imgCoordPixel);
+    // Qualcomm's HLSL gather order is lower-left, lower-right, upper-right,
+    // upper-left. These loads reproduce its four gather locations.
+    float leftX = sgsrLuma(rasterPixel(base + int2(-1, 0)));
+    float leftY = sgsrLuma(rasterPixel(base));
+    float leftZ = sgsrLuma(rasterPixel(base + int2(0, -1)));
+    float leftW = sgsrLuma(rasterPixel(base + int2(-1, -1)));
+    float center = sgsrLuma(pix);
+    float edgeVote = abs(leftZ - leftY) + abs(center - leftY) + abs(center - leftZ);
+    if (edgeVote <= 8.0 / 255.0) return pix;
+    float rightX = sgsrLuma(rasterPixel(base + int2(1, 0)));
+    float rightY = sgsrLuma(rasterPixel(base + int2(2, 0)));
+    float rightZ = sgsrLuma(rasterPixel(base + int2(2, -1)));
+    float rightW = sgsrLuma(rasterPixel(base + int2(1, -1)));
+    float upX = sgsrLuma(rasterPixel(base + int2(0, -2)));
+    float upY = sgsrLuma(rasterPixel(base + int2(1, -2)));
+    float downZ = sgsrLuma(rasterPixel(base + int2(1, 1)));
+    float downW = sgsrLuma(rasterPixel(base + int2(0, 1)));
+    float mean = (leftY + leftZ + rightX + rightW) * 0.25;
+    float sum = abs(leftX - mean) + abs(leftY - mean) + abs(leftZ - mean) + abs(leftW - mean) +
+                abs(rightX - mean) + abs(rightY - mean) + abs(rightZ - mean) + abs(rightW - mean) +
+                abs(upX - mean) + abs(upY - mean) + abs(downZ - mean) + abs(downW - mean);
+    float sumMean = 10.14185 / max(sum, 1e-5);
+    float stddev = sumMean * sumMean;
+    float2 acc = sgsrWeight(pl.x, pl.y + 1.0, upX - mean, stddev);
+    acc += sgsrWeight(pl.x - 1.0, pl.y + 1.0, upY - mean, stddev);
+    acc += sgsrWeight(pl.x - 1.0, pl.y - 2.0, downZ - mean, stddev);
+    acc += sgsrWeight(pl.x, pl.y - 2.0, downW - mean, stddev);
+    acc += sgsrWeight(pl.x + 1.0, pl.y - 1.0, leftX - mean, stddev);
+    acc += sgsrWeight(pl.x, pl.y - 1.0, leftY - mean, stddev);
+    acc += sgsrWeight(pl.x, pl.y, leftZ - mean, stddev);
+    acc += sgsrWeight(pl.x + 1.0, pl.y, leftW - mean, stddev);
+    acc += sgsrWeight(pl.x - 1.0, pl.y - 1.0, rightX - mean, stddev);
+    acc += sgsrWeight(pl.x - 2.0, pl.y - 1.0, rightY - mean, stddev);
+    acc += sgsrWeight(pl.x - 2.0, pl.y, rightZ - mean, stddev);
+    acc += sgsrWeight(pl.x - 1.0, pl.y, rightW - mean, stddev);
+    float finalY = acc.x != 0.0 ? acc.y / acc.x : 0.0;
+    float max4 = max(max(leftY, leftZ), max(rightX, rightW)) - mean;
+    float min4 = min(min(leftY, leftZ), min(rightX, rightW)) - mean;
+    finalY = clamp(sharpness * finalY, min4, max4);
+    float delta = finalY - (center - mean);
+    return saturate(pix + delta);
+}
+VK_BIND(2, 0) StructuredBuffer<uint> presentDepth : register(t2);
+#endif
+#if defined(MOTORSTORM_VK_ATTACHMENT)
+// The displayed raster as RGBA8 words (R in the low byte), once per frame, so
+// the full-screen present reads a texture instead of the packed GE buffer.
+[numthreads(8,8,1)]
+void PresentConvertCS(uint3 id : SV_DispatchThreadID) {
+    uint2 size = uint2(rasterExtent(surface.x), rasterExtent(surface.y));
+    if (any(id.xy >= size)) return;
+    uint4 c = uint4(channels(unpackFrame(presentColor[id.y * surface.z + id.x])));
+    computeOutput[id.y * size.x + id.x] = c.r | (c.g << 8) | (c.b << 16) | 0xFF000000u;
+}
+#endif
 float4 PresentPS(PresentVarying i) : SV_Target {
+#if defined(MOTORSTORM_VK_ATTACHMENT)
+    // mode.z = 1 runs SGSR 1. mode.w = 1 means the depth snapshot is bound.
+    // uvRange.x is EdgeSharpness. HUD-tagged pixels are composited after the
+    // upscale with a nearest sample, so text stays sharp.
+    uint2 extent = max(surface.xy * render.y, 1);
+    uint2 p = min(uint2(i.uv * float2(extent)), extent - 1);
+    bool hud = mode.w != 0 && (presentDepth[p.y * extent.x + p.x] & 0x10000u) != 0;
+    float3 color = hud ? rasterPixel(int2(i.uv * float2(rasterSize())))
+                       : mode.z != 0 ? sgsr1(i.uv, uvRange.x)
+                       : presentTexture() && render.z != 1 ? rasterLinear(i.uv)
+                                                            : displayShade(i.uv);
+    return float4(color, 1);
+#else
     return float4(displayShade(i.uv),1);
+#endif
 }
 
 // GPU texture decoding. presentColor holds the raw PSP texture bytes of one
