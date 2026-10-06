@@ -609,6 +609,16 @@ uint4 fastPixelExact(Varying i) {
     }
     return s;
 }
+// Alpha test and color test on the exact integer color, as PS does them
+// (the color test reads only the incoming fragment color, never the target).
+bool fastRejects(uint4 s) {
+    if ((C(0xd3) & 1) != 0) return false;
+    if ((C(0x22) & 1)) {
+        uint mask = (C(0xdb) >> 16) & 255;
+        if (!compare(s.a & mask, ((C(0xdb) >> 8) & 255) & mask, C(0xdb))) return true;
+    }
+    return (C(0x27) & 1) && !compare(pack(s) & (C(0xda) & 0xffffff), C(0xd9) & C(0xda), C(0xd8) & 3);
+}
 uint4 fastQuantize(uint4 color) {
     return bytes(unpackFrame(packFrame(pack(color))));
 }
@@ -629,10 +639,7 @@ float4 PSFast(Varying i) : SV_Target0 {
 float4 PSFastAlphaEarly(Varying i) : SV_Target0 {
     if ((render.w & 32u) != 0u) {
         uint4 exact = fastPixelExact(i);
-        if ((C(0xd3) & 1) == 0 && (C(0x22) & 1)) {
-            uint mask = (C(0xdb) >> 16) & 255;
-            if (!compare(exact.a & mask, ((C(0xdb) >> 8) & 255) & mask, C(0xdb))) discard;
-        }
+        if (fastRejects(exact)) discard;
         return float4(fastQuantize(exact)) / 255.0;
     }
     float4 sampled = 1;
@@ -648,10 +655,7 @@ float4 PSFastAlphaEarly(Varying i) : SV_Target0 {
 float4 PSFastAlpha(Varying i) : SV_Target0 {
     if ((render.w & 32u) != 0u) {
         uint4 exact = fastPixelExact(i);
-        if ((C(0xd3) & 1) == 0 && (C(0x22) & 1)) {
-            uint mask = (C(0xdb) >> 16) & 255;
-            if (!compare(exact.a & mask, ((C(0xdb) >> 8) & 255) & mask, C(0xdb))) discard;
-        }
+        if (fastRejects(exact)) discard;
         return float4(fastQuantize(exact)) / 255.0;
     }
     float4 sampled = 1;
@@ -671,11 +675,7 @@ float4 PSFastFeedback(Varying i) : SV_Target0 {
 }
 float4 PSFastAlphaFeedback(Varying i) : SV_Target0 {
     uint4 s = fastPixelExact(i);
-    if ((C(0xd3) & 1) == 0 && (C(0x22) & 1)) {
-        uint a = s.a;
-        uint mask = (C(0xdb) >> 16) & 255;
-        if (!compare(a & mask, ((C(0xdb) >> 8) & 255) & mask, C(0xdb))) discard;
-    }
+    if (fastRejects(s)) discard;
     return float4(fastQuantize(s)) / 255.0;
 }
 struct LoadResult { float4 color : SV_Target0; float depth : SV_Depth; };

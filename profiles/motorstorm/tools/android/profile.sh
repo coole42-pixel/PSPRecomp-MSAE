@@ -15,7 +15,7 @@ repo=$(cd "$(dirname "$0")/../../../.." && pwd)
 out=$repo/out/android/perf; mkdir -p "$out"
 adb shell am force-stop $package
 adb shell rm -f $files/race-benchmark.txt
-adb shell am start -n $package/.GameActivity --ei bench_seconds 90 --ei resolution "$resolution" >/dev/null
+adb shell am start -n $package/.GameActivity --ei bench_seconds 90 --ei resolution "$resolution" --es scale_mode off >/dev/null
 for _ in $(seq 1 120); do
     sleep 5
     guest=$(adb shell "grep HEARTBEAT $files/MotorStormAndroid.log | tail -1" | sed -n 's/.*guest_us=\([0-9]*\).*/\1/p')

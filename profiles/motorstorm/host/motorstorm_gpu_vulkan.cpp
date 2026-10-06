@@ -3900,6 +3900,11 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
                 return !(text && std::strcmp(text, "0") == 0);
             }();
             facts.wide_blends = wide_blends;
+            static const bool hardware_color_test = [] {
+                const char *text = std::getenv("PSPRECOMP_MOTORSTORM_HW_COLOR_TEST");
+                return !(text && std::strcmp(text, "0") == 0);
+            }();
+            facts.hardware_color_test = hardware_color_test;
             pixel_route = classify_ge_draw(draw.commands.data(), facts);
             if (pixel_route.hardware && (color.raster_stride() != depth->raster_stride() ||
                                          color.raster_height() != depth->raster_height()))

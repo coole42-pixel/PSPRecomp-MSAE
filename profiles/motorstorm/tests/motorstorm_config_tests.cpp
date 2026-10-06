@@ -177,9 +177,13 @@ int main() {
             const auto color_test = classify_ge_draw(commands.data(), facts);
             std::printf("ff color-test: hardware=%d entry=%s format=%s\n", color_test.hardware ? 1 : 0, color_test.fragment_entry,
                         motorstorm::compact_color_format_name(color_test.color_format));
-            check(!color_test.hardware && color_test.color_format == CompactColorFormat::PackedR32Uint &&
-                      std::string(color_test.fragment_entry) == "PS",
-                  "color test stays on the ordered attachment path");
+            check(color_test.hardware && color_test.state.alpha_discard && color_test.exact_pixel &&
+                      std::string(color_test.fragment_entry) == "PSFastAlpha" && !color_test.runs_pixel_update,
+                  "the color test runs in the exact discard entry on the attachment path");
+            facts.hardware_color_test = false;
+            check(!classify_ge_draw(commands.data(), facts).hardware,
+                  "without the hardware color test it stays on the ordered attachment path");
+            facts.hardware_color_test = true;
 
             commands[0x27] = 0u;
             commands[0x24] = 1u;

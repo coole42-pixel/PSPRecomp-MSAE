@@ -72,6 +72,8 @@ struct PixelFeatures {
 //   Equations ADD, SUBTRACT, REVERSE_SUBTRACT, MIN and MAX. The attachment
 //   result can differ from the PSP's two truncated integer products by one
 //   channel value. PSP alpha is copied from the source (ONE/ZERO/ADD).
+// - Color test (0x27): it compares the fragment's own color, so the discard
+//   entry runs it on the exact integer color (exact_pixel).
 // - Alpha test (0x22). ALWAYS stays on PSFast so opaque early-Z is intact.
 //   Any other function is PSFastAlpha, which discards. The discard is not in
 //   the opaque shader.
@@ -84,7 +86,7 @@ struct PixelFeatures {
 //   dest alpha (factors 6-9, the clamped 2*alpha product) and the absolute
 //   difference equation (5). Those read the destination color in the shader.
 // - Blends on 16-bit targets.
-// - Color test (0x27), stencil test (0x24). Stencil lives in framebuffer alpha.
+// - Stencil test (0x24). Stencil lives in framebuffer alpha.
 // - A keep-mask that is neither all-keep nor all-write inside a channel.
 // - Two different fixed blend colors that are not inverses of each other.
 // - Live framebuffer reads without a valid snapshot, soft-particle depth fade,
@@ -118,6 +120,8 @@ struct GeDrawFacts {
     // Every 8888 blend Vulkan can express takes the hardware route, not only
     // source-alpha/one-minus-source-alpha (PSPRECOMP_MOTORSTORM_HW_BLENDS=0).
     bool wide_blends{true};
+    // Color-tested draws take the hardware route (PSPRECOMP_MOTORSTORM_HW_COLOR_TEST=0).
+    bool hardware_color_test{true};
 };
 
 struct HardwarePixelState {
@@ -166,7 +170,12 @@ struct DrawPixelRoute {
     if (facts.raster_half != 2u || facts.feedback || facts.soft_particles || facts.hud_tag ||
         facts.extended_color)
         return reject();
-    if (!clearing && ((command(0x27) & 1u) != 0u || (command(0x24) & 1u) != 0u))
+    if (!clearing && (command(0x24) & 1u) != 0u)
+        return reject();
+    // The color test reads only the fragment's own color: the discard shader
+    // runs it on the exact integer color, like the ordered shader.
+    const bool color_test = !clearing && (command(0x27) & 1u) != 0u;
+    if (color_test && !facts.hardware_color_test)
         return reject();
 
     const bool write_color = !clearing || (command(0xD3) & 0x100u) != 0u;
@@ -268,11 +277,11 @@ struct DrawPixelRoute {
     if (!clearing && cull_primitive && (command(0x1D) & 1u) != 0u)
         hw.cull_mode = (command(0x9B) & 1u) != 0u ? 0x02 : 0x01; // back : front
     const std::uint32_t alpha_func = command(0xDB) & 7u;
-    hw.alpha_discard = !clearing && (command(0x22) & 1u) != 0u && alpha_func != 1u;
+    hw.alpha_discard = (!clearing && (command(0x22) & 1u) != 0u && alpha_func != 1u) || color_test;
 
     DrawPixelRoute route;
     route.hardware = true;
-    route.exact_pixel = facts.format != 3u || facts.feedback_snapshot || facts.enhanced_filtering ||
+    route.exact_pixel = color_test || facts.format != 3u || facts.feedback_snapshot || facts.enhanced_filtering ||
                         facts.texture_replacement ||
                         (!clearing && (command(0x1E) & 1u) != 0u && !facts.simple_texture_filter);
     route.state = hw;
