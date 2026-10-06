@@ -423,7 +423,7 @@ constexpr UINT64 kDefaultChunkDraws = 128u;
 UINT present_height_limit() {
     static const UINT value = [] {
         const char *text = std::getenv("PSPRECOMP_MOTORSTORM_PRESENT_HEIGHT");
-        return text ? static_cast<UINT>(std::strtoul(text, nullptr, 0)) : 1080u;
+        return text ? static_cast<UINT>(std::strtoul(text, nullptr, 0)) : 0u;
     }();
     return value >= 272u ? value : 0u;
 }
@@ -4656,12 +4656,11 @@ bool create_swapchain(State &s) {
     if (caps.currentExtent.width != 0xFFFFFFFFu)
         extent = caps.currentExtent;
 #if defined(__ANDROID__)
-    // Phone and tablet panels are 1440-1600 pixels on the short side. The
-    // present pass (SGSR upscale and post effects) costs per output pixel and
-    // shares the GE queue, so render it at most this tall and let the display
-    // compositor scale the buffer to the panel (Android scales a swapchain
-    // whose extent differs from the window). PSPRECOMP_MOTORSTORM_PRESENT_HEIGHT
-    // sets the short side; 0 keeps the native panel size.
+    // PSPRECOMP_MOTORSTORM_PRESENT_HEIGHT=<lines> renders the present pass
+    // (SGSR upscale, post effects) at most that tall and lets the display
+    // compositor scale it to the panel. Off by default: on a Snapdragon 8
+    // Gen 3 a 1080-line swapchain on a 1440-line panel raced 9% slower than
+    // native, as the compositor then scales on the same GPU.
     limit_to_present(extent.width, extent.height);
 #endif
     extent.width = std::clamp(extent.width, caps.minImageExtent.width, caps.maxImageExtent.width);
