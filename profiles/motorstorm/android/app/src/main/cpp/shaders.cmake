@@ -13,7 +13,7 @@ foreach(shader IN ITEMS VS:VS:vs_6_0:flip VSPoint:VS:vs_6_0:none PointVS:PointVS
     DecodeTargetCS:DecodeTargetCS:cs_6_0:none PostResolveCS:PostResolveCS:cs_6_0:none
     DebandCS:DebandCS:cs_6_0:none PostCaptureCS:PostCaptureCS:cs_6_0:none PostColorCS:PostColorCS:cs_6_0:none
     PostColorCaptureCS:PostColorCaptureCS:cs_6_0:none DepthResolveCS:DepthResolveCS:cs_6_0:none
-    PresentConvertCS:PresentConvertCS:cs_6_0:none)
+    PresentConvertCS:PresentConvertCS:cs_6_0:none VertexBatchCS:VertexBatchCS:cs_6_0:none)
     string(REPLACE ":" ";" parts "${shader}")
     list(GET parts 0 name)
     list(GET parts 1 entry)

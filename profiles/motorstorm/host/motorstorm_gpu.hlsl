@@ -1013,17 +1013,18 @@ static const uint kVCount = 0, kVPrim = 1, kVFlags = 2, kVStride = 3, kVMorphs =
     kVLights = 157, kVLightWords = 32;
 // word 0: vertices to decode; flags: 4 lighting, 8 reverse normal, 16 separate specular
 static uint gLimit;  // read bound of the current job (bytes)
-uint vword(uint i) { return i*4 < gLimit ? presentColor[i] : 0; }
+static uint gJob;    // first word of the current job in presentColor (VertexBatchCS)
+uint vword(uint i) { return i*4 < gLimit ? presentColor[gJob+i] : 0; }
 float vfloat(uint i) { return asfloat(vword(i)); }
 uint typeStep(uint type) { return type == 0 ? 0 : 1u << (type - 1); }
 // Every read is bounded by the job's size (word 15): root views are unchecked.
-uint vbyte(uint off) { return off < gLimit ? (presentColor[off>>2] >> ((off&3)*8)) & 255 : 0; }
+uint vbyte(uint off) { return off < gLimit ? (presentColor[gJob+(off>>2)] >> ((off&3)*8)) & 255 : 0; }
 uint vhalf(uint off) {
-    if((off&1) == 0 && off+2 <= gLimit) return (presentColor[off>>2] >> ((off&2)*8)) & 0xFFFF;
+    if((off&1) == 0 && off+2 <= gLimit) return (presentColor[gJob+(off>>2)] >> ((off&2)*8)) & 0xFFFF;
     return vbyte(off) | (vbyte(off+1)<<8);
 }
 uint vword32(uint off) {
-    if((off&3) == 0 && off+4 <= gLimit) return presentColor[off>>2];
+    if((off&3) == 0 && off+4 <= gLimit) return presentColor[gJob+(off>>2)];
     return vhalf(off) | (vhalf(off+2)<<16);
 }
 float signedValue(uint at, uint type) {
@@ -1190,8 +1191,20 @@ DecodedVertex decodeVertex(uint element) {
     return result;
 }
 // One thread per input vertex (word 0: count); the draw expands strips/fans.
+void storeVertex(uint base, DecodedVertex self) {
+    computeOutput[base+0] = asuint(self.position.x);
+    computeOutput[base+1] = asuint(self.position.y);
+    computeOutput[base+2] = asuint(self.position.z);
+    computeOutput[base+3] = self.color;
+    computeOutput[base+4] = self.secondary;
+    computeOutput[base+5] = asuint(self.u);
+    computeOutput[base+6] = asuint(self.v);
+    computeOutput[base+7] = asuint(1.0);
+    computeOutput[base+8] = asuint(1.0);
+}
 [numthreads(64,1,1)]
 void VertexCS(uint3 id : SV_DispatchThreadID) {
+    gJob = 0;
     gLimit = presentColor[15];
     if(id.x >= presentColor[0]) return;
     DecodedVertex self = decodeVertex(id.x);
@@ -1267,6 +1280,21 @@ void DepthResolveCS(uint3 id : SV_DispatchThreadID) {
 // filtering blends around HUD shapes stays ungraded too.
 // The depth snapshot (t5) and the other per-frame post inputs.
 VK_BIND(8, 0) StructuredBuffer<uint> depthSnapshot : register(t5);
+// Every VertexCS job of a submission in one dispatch (Android). Tiny
+// per-draw dispatches each paid the GPU's fixed dispatch cost. depthSnapshot
+// holds four words per workgroup: the job's first word in presentColor (the
+// whole upload buffer), its first output word, its vertex count and the
+// group's first vertex. Each job decodes exactly as in VertexCS.
+[numthreads(64,1,1)]
+void VertexBatchCS(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
+    uint4 entry = uint4(depthSnapshot[group.x*4], depthSnapshot[group.x*4+1], depthSnapshot[group.x*4+2],
+                        depthSnapshot[group.x*4+3]);
+    uint vertex = entry.w + local.x;
+    if(vertex >= entry.z) return;
+    gJob = entry.x;
+    gLimit = presentColor[gJob+15];
+    storeVertex(entry.y + vertex*9, decodeVertex(vertex));
+}
 float hudMask(int2 p) {
     if((C(0)&64)==0) return 0;
     uint2 e=postExtent();

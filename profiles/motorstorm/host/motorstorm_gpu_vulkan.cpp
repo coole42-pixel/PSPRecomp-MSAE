@@ -99,6 +99,7 @@ std::atomic<std::uint64_t> output_size{(480ull << 32) | 272u};
 #include "motorstorm_spirv_PSTrivial.h"
 #include "motorstorm_spirv_PSNoShade.h"
 #include "motorstorm_spirv_PresentConvertCS.h"
+#include "motorstorm_spirv_VertexBatchCS.h"
 #include "motorstorm_spirv_VSFast.h"
 #include "motorstorm_spirv_PointVSFast.h"
 #include "motorstorm_spirv_PSFast.h"
@@ -439,6 +440,15 @@ void limit_to_present(UINT &width, UINT &height) {
     height = scaled(height);
 }
 #endif
+// PSPRECOMP_MOTORSTORM_VERTEX_BATCH=0 dispatches VertexCS once per draw (as
+// before) instead of once per submission. Android only.
+[[maybe_unused]] bool vertex_batching() {
+    static const bool value = [] {
+        const char *text = std::getenv("PSPRECOMP_MOTORSTORM_VERTEX_BATCH");
+        return !(text && std::strcmp(text, "0") == 0);
+    }();
+    return value;
+}
 UINT command_slot_count() {
     static const UINT value = [] {
         const char *text = std::getenv("PSPRECOMP_MOTORSTORM_GPU_COMMAND_SLOTS");
@@ -564,6 +574,9 @@ struct State {
     VkCommandBuffer cmd{};
     UINT slot_index{};
     UINT ge_slot{};  // last GE chunk slot; lists continue the rotation from it
+    // VertexBatchCS workgroups of the recording chunk: {job word, output word,
+    // vertex count, first vertex} each; dispatched once in submit_chunk.
+    std::vector<std::uint32_t> vertex_groups;
     UINT64 frame_fence{}, chunk_draws{};
     UINT64 readback_fence{}, arena_fence{};
     // The upload and vertex arenas alternate between two halves (see begin()).
@@ -614,7 +627,7 @@ struct State {
     Surface *hw_pass_color{}, *hw_pass_depth{};
 #endif
     VkPipeline expand_pipeline{}, resolve_pipeline{}, capture_pipeline{}, decode_pipeline{}, mip_pipeline{},
-        vertex_pipeline{}, decode_target_pipeline{}, post_resolve_pipeline{}, deband_pipeline{},
+        vertex_pipeline{}, vertex_batch_pipeline{}, decode_target_pipeline{}, post_resolve_pipeline{}, deband_pipeline{},
         post_capture_pipeline{}, post_color_pipeline{}, post_color_capture_pipeline{}, depth_resolve_pipeline{},
         present_convert_pipeline{};
     // Swapchain pipelines, created for the swapchain's format.
@@ -865,6 +878,7 @@ struct State {
         }
         for (VkPipeline pipeline : {list_pipeline, strip_pipeline, line_pipeline, point_pipeline, expand_pipeline,
                                     resolve_pipeline, capture_pipeline, decode_pipeline, mip_pipeline, vertex_pipeline,
+                                    vertex_batch_pipeline,
                                     decode_target_pipeline, post_resolve_pipeline, deband_pipeline,
                                     post_capture_pipeline, post_color_pipeline, post_color_capture_pipeline,
                                     depth_resolve_pipeline, present_pipeline, post_present_pipeline})
@@ -1223,9 +1237,26 @@ void begin(State &s, UINT slot = UINT_MAX) {
     open_chunk(s, slot);
 }
 // Close and submit the recording chunk without waiting for it.
+UINT64 allocate(State &s, UINT64 bytes, UINT64 alignment);
+void push_compute(State &s, VkCommandBuffer cmd, View constants, View source, View destination, View depth = {});
 void submit_chunk(State &s) {
     end_rendering(s);
     CommandSlot &chunk = s.slots[s.slot_index];
+    if (s.pre_open && !s.vertex_groups.empty()) {
+        // One VertexBatchCS dispatch for every job of the chunk, in pieces
+        // within the dispatch size limit (and storage offset alignment).
+        constexpr std::size_t kGroupsPerDispatch = 32768u;
+        const std::size_t groups = s.vertex_groups.size() / 4u;
+        const auto table = allocate(s, s.vertex_groups.size() * 4u, 256);
+        std::memcpy(s.mapped + table, s.vertex_groups.data(), s.vertex_groups.size() * 4u);
+        vkCmdBindPipeline(chunk.pre, VK_PIPELINE_BIND_POINT_COMPUTE, s.vertex_batch_pipeline);
+        for (std::size_t first = 0; first < groups; first += kGroupsPerDispatch) {
+            push_compute(s, chunk.pre, {}, {s.upload.buffer, 0}, {s.vertex_arena.buffer, 0},
+                         {s.upload.buffer, table + first * 16u});
+            vkCmdDispatch(chunk.pre, static_cast<UINT>(std::min(kGroupsPerDispatch, groups - first)), 1, 1);
+        }
+        s.vertex_groups.clear();
+    }
     // Readback copies become host-visible, and the next submission on this
     // queue observes everything written here.
     memory_barrier(s.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
@@ -1301,7 +1332,7 @@ VkWriteDescriptorSet image_write(UINT binding, const VkDescriptorImageInfo *info
     return write;
 }
 // Compute bindings: constants (b0), source (t1), destination (u2), depth snapshot (t5).
-void push_compute(State &s, VkCommandBuffer cmd, View constants, View source, View destination, View depth = {}) {
+void push_compute(State &s, VkCommandBuffer cmd, View constants, View source, View destination, View depth) {
     const VkDescriptorBufferInfo infos[]{
         {constants.buffer ? constants.buffer : s.upload.buffer, constants.offset, sizeof(Constants)},
         {source.buffer ? source.buffer : s.upload.buffer, source.offset, VK_WHOLE_SIZE},
@@ -2002,6 +2033,7 @@ const Spirv &spirv(std::string_view name) {
         MOTORSTORM_SPIRV(PSTrivial),
         MOTORSTORM_SPIRV(PSNoShade),
         MOTORSTORM_SPIRV(PresentConvertCS),
+        MOTORSTORM_SPIRV(VertexBatchCS),
         MOTORSTORM_SPIRV(VSFast),
         MOTORSTORM_SPIRV(PointVSFast),
         MOTORSTORM_SPIRV(PSFast),
@@ -2875,6 +2907,10 @@ void create_pipelines(State &s) {
     s.capture_pipeline = create_compute(s, "CaptureCS");
     s.decode_pipeline = create_compute(s, "DecodeCS");
     s.vertex_pipeline = create_compute(s, "VertexCS");
+#if defined(__ANDROID__)
+    if (vertex_batching())
+        s.vertex_batch_pipeline = create_compute(s, "VertexBatchCS");
+#endif
     s.decode_target_pipeline = create_compute(s, "DecodeTargetCS");
     s.mip_pipeline = create_compute(s, "MipCS");
     s.post_resolve_pipeline = create_compute(s, "PostResolveCS");
@@ -3608,15 +3644,23 @@ UINT64 process_vertices(State &s, psprecomp::GuestMemory &memory, const GpuVerte
         VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         check(vkBeginCommandBuffer(chunk.pre, &begin_info), "begin vertex commands");
-        vkCmdBindPipeline(chunk.pre, VK_PIPELINE_BIND_POINT_COMPUTE, s.vertex_pipeline);
+        if (!s.vertex_batch_pipeline)
+            vkCmdBindPipeline(chunk.pre, VK_PIPELINE_BIND_POINT_COMPUTE, s.vertex_pipeline);
         s.pre_open = true;
         if (chunk.queries) {
             vkCmdWriteTimestamp(chunk.pre, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, chunk.queries, 2);
             chunk.pre_timed = true;
         }
     }
-    push_compute(s, chunk.pre, {}, upload_view(s, offset), {s.vertex_arena.buffer, output});
-    vkCmdDispatch(chunk.pre, (job.decode_count + 63u) / 64u, 1, 1);
+    if (s.vertex_batch_pipeline) {
+        for (UINT first = 0; first < job.decode_count; first += 64u)
+            s.vertex_groups.insert(s.vertex_groups.end(),
+                                   {static_cast<std::uint32_t>(offset / 4u), static_cast<std::uint32_t>(output / 4u),
+                                    job.decode_count, first});
+    } else {
+        push_compute(s, chunk.pre, {}, upload_view(s, offset), {s.vertex_arena.buffer, output});
+        vkCmdDispatch(chunk.pre, (job.decode_count + 63u) / 64u, 1, 1);
+    }
     s.has_commands = true;
     return output;
 }
