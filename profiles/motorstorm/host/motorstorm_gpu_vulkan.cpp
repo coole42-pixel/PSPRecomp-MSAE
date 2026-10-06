@@ -2749,9 +2749,12 @@ bool hardware_draws_enabled(const State &s) {
     (void)s;
     return false;
 #else
-    return s.pixel_path == PixelPath::OrderedAttachment && s.hw_depth_ok && s.raster_half == 2 &&
-           !diag_flag("PSPRECOMP_MOTORSTORM_DIAG_NO_INPUT_READ") &&
-           !diag_flag("PSPRECOMP_MOTORSTORM_DIAG_TRIVIAL_PS") && !diag_flag("PSPRECOMP_MOTORSTORM_DIAG_NO_SHADE");
+    // Called per draw: read the diagnostic switches once (getenv scans the
+    // whole environment and showed up at ~10% of the guest thread).
+    static const bool diagnostics = diag_flag("PSPRECOMP_MOTORSTORM_DIAG_NO_INPUT_READ") ||
+                                    diag_flag("PSPRECOMP_MOTORSTORM_DIAG_TRIVIAL_PS") ||
+                                    diag_flag("PSPRECOMP_MOTORSTORM_DIAG_NO_SHADE");
+    return s.pixel_path == PixelPath::OrderedAttachment && s.hw_depth_ok && s.raster_half == 2 && !diagnostics;
 #endif
 }
 void create_pipelines(State &s) {
