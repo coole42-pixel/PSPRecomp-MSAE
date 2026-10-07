@@ -84,6 +84,11 @@ public:
             if (offset <= ram_limit32_ && !read_watched(address)) return GuestMemory::read_le32(ram_data_ + offset);
             return owner_->aot_load32_slow(address);
         }
+        // Selected diagnostic sites carry the original instruction address.
+        [[nodiscard]] std::uint32_t aot_load32_at(std::uint32_t address, std::uint32_t pc,
+                                               std::uint32_t ra) const {
+            return owner_->aot_load32_at(address, pc, ra);
+        }
         PSPRECOMP_MEMORY_FAST_PATH void aot_store8(std::uint32_t address, std::uint8_t value) const {
             const std::uint32_t offset = ram_offset_of_fast(address);
 #if defined(PSPRECOMP_AOT_ASSUME_NO_WRITE_WATCH)
@@ -256,6 +261,17 @@ public:
     [[nodiscard]] std::uint8_t load8(std::uint32_t address) const;
     [[nodiscard]] std::uint16_t load16(std::uint32_t address) const;
     [[nodiscard]] std::uint32_t load32(std::uint32_t address) const;
+    [[nodiscard]] std::uint32_t aot_load32_at(std::uint32_t address, std::uint32_t pc,
+                                           std::uint32_t ra) const;
+    [[nodiscard]] static std::uint32_t vram_access_pc() noexcept;
+    [[nodiscard]] static std::uint32_t vram_access_ra() noexcept;
+    // An exact scalar read can be served without materializing an entire GPU
+    // target. Declining retains the ordinary range publication hook.
+    using VramRead32Hook = bool (*)(void *, std::uint32_t, std::uint32_t &);
+    void set_vram_read32_hook(VramRead32Hook hook, void *context) noexcept {
+        vram_read32_context_ = context;
+        vram_read32_hook_ = hook;
+    }
     [[nodiscard]] std::uint32_t load_word_left(std::uint32_t address, std::uint32_t existing) const;
     [[nodiscard]] std::uint32_t load_word_right(std::uint32_t address, std::uint32_t existing) const;
     void store8(std::uint32_t address, std::uint8_t value);
@@ -296,6 +312,9 @@ public:
     [[nodiscard]] bool vram_hook_armed() const noexcept { return vram_hook_armed_.load(); }
 
 private:
+    [[nodiscard]] bool try_vram_read32(std::uint32_t address, std::uint32_t &value) const;
+    std::atomic<VramRead32Hook> vram_read32_hook_{};
+    std::atomic<void *> vram_read32_context_{};
     void notify_vram_access(std::uint32_t address, std::size_t length) const {
         if (!vram_hook_armed_.load() || !vram_hook_armed_.exchange(false)) return;
         if (const auto hook = vram_range_hook_.load())

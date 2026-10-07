@@ -766,6 +766,40 @@ void ResolveCS(uint3 id : SV_DispatchThreadID) {
     c.a=bytes(unpackFrame(center)).a; // stencil is never averaged
     computeOutput[id.y*surface.x+id.x]=packFrame(pack(c));
 }
+// Exact scalar/grid queries. Same integer resolve as ResolveCS, including
+// central-sample PSP stencil. mode.y: packed buffer, hardware RGBA, small
+// ordered-attachment copy. No framebuffer representation is modified.
+void tinyColorQuery(uint3 id, bool hardware) {
+    if (id.x >= mode.z) return;
+    uint2 p = commands[0].xy + uint2(id.x % commands[0].w * commands[0].z,
+                                    id.x / commands[0].w * commands[1].x);
+    uint scale = render.x / 2;
+    uint2 base = p * scale;
+    uint4 total = 0; uint alpha = 0;
+    for (uint y=0;y<scale;++y) for (uint x=0;x<scale;++x) {
+        uint value;
+        if (hardware) {
+            uint4 c = uint4(saturate(textureImage.Load(int3(base + uint2(x,y),0))) * 255.0 + 0.5);
+            value = packFrame(pack(min(c,255)));
+        } else {
+            uint index = mode.y == 2 ? id.x * scale * scale + y * scale + x
+                                     : (base.y+y)*surface.z+base.x+x;
+            if (mode.y == 3) index = (base.y - commands[0].y*scale + y)*surface.z + base.x - commands[0].x*scale + x;
+            value = presentColor[index];
+        }
+        uint4 c = bytes(unpackFrame(value));
+        total += c;
+        if (x == scale/2 && y == scale/2) alpha = c.a;
+    }
+    uint samples = scale*scale;
+    uint4 result = (total+samples/2)/samples;
+    result.a = alpha;
+    computeOutput[id.x] = packFrame(pack(result));
+}
+[numthreads(64,1,1)]
+void TinyColorQueryCS(uint3 id : SV_DispatchThreadID) { tinyColorQuery(id,false); }
+[numthreads(64,1,1)]
+void TinyColorImageQueryCS(uint3 id : SV_DispatchThreadID) { tinyColorQuery(id,true); }
 float3 outputPixel(int2 p) {
     uint2 extent=surface.xy*render.y;
     p=clamp(p,0,int2(extent)-1);

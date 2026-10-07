@@ -98,6 +98,10 @@ struct GpuReport {
     std::uint32_t cpu_vram_address{};
     std::uint64_t cpu_vram_bytes{};
     std::uint64_t query_prefetches{}, query_prefetch_bytes{};
+    std::uint64_t tiny_query_count{}, tiny_query_bytes{}, tiny_query_gpu_waits{}, tiny_query_wait_ns{},
+        full_publication_avoided{}, tiny_query_cache_hits{}, tiny_query_verified_values{}, tiny_query_mismatches{},
+        tiny_query_submissions{}, tiny_transfer_queries{}, tiny_query_gpu_ns{}, tiny_query_untouched{}, tiny_query_prefetches{},
+        tiny_snapshot_count{}, tiny_snapshot_bytes{}, superseded_query_snapshots{};
     std::uint64_t readonly_depth_passes{}, color_only_restores{}, depth_restores{};
     // Optional asynchronous GPU timestamp totals: resolve, deband, colour.
     std::uint64_t post_gpu_frames{}, post_gpu_max_ns{};

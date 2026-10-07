@@ -455,6 +455,127 @@ void feedback_after_overwrite(psprecomp::GuestMemory &memory) {
         memory.load32(kColor + (6u * 32u + 14u) * 4u) != 0x80AABBCCu)
         throw std::runtime_error("Self-feedback must refresh its snapshot after the sampled pixels are overwritten");
 }
+void tiny_query_coherence(psprecomp::GuestMemory &memory) {
+    const char *backend = std::getenv("PSPRECOMP_MOTORSTORM_RENDERER");
+    if (!backend || std::strcmp(backend, "vulkan")) return;
+    if (!motorstorm::gpu_initialize() || motorstorm::gpu_report().api != "Vulkan")
+        throw std::runtime_error("Vulkan query fixture must execute on Vulkan");
+    _putenv_s("PSPRECOMP_MOTORSTORM_TINY_QUERY", "1");
+    cached_readback_during_recording(memory);
+    run(memory, Case{3, {}});
+    constexpr std::uint32_t source = kColor + 0x70000u, other = kColor + 0x90000u;
+    memory.zero(source, 0x18000u); memory.zero(other, 0x10000u);
+    const bool previous_lazy = motorstorm::gpu_lazy_publish();
+    motorstorm::gpu_set_lazy_publish(true);
+    motorstorm::gpu_set_deferred_readback(true);
+    motorstorm::GpuDraw draw;
+    draw.framebuffer = source; draw.stride = 32; draw.format = 3;
+    draw.right = draw.bottom = 32;
+    const auto submit = [&](std::uint32_t address, std::uint32_t rgb) {
+        draw.framebuffer = address;
+        const std::array<motorstorm::GpuVertex, 3> vertices{{
+            {4, 4, 70, rgb}, {24, 4, 70, rgb}, {4, 24, 70, rgb}}};
+        motorstorm::gpu_submit(memory, draw, vertices, nullptr);
+    };
+    submit(source, 0xFF102030u); motorstorm::gpu_end_list(memory);
+    const auto pixel = source + (10u * 32u + 10u) * 4u;
+    const auto before = motorstorm::gpu_report();
+    if (memory.aot_load32(pixel) != 0x00102030u || memory.load32(pixel + 0x400000u) != 0x00102030u ||
+        memory.load32(pixel | 0x40000000u) != 0x00102030u)
+        throw std::runtime_error("Exact query repeated/mirrored reads must match current GPU pixels");
+    if (motorstorm::gpu_report().publishes != before.publishes || !memory.vram_hook_armed())
+        throw std::runtime_error("Exact query must retain resident targets without full publication");
+    memory.arm_vram_hook(false);
+    memory.aot_store8(pixel + 1u, 0x66u); // Reproduce a CPU write during renderer shadow-read suppression.
+    memory.arm_vram_hook(true);
+    if (memory.load32(pixel) != 0x00106630u)
+        throw std::runtime_error("Exact query must preserve CPU-modified bytes just like full publication");
+    memory.arm_vram_hook(false);
+    memory.aot_store8(pixel + 1u, 0u);
+    memory.arm_vram_hook(true);
+    if (memory.load32(pixel) != 0x00102030u)
+        throw std::runtime_error("GPU query caches must not cache merged CPU bytes");
+    const auto untouched = motorstorm::gpu_report();
+    if (memory.load32(source + (31u * 32u + 31u) * 4u) != 0u ||
+        motorstorm::gpu_report().tiny_query_untouched != untouched.tiny_query_untouched + 1u ||
+        motorstorm::gpu_report().tiny_query_submissions != untouched.tiny_query_submissions)
+        throw std::runtime_error("Provably untouched bytes must retain their RAM value without GPU work");
+    submit(other, 0xFF112233u);
+    const auto unrelated = motorstorm::gpu_report();
+    if (memory.load32(pixel) != 0x00102030u || motorstorm::gpu_report().submissions != unrelated.submissions)
+        throw std::runtime_error("Cached exact query must leave unrelated commands recording");
+    motorstorm::gpu_end_list(memory);
+    submit(source, 0xFF778899u); // Query its current, still-recording writes.
+    if (memory.load32(pixel) != 0x00778899u)
+        throw std::runtime_error("Recording source query must include its latest draws");
+    motorstorm::gpu_end_list(memory);
+    memory.store32(source, 0x00552211u);
+    if (memory.load32(source) != 0x00552211u)
+        throw std::runtime_error("CPU writes after exact reads must survive publication");
+    submit(source, 0xFF334455u); motorstorm::gpu_end_list(memory);
+    if (memory.load32(source) != 0x00552211u || memory.load32(pixel) != 0x00334455u)
+        throw std::runtime_error("CPU writes and later draws must keep separate ownership");
+    constexpr std::uint32_t destination = kColor + 0xD0000u;
+    memory.zero(destination, 32u * 3u * 4u);
+    submit(source, 0xFF123456u);
+    if (!motorstorm::gpu_transfer_from_target(source, 32, 8, 8, destination, 32, 0, 0, 2, 2, 4))
+        throw std::runtime_error("Transfer query fixture failed to snapshot its source");
+    motorstorm::gpu_end_list(memory);
+    submit(other, 0xFF998877u);
+    const auto transfer_before = motorstorm::gpu_report();
+    if (memory.load32(destination) != 0x00123456u || memory.load32(destination + 32u * 4u) != 0x00123456u ||
+        memory.load32(destination + 2u * 4u) != 0u ||
+        motorstorm::gpu_report().submissions != transfer_before.submissions ||
+        motorstorm::gpu_report().tiny_transfer_queries != transfer_before.tiny_transfer_queries + 1u)
+        throw std::runtime_error("Transfer queries must preserve row padding and unrelated recording work");
+    motorstorm::gpu_end_list(memory);
+    const auto superseded_before = motorstorm::gpu_report().superseded_query_snapshots;
+    _putenv_s("PSPRECOMP_MOTORSTORM_TINY_QUERY", "0");
+    submit(source, 0xFF654321u);
+    if (!motorstorm::gpu_transfer_from_target(source, 32, 8, 8, destination, 32, 0, 0, 2, 2, 4))
+        throw std::runtime_error("Native cache fixture could not record its legacy resolve");
+    _putenv_s("PSPRECOMP_MOTORSTORM_TINY_QUERY", "1");
+    if (memory.load32(pixel) != 0x00654321u)
+        throw std::runtime_error("Exact reads must honor the current, still-recording native resolve");
+    motorstorm::gpu_end_list(memory);
+    (void)memory.load32(destination);
+    submit(source, 0xFF123456u);
+    for (unsigned i = 0; i < 819u; ++i)
+        if (!motorstorm::gpu_transfer_from_target(source, 32, 4, 4, destination, 32, 0, 0, 17, 17, 4))
+            throw std::runtime_error("Repeated superseded snapshot fixture exhausted the query ring");
+    submit(source, 0xFFA1B2C3u);
+    if (!motorstorm::gpu_transfer_from_target(source, 32, 4, 4, destination, 32, 0, 0, 17, 17, 4))
+        throw std::runtime_error("Ordered query ring reuse must retain the newest snapshot");
+    motorstorm::gpu_end_list(memory);
+    if (memory.load32(destination) != 0x00A1B2C3u ||
+        motorstorm::gpu_report().superseded_query_snapshots < superseded_before + 819u)
+        throw std::runtime_error("Superseded snapshots and ring reuse must return the exact latest command-ordered pixels");
+    submit(source, 0xFFA1B2C3u);
+    if (!motorstorm::gpu_transfer_from_target(source, 32, 4, 4, destination, 32, 0, 0, 17, 17, 4))
+        throw std::runtime_error("Partial-overlap fixture could not record its original snapshot");
+    submit(source, 0xFFAABBCCu);
+    if (!motorstorm::gpu_transfer_from_target(source, 32, 4, 4, destination, 32, 0, 0, 1, 1, 4))
+        throw std::runtime_error("Partial-overlap fixture could not record its later snapshot");
+    motorstorm::gpu_end_list(memory);
+    if (memory.load32(destination) != 0x00AABBCCu || memory.load32(destination + 4u) != 0x00A1B2C3u)
+        throw std::runtime_error("Partly overlapping snapshots must retain old pixels outside the later footprint");
+    draw.stride = 64; draw.right = 64;
+    submit(source, 0xFF556677u); motorstorm::gpu_end_list(memory);
+    if (memory.load32(source + (10u * 64u + 10u) * 4u) != 0x00556677u)
+        throw std::runtime_error("Resized/recreated query target must not reuse old cache values");
+    draw.format = 0;
+    submit(source, 0xFF00FF00u); motorstorm::gpu_end_list(memory);
+    if (memory.load32(source + (10u * 64u + 10u) * 2u) != 0x07E007E0u)
+        throw std::runtime_error("Overlapping 16-bit reinterpretation must use exact fallback publication");
+    if (motorstorm::gpu_report().tiny_query_count <= before.tiny_query_count)
+        throw std::runtime_error("Exact query fixture did not execute the query path");
+    std::printf("Exact query fixture: count=%llu snapshots=%llu superseded=%llu untouched=%llu\n",
+        motorstorm::gpu_report().tiny_query_count, motorstorm::gpu_report().tiny_snapshot_count,
+        motorstorm::gpu_report().superseded_query_snapshots, motorstorm::gpu_report().tiny_query_untouched);
+    motorstorm::gpu_set_deferred_readback(false);
+    motorstorm::gpu_set_lazy_publish(previous_lazy);
+    _putenv_s("PSPRECOMP_MOTORSTORM_TINY_QUERY", "0");
+}
 } // namespace
 // GPU texture decoding (DecodeCS) must match the CPU texel path bit for bit
 // for every format, swizzle mode and palette mode.
@@ -1090,6 +1211,7 @@ int main(int argc, char **argv) {
                 downsample_feedback_bounds(memory);
                 cached_readback_during_recording(memory);
                 feedback_after_overwrite(memory);
+                tiny_query_coherence(memory);
                 motorstorm::gpu_shutdown();
             }
             std::puts("Cross-list GPU feedback and demand-driven CPU publication passed");

@@ -910,7 +910,8 @@ L_0894258C:
     }
 L_089425A0:
     { const bool branch_taken = 0u == 0u;
-    aot_gpr[2] = (PSPRECOMP_AOT_LOAD32(aot_gpr[4] + static_cast<std::uint32_t>(0)));
+    // Original PSP pixel query; preserve instruction metadata for VRAM tracing.
+    aot_gpr[2] = aot_mem.aot_load32_at(aot_gpr[4], 0x089425A4u, aot_gpr[31]);
       if (branch_taken) {
           goto L_089425E8;
       }

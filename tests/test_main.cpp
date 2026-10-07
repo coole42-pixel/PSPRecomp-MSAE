@@ -2105,6 +2105,34 @@ int main() {
                 "Range coherence hook must describe all bytes cleared by a CPU write");
         segmented_memory.set_vram_access_hook(nullptr, nullptr);
         segmented_memory.store32(0x04000000u, 0x12345678u);
+        struct ExactRead { unsigned calls{}; std::uint32_t pc{}, ra{}; } exact_read;
+        segmented_memory.set_vram_read32_hook([](void *context, std::uint32_t address, std::uint32_t &value) {
+            auto &trace = *static_cast<ExactRead *>(context);
+            ++trace.calls;
+            trace.pc = psprecomp::GuestMemory::vram_access_pc();
+            trace.ra = psprecomp::GuestMemory::vram_access_ra();
+            value = 0xAABBCCDDu;
+            return (address & 0x1FFFFFu) == 0;
+        }, &exact_read);
+        segmented_memory.set_vram_range_access_hook([](void *, std::uint32_t, std::size_t) {}, nullptr);
+        segmented_memory.arm_vram_hook(true);
+        require(segmented_memory.aot_load32_at(0x44400000u, 0x089425A4u, 0x0894258Cu) == 0xAABBCCDDu &&
+                exact_read.pc == 0x089425A4u && exact_read.ra == 0x0894258Cu && segmented_memory.vram_hook_armed(),
+                "Exact reads must carry the instruction context and retain unpublished VRAM residency");
+        require(psprecomp::GuestMemory::vram_access_pc() == 0u && psprecomp::GuestMemory::vram_access_ra() == 0u,
+                "Instruction tracing context must be restored after the access");
+        require(segmented_memory.load32(0x44000000u) == 0xAABBCCDDu,
+                "Host scalar reads must share the exact VRAM result");
+        segmented_memory.arm_vram_hook(true);
+        (void)segmented_memory.aot_load32(0x441FFFFEu);
+        require(exact_read.calls == 2u, "Wrapping reads must use complete range publication");
+        segmented_memory.arm_vram_hook(true);
+        segmented_memory.store32(0x44000000u, 0x11223344u);
+        require(exact_read.calls == 2u && segmented_memory.load32(0x04000000u) == 0x11223344u,
+                "Writes and their implicit old-value reads must retain full publication and bypass exact read queries");
+        segmented_memory.set_vram_read32_hook(nullptr, nullptr);
+        segmented_memory.set_vram_access_hook(nullptr, nullptr);
+        segmented_memory.store32(0x04000000u, 0x12345678u);
         require(segmented_memory.load32(0x44000000u) == 0x12345678u,
                 "PSP cached/uncached EDRAM aliasing failed");
         require(segmented_memory.contains(0x04200000u, 1u) &&

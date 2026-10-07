@@ -338,6 +338,14 @@ struct PerfTracker {
                          " color_restore=" + std::to_string(report.color_only_restores) +
                          " depth_restore=" + std::to_string(report.depth_restores);
             log_line("VRAM_COHERENCE", coherence);
+            log_line("TINY_QUERY_TOTAL", "count=" + std::to_string(report.tiny_query_count) +
+                " bytes=" + std::to_string(report.tiny_query_bytes) +
+                " waits=" + std::to_string(report.tiny_query_gpu_waits) +
+                " wait_ms=" + fmt1(report.tiny_query_wait_ns / 1e6) +
+                " avoided=" + std::to_string(report.full_publication_avoided) +
+                " hits=" + std::to_string(report.tiny_query_cache_hits) +
+                " verified=" + std::to_string(report.tiny_query_verified_values) +
+                " mismatches=" + std::to_string(report.tiny_query_mismatches));
 
             std::string dominant_bottleneck = "None (smooth)";
             if (window_cause_pipeline_ms >= 15.0) {

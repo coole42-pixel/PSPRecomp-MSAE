@@ -1,5 +1,6 @@
 #include "psprecomp/guest_memory.hpp"
 #include "psprecomp/common.hpp"
+#include "psprecomp/memory_access_context.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -18,6 +19,13 @@ std::uint32_t runtime_dispatch_pc() noexcept;
 std::uint32_t runtime_watch_register(std::uint32_t index) noexcept;
 
 namespace {
+thread_local std::uint32_t access_pc{}, access_ra{};
+thread_local bool access_write{};
+struct WriteAccess {
+    bool previous{access_write};
+    WriteAccess() { access_write = true; }
+    ~WriteAccess() { access_write = previous; }
+};
 struct WriteWatch {
     bool enabled{};
     std::uint32_t address{};
@@ -103,6 +111,22 @@ void log_read_watch(std::uint32_t address, std::size_t length, std::uint64_t val
               << " size=" << length
               << " value=0x" << std::hex << value << std::dec << "\n";
 }
+}
+
+std::uint32_t GuestMemory::vram_access_pc() noexcept { return access_pc; }
+bool memory_access_is_write() noexcept { return access_write; }
+std::uint32_t GuestMemory::vram_access_ra() noexcept { return access_ra; }
+bool GuestMemory::try_vram_read32(std::uint32_t address, std::uint32_t &value) const {
+    const auto hook = vram_read32_hook_.load();
+    return !access_write && hook && vram_hook_armed() && hook(vram_read32_context_.load(), address, value);
+}
+std::uint32_t GuestMemory::aot_load32_at(std::uint32_t address, std::uint32_t pc, std::uint32_t ra) const {
+    struct Context {
+        std::uint32_t pc{access_pc}, ra{access_ra};
+        ~Context() { access_pc = pc; access_ra = ra; }
+    } saved;
+    access_pc = pc; access_ra = ra;
+    return aot_load32(address);
 }
 
 GuestMemory::GuestMemory(std::uint32_t size_bytes)
@@ -235,6 +259,11 @@ std::uint32_t GuestMemory::aot_load32_slow(std::uint32_t address) const {
     const std::vector<std::uint8_t> *data = nullptr;
     std::size_t offset = 0u;
     if (is_vram_window(c)) {
+        std::uint32_t exact{};
+        if (vram_offset(c) + 4u <= vram_.size() && try_vram_read32(address, exact)) {
+            log_read_watch(address, 4u, exact);
+            return exact;
+        }
         notify_vram_access(address, 4u);
         data = &vram_;
         offset = vram_offset(c);
@@ -266,6 +295,7 @@ std::uint32_t GuestMemory::aot_load_word_right(std::uint32_t address, std::uint3
 }
 
 void GuestMemory::aot_store8_slow(std::uint32_t address, std::uint8_t value) {
+    WriteAccess operation;
     if (write_watch_enabled_) { store8(address, value); return; }
     const std::uint32_t c = canonical(address);
     if (is_vram_window(c)) { notify_vram_access(address, 1u); vram_[vram_offset(c)] = value; return; }
@@ -276,6 +306,7 @@ void GuestMemory::aot_store8_slow(std::uint32_t address, std::uint8_t value) {
     store8(address, value);
 }
 void GuestMemory::aot_store16_slow(std::uint32_t address, std::uint16_t value) {
+    WriteAccess operation;
     if (write_watch_enabled_) { store16(address, value); return; }
     const std::uint32_t c = canonical(address);
     std::vector<std::uint8_t> *data = nullptr;
@@ -290,6 +321,7 @@ void GuestMemory::aot_store16_slow(std::uint32_t address, std::uint16_t value) {
     store16(address, value);
 }
 void GuestMemory::aot_store32_slow(std::uint32_t address, std::uint32_t value) {
+    WriteAccess operation;
     if (write_watch_enabled_) { store32(address, value); return; }
     const std::uint32_t c = canonical(address);
     std::vector<std::uint8_t> *data = nullptr;
@@ -306,12 +338,14 @@ void GuestMemory::aot_store32_slow(std::uint32_t address, std::uint32_t value) {
     store32(address, value);
 }
 void GuestMemory::aot_store_word_left(std::uint32_t address, std::uint32_t value) {
+    WriteAccess operation;
     const std::uint32_t shift = (address & 3u) * 8u;
     const std::uint32_t aligned = address & ~3u;
     const std::uint32_t memory_word = aot_load32(aligned);
     aot_store32(aligned, (value >> (24u - shift)) | (memory_word & (0xFFFFFF00u << shift)));
 }
 void GuestMemory::aot_store_word_right(std::uint32_t address, std::uint32_t value) {
+    WriteAccess operation;
     const std::uint32_t shift = (address & 3u) * 8u;
     const std::uint32_t aligned = address & ~3u;
     const std::uint32_t memory_word = aot_load32(aligned);
@@ -372,6 +406,7 @@ void GuestMemory::aot_copy_lz_match(std::uint32_t destination, std::uint32_t sou
 }
 
 std::uint8_t *GuestMemory::raw_pointer(std::uint32_t address, std::size_t length) {
+    WriteAccess operation;
     return const_cast<std::uint8_t *>(
         static_cast<const GuestMemory *>(this)->raw_pointer(address, length));
 }
@@ -406,6 +441,10 @@ std::uint16_t GuestMemory::load16(std::uint32_t address) const {
            static_cast<std::uint16_t>(static_cast<std::uint16_t>(load8(address + 1u)) << 8u);
 }
 std::uint32_t GuestMemory::load32(std::uint32_t address) const {
+    const auto c = canonical(address);
+    std::uint32_t exact{};
+    if (is_vram_window(c) && contains(address, 4u) && vram_offset(c) + 4u <= vram_.size() &&
+        try_vram_read32(address, exact)) return exact;
     return static_cast<std::uint32_t>(load8(address)) |
            (static_cast<std::uint32_t>(load8(address + 1u)) << 8u) |
            (static_cast<std::uint32_t>(load8(address + 2u)) << 16u) |
@@ -422,6 +461,7 @@ std::uint32_t GuestMemory::load_word_right(std::uint32_t address, std::uint32_t 
     return (existing & (0xFFFFFF00u << (24u - shift))) | (memory_word >> shift);
 }
 void GuestMemory::store8(std::uint32_t address, std::uint8_t value) {
+    WriteAccess operation;
     const auto r = resolve(address, 1u);
     auto &data = region_bytes(r.region);
     const std::uint8_t old = data[r.offset];
@@ -429,6 +469,7 @@ void GuestMemory::store8(std::uint32_t address, std::uint8_t value) {
     data[r.offset] = value;
 }
 void GuestMemory::store16(std::uint32_t address, std::uint16_t value) {
+    WriteAccess operation;
     const std::uint16_t old = load16(address);
     log_write_watch(address, 2u, "store16", old, value);
     const auto write_byte = [this](std::uint32_t byte_address, std::uint8_t byte) {
@@ -439,6 +480,7 @@ void GuestMemory::store16(std::uint32_t address, std::uint16_t value) {
     write_byte(address + 1u, static_cast<std::uint8_t>((value >> 8u) & 0xFFu));
 }
 void GuestMemory::store32(std::uint32_t address, std::uint32_t value) {
+    WriteAccess operation;
     const std::uint32_t old = load32(address);
     log_write_watch(address, 4u, "store32", old, value);
     const auto write_byte = [this](std::uint32_t byte_address, std::uint8_t byte) {
@@ -451,12 +493,14 @@ void GuestMemory::store32(std::uint32_t address, std::uint32_t value) {
     write_byte(address + 3u, static_cast<std::uint8_t>((value >> 24u) & 0xFFu));
 }
 void GuestMemory::store_word_left(std::uint32_t address, std::uint32_t value) {
+    WriteAccess operation;
     const std::uint32_t shift = (address & 3u) * 8u;
     const std::uint32_t aligned = address & ~3u;
     const std::uint32_t memory_word = load32(aligned);
     store32(aligned, (value >> (24u - shift)) | (memory_word & (0xFFFFFF00u << shift)));
 }
 void GuestMemory::store_word_right(std::uint32_t address, std::uint32_t value) {
+    WriteAccess operation;
     const std::uint32_t shift = (address & 3u) * 8u;
     const std::uint32_t aligned = address & ~3u;
     const std::uint32_t memory_word = load32(aligned);
@@ -466,6 +510,7 @@ void GuestMemory::memory_barrier() const noexcept {
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 void GuestMemory::copy_in(std::uint32_t address, std::span<const std::uint8_t> source) {
+    WriteAccess operation;
     if (!contains(address, source.size()))
         throw Error("Guest memory access outside PSP RAM/EDRAM at " + hex32(address));
     log_write_watch(address, source.size(), "copy_in", 0u, 0u);
@@ -495,6 +540,7 @@ void GuestMemory::copy_out(std::uint32_t address, std::span<std::uint8_t> destin
     }
 }
 void GuestMemory::zero(std::uint32_t address, std::size_t length) {
+    WriteAccess operation;
     if (!contains(address, length))
         throw Error("Guest memory access outside PSP RAM/EDRAM at " + hex32(address));
     log_write_watch(address, length, "zero", 0u, 0u);

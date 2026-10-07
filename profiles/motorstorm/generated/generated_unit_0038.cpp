@@ -670,7 +670,8 @@ L_0882A60C:
     aot_gpr[5] = (65280u << 16u);
     goto L_0882A614;
 L_0882A614:
-    aot_gpr[6] = (PSPRECOMP_AOT_LOAD32(aot_gpr[10] + static_cast<std::uint32_t>(0)));
+    // Original PSP alpha/stencil visibility scan.
+    aot_gpr[6] = aot_mem.aot_load32_at(aot_gpr[10], 0x0882A614u, aot_gpr[31]);
     aot_gpr[6] = (aot_gpr[6] & aot_gpr[5]);
     { const bool branch_taken = aot_gpr[6] != aot_gpr[5];
     aot_gpr[10] = (aot_gpr[10] + static_cast<std::uint32_t>(4));

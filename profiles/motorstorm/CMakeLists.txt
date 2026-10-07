@@ -174,7 +174,7 @@ if(PSPRECOMP_MOTORSTORM_VULKAN)
                             PointGS:PointGS:gs_6_0:-fvk-invert-y PresentVS:PresentVS:vs_6_0:-fvk-invert-y
                             PresentPS:PresentPS:ps_6_0:none PostPS:PostPS:ps_6_0:none
                             PostPresentPS:PostPresentPS:ps_6_0:none
-                            ExpandCS:ExpandCS:cs_6_0:none ResolveCS:ResolveCS:cs_6_0:none
+                            ExpandCS:ExpandCS:cs_6_0:none ResolveCS:ResolveCS:cs_6_0:none TinyColorQueryCS:TinyColorQueryCS:cs_6_0:none TinyColorImageQueryCS:TinyColorImageQueryCS:cs_6_0:none
                             CaptureCS:CaptureCS:cs_6_0:none DecodeCS:DecodeCS:cs_6_0:none MipCS:MipCS:cs_6_0:none
                             PostResolveCS:PostResolveCS:cs_6_0:none DebandCS:DebandCS:cs_6_0:none
                             PostCaptureCS:PostCaptureCS:cs_6_0:none PostColorCS:PostColorCS:cs_6_0:none
