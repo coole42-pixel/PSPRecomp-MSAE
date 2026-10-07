@@ -9,6 +9,19 @@
 
 namespace motorstorm {
 
+// PSP EDRAM aliases and accesses can wrap around its 2 MiB physical image.
+inline bool vram_ranges_overlap(std::uint32_t address, std::size_t length,
+                                std::uint32_t target, std::uint64_t target_length) noexcept {
+    address = psprecomp::GuestMemory::canonical(address);
+    target = psprecomp::GuestMemory::canonical(target);
+    constexpr std::uint32_t base = 0x04000000u, size = 0x00200000u, mask = size - 1u;
+    if (!length || !target_length || address < base || address >= 0x04800000u ||
+        target < base || target >= 0x04800000u) return false;
+    if (length >= size || target_length >= size) return true;
+    const auto a = (address - base) & mask, b = (target - base) & mask;
+    return ((b - a) & mask) < length || ((a - b) & mask) < target_length;
+}
+
 // The GE frontend still decodes PSP vertex layouts, morphs, skinning and
 // lighting. Non-through positions remain in model space for the vertex shader.
 struct GpuVertex {
@@ -73,14 +86,28 @@ struct GpuReport {
         replaced_draws{}, replacement_uploads{}, replacements_evicted{}, streamed_texture_updates{},
         gpu_vertex_draws{}, hardware_pixel_draws{}, ordered_pixel_draws{}, pixel_path_switches{},
         hardware_alpha_draws{}, reject_feedback{}, reject_stencil{}, reject_color{}, reject_mask{}, reject_blend{},
-        reject_other{}, hw_packs{}, hw_pack_ns{}, pipelines_created{}, pipeline_create_ns{};
+        reject_other{}, hw_packs{}, hw_pack_ns{}, pipelines_created{}, pipeline_create_ns{},
+        draws_ps_fast{}, draws_ps_fast_alpha{}, draws_ps_ordered{}, hardware_vertices{}, ordered_vertices{},
+        switches_hw_to_ordered{}, switches_ordered_to_hw{}, render_pass_endings{},
+        pack_color_dispatches{}, pack_depth_dispatches{}, framebuffer_syncs{},
+        reject_raster_half_zero{}, reject_soft_particles{}, reject_hud_tag{}, reject_extended_color{},
+        reject_blend_16bit{}, reject_blend_narrow{}, reject_blend_equation{},
+        reject_blend_double_alpha{}, reject_blend_factor_unknown{}, reject_blend_fix_conflict{},
+        reject_target_size_mismatch{}, unrelated_vram_accesses{}, feedback_tail_compositions{};
+    std::uint32_t texture_sync_address{}, texture_sync_bytes{}, texture_sync_target{}, texture_sync_bpp{};
+    std::uint32_t cpu_vram_address{};
+    std::uint64_t cpu_vram_bytes{};
+    std::uint64_t query_prefetches{}, query_prefetch_bytes{};
+    std::uint64_t readonly_depth_passes{}, color_only_restores{}, depth_restores{};
     // Optional asynchronous GPU timestamp totals: resolve, deband, colour.
     std::uint64_t post_gpu_frames{}, post_gpu_max_ns{};
     // Readback publishes by trigger: draw, sync, list end, CPU VRAM access,
     // list start, other. Count, of which waited on the GPU, and wait time.
     std::array<std::uint64_t, 6> publishes{}, publish_waits{}, publish_wait_ns{};
     std::array<std::uint64_t, 3> post_gpu_ns{};
-    bool active{};
+    bool active{}, racing{}, display_timing_supported{};
+    std::uint64_t present_requests{}, displayed_frames{};
+    std::uint64_t direct_image_presents{}, snapshot_image_bytes{}, snapshot_buffer_bytes{}, present_convert_dispatches{};
     std::uint32_t resolution_scale{1}, raster_half{2}, antialiasing{};  // raster scale in half units
     // Latest retired GE-chunk GPU time from timestamp queries. Negative: none yet.
     double last_gpu_ms{-1.0};
@@ -129,6 +156,10 @@ void gpu_sync(psprecomp::GuestMemory &);
 void gpu_end_list(psprecomp::GuestMemory &);
 void gpu_settle(psprecomp::GuestMemory &);
 void gpu_set_deferred_readback(bool enabled) noexcept;
+// Lazy publication (deferred readbacks are not copied to guest memory until a
+// CPU access needs them).  Windows defaults to eager; Android defaults to lazy.
+void gpu_set_lazy_publish(bool enabled) noexcept;
+bool gpu_lazy_publish() noexcept;
 // Returns true when the bytes overlapped a drawn target and forced a sync.
 bool gpu_sync_texture(psprecomp::GuestMemory &, std::uint32_t address, std::uint32_t bytes);
 // A GE block transfer whose source lies in a target drawn by the current list:

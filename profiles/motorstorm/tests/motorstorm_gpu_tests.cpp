@@ -81,7 +81,7 @@ void bilinear_fraction_grid(psprecomp::GuestMemory &memory) {
                 for (unsigned fy = 0u; fy < 16u; ++fy)
                     for (unsigned fx = 0u; fx < 16u; ++fx) {
                         std::uint32_t expected{};
-                        for (unsigned shift = 0u; shift < 32u; shift += 8u) {
+                        for (unsigned shift = 0u; shift < 24u; shift += 8u) {
                             const auto channel = [&](int x, int y) { return (sample(x, y) >> shift) & 255u; };
                             const auto a = channel(base_x, base_y) * (16u - fx) + channel(base_x + 1, base_y) * fx;
                             const auto b = channel(base_x, base_y + 1) * (16u - fx) + channel(base_x + 1, base_y + 1) * fx;
@@ -160,8 +160,10 @@ void oversized_target(psprecomp::GuestMemory &memory) {
     command(list,0x0C,0);
     for(std::size_t i=0;i<list.size();++i)memory.store32(kList+static_cast<std::uint32_t>(i*4),list[i]);
     motorstorm::software_ge_execute_list(memory,kList,0);
-    if(memory.load32(kColor+(295*16+8)*4)!=0xFF317BC5 ||
-       memory.load32(display+(271*16+8)*4)!=0xFF317BC5)
+    // Ordinary color draws preserve framebuffer alpha (PSP stencil), which
+    // these zeroed targets initialize to zero.
+    if(memory.load32(kColor+(295*16+8)*4)!=0x00317BC5 ||
+       memory.load32(display+(271*16+8)*4)!=0x00317BC5)
         throw std::runtime_error("Offscreen rows beyond the LCD must survive feedback scaling to the final display");
 }
 void feedback(psprecomp::GuestMemory &memory) {
@@ -202,9 +204,256 @@ void feedback(psprecomp::GuestMemory &memory) {
     for (std::size_t i = 0; i < list.size(); ++i)
         memory.store32(kList + static_cast<std::uint32_t>(i * 4), list[i]);
     motorstorm::software_ge_execute_list(memory, kList, 0);
-    if (memory.load32(kColor + (10 * 32 + 10) * 4) != 0x6090B0D0 ||
-        memory.load32(0x04020000 + (10 * 32 + 10) * 4) != 0x6090B0D0)
+    if (memory.load32(kColor + (10 * 32 + 10) * 4) != 0x8090B0D0 ||
+        memory.load32(0x04020000 + (10 * 32 + 10) * 4) != 0x8090B0D0)
         throw std::runtime_error("GPU framebuffer feedback / transfer coherence failed");
+}
+void cross_list_feedback(psprecomp::GuestMemory &memory) {
+    run(memory, Case{3, {}});
+    // This VRAM texture is not a rendered target. Reading it must not publish
+    // an unrelated framebuffer that remains resident on the GPU.
+    memory.store32(kColor + 0x30000u, 0xFFFFFFFFu);
+    memory.zero(kColor + 0x40000u, 32u * 32u * 4u);
+    memory.zero(kColor + 0x50000u, 32u * 32u * 4u);
+    memory.zero(kColor + 0x60000u, 32u * 32u * 4u);
+    memory.zero(kColor + 0x70000u, 32u * 32u * 4u);
+    // This fixture verifies the lazy-publication contract (resident GPU output,
+    // no CPU publication until a VRAM access needs it); force that mode even on
+    // platforms whose product default is eager.
+    const bool previous_lazy = motorstorm::gpu_lazy_publish();
+    motorstorm::gpu_set_deferred_readback(true);
+    motorstorm::gpu_set_lazy_publish(true);
+    const auto before = motorstorm::gpu_report();
+    const auto execute = [&](const std::vector<std::uint32_t> &list) {
+        for (std::size_t i = 0; i < list.size(); ++i)
+            memory.store32(kList + static_cast<std::uint32_t>(i * 4), list[i]);
+        motorstorm::software_ge_execute_list(memory, kList, 0);
+    };
+    execute({0x9C010000u, 0x9D040020u, 0xD2000003u, 0x1E000000u,
+             0x10080000u, 0x01000000u | (kVertices & 0xFFFFFFu), 0x04060002u, 0x0C000000u});
+    execute({0x9C011000u, 0x01000000u | (kVertices & 0xFFFFFFu), 0x04060002u, 0x0C000000u});
+    if (!motorstorm::gpu_feedback_available(kColor + 0x10000u, 32u, 3u))
+        throw std::runtime_error("Deferred list target must remain available for GPU feedback");
+    if (memory.load32(0x44230000u) != 0xFFFFFFFFu ||
+        motorstorm::gpu_report().publishes[3] != before.publishes[3] || !memory.vram_hook_armed())
+        throw std::runtime_error("Unrelated CPU VRAM reads must keep resident output and the coherence hook armed");
+    std::uint64_t source_version{};
+    if (!motorstorm::gpu_source_in_target(kColor + 0x10000u, 32u * 32u * 4u, false, source_version) ||
+        !motorstorm::gpu_overlay_targets(kColor + 0x10000u, 32u * 64u * 4u, source_version))
+        throw std::runtime_error("Resident texture sources must be discoverable before recording the next list");
+    vertex(memory, 0, 4, 4, 0xFFFFFFFFu);
+    vertex(memory, 1, 20, 20, 0xFFFFFFFFu);
+    execute({0x9C050000u, 0x9D040020u, 0xA0030000u, 0xA8040001u,
+             0xB8000000u, 0xC3000003u, 0xC2000000u, 0xC6000000u,
+             0xC7000101u, 0xC9000103u, 0x1E000001u,
+             0x01000000u | (kVertices & 0xFFFFFFu), 0x04060002u, 0x0C000000u});
+    // A swizzled texture extends beyond the resident source, so its RAM shadow
+    // and the rendered portion must be composed on the GPU without publication.
+    execute({0x9C040000u, 0xA0010000u, 0xA8040020u, 0xB8000605u, 0xC2000001u,
+             0x01000000u | (kVertices & 0xFFFFFFu), 0x04060002u, 0x0C000000u});
+    // A tall declared feedback texture reads only its resident prefix here.
+    // Its unused tail overlaps a second dirty framebuffer and must not be read.
+    if (before.api == "Vulkan")
+        execute({0x9C000000u, 0xC2000000u,
+                 0x01000000u | (kVertices & 0xFFFFFFu), 0x04060002u, 0x0C000000u});
+    execute({0x9C000000u, 0x9D040020u, 0xA0010000u, 0xA8040020u,
+             0xB8000505u, 0xC3000003u, 0xC2000000u, 0xC6000000u,
+             0xC7000101u, 0xC9000103u, 0x1E000001u,
+             0x01000000u | (kVertices & 0xFFFFFFu), 0x04060002u, 0x0C000000u});
+    const auto resident = motorstorm::gpu_report();
+    for (unsigned i = 0; i < resident.publishes.size(); ++i)
+        if (resident.publishes[i] != before.publishes[i])
+            std::printf("Unexpected publication reason %u: %llu -> %llu\n", i, before.publishes[i], resident.publishes[i]);
+    if (resident.publishes[1] != before.publishes[1] ||
+        resident.publishes[2] != before.publishes[2] || resident.publishes[3] != before.publishes[3] ||
+        resident.publishes[4] != before.publishes[4] ||
+        resident.feedback_draws <= before.feedback_draws)
+        throw std::runtime_error("Cross-list feedback must sample GPU pixels without CPU publication");
+    // Now reach the tail without changing the prefix. This must refresh the
+    // newly requested rows rather than reuse uninitialized cached padding.
+    memory.store32(kVertices + 4u, std::bit_cast<std::uint32_t>(36.0f));
+    memory.store32(kVertices + 24u + 4u, std::bit_cast<std::uint32_t>(52.0f));
+    execute({0x9C060000u, 0xB8000605u,
+             0x01000000u | (kVertices & 0xFFFFFFu), 0x04060002u, 0x0C000000u});
+    const char *tail_setting = std::getenv("PSPRECOMP_MOTORSTORM_GPU_FEEDBACK_TAIL");
+    const bool gpu_tail_enabled = !(tail_setting && std::strcmp(tail_setting, "0") == 0);
+    if (before.api == "Vulkan" && gpu_tail_enabled &&
+        (motorstorm::gpu_report().publishes[1] != resident.publishes[1] ||
+         motorstorm::gpu_report().publishes[3] != resident.publishes[3] ||
+         motorstorm::gpu_report().feedback_tail_compositions <= resident.feedback_tail_compositions))
+        throw std::runtime_error("Feedback tail overlapping a resident RGBA8 target must compose without CPU publication");
+    if (before.api == "Vulkan" && gpu_tail_enabled) {
+        // The conservative UV bounds upload a large tail each draw. Cross the
+        // upload-arena rollover within one list, while sampling the second
+        // resident target in the visible scissor. Rollover must only submit;
+        // it must not publish all framebuffers as a side effect.
+        vertex(memory, 0, 4, 4, 0xFFFFFFFFu);
+        vertex(memory, 1, 20, 984, 0xFFFFFFFFu);
+        memory.store32(kVertices + 4u, std::bit_cast<std::uint32_t>(36.0f));
+        memory.store32(kVertices + 24u + 4u, std::bit_cast<std::uint32_t>(1016.0f));
+        std::vector<std::uint32_t> pressure{0x9C070000u, 0xB8000A05u};
+        for (unsigned i = 0; i < 260u; ++i) {
+            pressure.push_back(0x01000000u | (kVertices & 0xFFFFFFu));
+            pressure.push_back(0x04060002u);
+        }
+        pressure.push_back(0x0C000000u);
+        const auto before_pressure = motorstorm::gpu_report();
+        execute(pressure);
+        if (motorstorm::gpu_report().publishes != before_pressure.publishes ||
+            !motorstorm::gpu_source_in_target(kColor + 0x10000u, 32u * 32u * 4u, false, source_version))
+            throw std::runtime_error("Upload arena rollover must retain GPU targets without guest publication");
+        if (memory.load32(kColor + 0x70000u + (10u * 32u + 10u) * 4u) != 0x0090B0D0u)
+            throw std::runtime_error("Arena rollover must fence upload reuse and preserve feedback pixels");
+    }
+    const auto before_texture_sync = motorstorm::gpu_report();
+    if (motorstorm::gpu_sync_texture(memory, 0x44250000u, 0u) ||
+        !motorstorm::gpu_sync_texture(memory, 0x44250000u, 32u * 32u * 4u) ||
+        motorstorm::gpu_report().publishes[1] != before_texture_sync.publishes[1] + 1u ||
+        motorstorm::gpu_report().publishes[3] != before_texture_sync.publishes[3] ||
+        !memory.vram_hook_armed() ||
+        !motorstorm::gpu_source_in_target(kColor + 0x10000u, 32u * 32u * 4u, false, source_version) ||
+        !motorstorm::gpu_source_in_target(kColor + 0x60000u, 32u * 32u * 4u, false, source_version))
+        throw std::runtime_error("Texture synchronization must publish mirrored pending output and retain unrelated GPU targets");
+    if (motorstorm::gpu_sync_texture(memory, 0x44250000u, 32u * 32u * 4u) ||
+        memory.load32(kColor + 0x50000u + (10u * 32u + 10u) * 4u) != 0x00FFFFFFu ||
+        motorstorm::gpu_report().publishes[3] != before_texture_sync.publishes[3])
+        throw std::runtime_error("Synchronized texture bytes must be current without repeated publication");
+    std::vector<std::uint8_t> crossing_read(4u + (10u * 32u + 10u) * 4u + 4u);
+    memory.copy_out(kColor + 0x3FFFCu, crossing_read);
+    const auto offset = 4u + (10u * 32u + 10u) * 4u;
+    if (crossing_read[offset] != 0xD0u || crossing_read[offset + 1u] != 0xB0u ||
+        crossing_read[offset + 2u] != 0x90u)
+        throw std::runtime_error("A bulk read beginning outside a dirty surface must publish before copying its overlapping bytes");
+    if (!memory.vram_hook_armed() || !motorstorm::gpu_feedback_available(kColor + 0x10000u, 32u, 3u))
+        throw std::runtime_error("Publishing one surface must leave unrelated GPU output resident and coherent on demand");
+    if (memory.load32(kColor + (10u * 32u + 10u) * 4u) != 0x8090B0D0u ||
+        motorstorm::gpu_report().publishes[3] <= before.publishes[3])
+        throw std::runtime_error("CPU VRAM load must publish the deferred feedback pixels on demand");
+    const auto overlay_pixel = memory.load32(kColor + 0x40000u + (10u * 32u + 10u) * 4u);
+    const auto unrelated_pixel = memory.load32(kColor + 0x50000u + (10u * 32u + 10u) * 4u);
+    if (overlay_pixel != 0x0090B0D0u || unrelated_pixel != 0x00FFFFFFu) {
+        std::printf("Texture pixels: overlay=%08X unrelated=%08X\n", overlay_pixel, unrelated_pixel);
+        throw std::runtime_error("GPU overlay composition and unrelated VRAM textures must preserve current pixels");
+    }
+    if (memory.load32(kColor + 0x60000u + (10u * 32u + 10u) * 4u) != 0x0090B0D0u)
+        throw std::runtime_error("Feedback must initialize newly sampled tail rows even when the prefix is unchanged");
+    motorstorm::gpu_set_deferred_readback(false);
+    motorstorm::gpu_set_lazy_publish(previous_lazy);
+}
+void downsample_feedback_bounds(psprecomp::GuestMemory &memory) {
+    // This bounds implementation belongs to Vulkan; D3D12 has a separate
+    // snapshot sampler and is covered by the existing feedback fixtures.
+    if (motorstorm::gpu_report().api != "Vulkan") return;
+    run(memory, Case{3, {}});
+    const bool previous_lazy = motorstorm::gpu_lazy_publish();
+    motorstorm::gpu_set_lazy_publish(true);
+    motorstorm::gpu_set_deferred_readback(true);
+    const auto execute = [&](const std::vector<std::uint32_t> &list) {
+        for (std::size_t i = 0; i < list.size(); ++i)
+            memory.store32(kList + static_cast<std::uint32_t>(i * 4u), list[i]);
+        motorstorm::software_ge_execute_list(memory, kList, 0);
+    };
+    vertex(memory, 0, 0, 0, 0xFF90B0D0u);
+    vertex(memory, 1, 512, 296, 0xFF90B0D0u);
+    execute({0x9C098000u, 0x9D040200u, 0x9E130000u, 0x9F040200u, 0x23000001u,
+             0xD4000000u, 0xD5000000u | 511u | (295u << 10), 0x1E000000u,
+             0x01000000u | (kVertices & 0xFFFFFFu), 0x04060002u, 0x0C000000u});
+    vertex(memory, 0, 0, 0, 0xFF102030u);
+    vertex(memory, 1, 480, 272, 0xFF102030u);
+    execute({0x9C000000u, 0x23000000u, 0xD5000000u | 479u | (271u << 10),
+             0x01000000u | (kVertices & 0xFFFFFFu), 0x04060002u, 0x0C000000u});
+    const auto before = motorstorm::gpu_report();
+    std::vector<std::uint32_t> strips{0xA0098000u, 0xA8040200u, 0xB8000909u,
+        0xC3000003u, 0xC2000000u, 0xC6000101u, 0xC7000000u, 0xC9000103u, 0x1E000001u};
+    unsigned index = 0;
+    for (unsigned y : {0u, 256u}) {
+        const unsigned bottom = y == 0u ? 256u : 272u;
+        for (unsigned x = 0; x < 480u; x += 32u) {
+            vertex(memory, index, static_cast<float>(x), static_cast<float>(y), 0xFFFFFFFFu);
+            vertex(memory, index + 1u, static_cast<float>(x + 32u), static_cast<float>(bottom), 0xFFFFFFFFu);
+            memory.store32(kVertices + index * 24u, std::bit_cast<std::uint32_t>(x * (512.0f / 480.0f)));
+            memory.store32(kVertices + index * 24u + 4u, std::bit_cast<std::uint32_t>(y * (296.0f / 272.0f)));
+            memory.store32(kVertices + (index + 1u) * 24u, std::bit_cast<std::uint32_t>((x + 32u) * (512.0f / 480.0f)));
+            memory.store32(kVertices + (index + 1u) * 24u + 4u, std::bit_cast<std::uint32_t>(bottom * (296.0f / 272.0f)));
+            strips.push_back(0x01000000u | ((kVertices + index * 24u) & 0xFFFFFFu));
+            strips.push_back(0x04060002u);
+            index += 2u;
+        }
+    }
+    strips.push_back(0x0C000000u);
+    execute(strips);
+    if (before.api == "Vulkan" && motorstorm::gpu_report().publishes != before.publishes)
+        throw std::runtime_error("512x296 to 480x272 feedback strips must not publish unrelated depth padding");
+    for (const auto offset : {0u, 479u, 271u * 512u, 271u * 512u + 479u})
+        if ((memory.load32(kColor + offset * 4u) & 0x00FFFFFFu) != 0x0090B0D0u)
+            throw std::runtime_error("Downsampled feedback must preserve all four display corners");
+    motorstorm::gpu_set_deferred_readback(false);
+    motorstorm::gpu_set_lazy_publish(previous_lazy);
+}
+void cached_readback_during_recording(psprecomp::GuestMemory &memory) {
+    if (motorstorm::gpu_report().api != "Vulkan") return;
+    run(memory, Case{3, {}});
+    motorstorm::gpu_sync(memory);
+    constexpr std::uint32_t source = kColor + 0x180000u, other = kColor + 0x190000u;
+    memory.zero(source, 4096u); memory.zero(other, 4096u);
+    const bool previous_lazy = motorstorm::gpu_lazy_publish();
+    motorstorm::gpu_set_lazy_publish(true);
+    motorstorm::gpu_set_deferred_readback(true);
+    motorstorm::GpuDraw draw;
+    draw.framebuffer = source; draw.stride = 32; draw.format = 3;
+    draw.right = draw.bottom = 32;
+    const auto submit = [&](std::uint32_t address, std::uint32_t rgb) {
+        draw.framebuffer = address;
+        const std::array<motorstorm::GpuVertex, 3> vertices{{
+            {4, 4, 70, rgb}, {20, 4, 70, rgb}, {4, 20, 70, rgb}}};
+        motorstorm::gpu_submit(memory, draw, vertices, nullptr);
+    };
+    submit(source, 0xFF102030u);
+    motorstorm::gpu_end_list(memory);
+    if (memory.load32(source + (10u * 32u + 10u) * 4u) != 0x00102030u)
+        throw std::runtime_error("Initial CPU query must publish current source pixels");
+    submit(source, 0xFFAABBCCu);
+    motorstorm::gpu_end_list(memory);
+    submit(other, 0xFFFEDCBAu); // Leave unrelated work recording.
+    const auto before = motorstorm::gpu_report();
+    if (memory.load32(source + (10u * 32u + 10u) * 4u) != 0x00AABBCCu ||
+        motorstorm::gpu_report().submissions != before.submissions)
+        throw std::runtime_error("A completed target readback must not submit unrelated recording work");
+    motorstorm::gpu_end_list(memory);
+    if (memory.load32(other + (10u * 32u + 10u) * 4u) != 0x00FEDCBAu)
+        throw std::runtime_error("Cached publication must preserve unrelated staged vertices and output");
+    memory.store32(source, 0x00775511u);
+    submit(source, 0xFF334455u);
+    motorstorm::gpu_end_list(memory);
+    if (memory.load32(source) != 0x00775511u ||
+        memory.load32(source + (10u * 32u + 10u) * 4u) != 0x00334455u)
+        throw std::runtime_error("CPU writes following cached readback must survive subsequent GPU draws");
+    motorstorm::gpu_set_deferred_readback(false);
+    motorstorm::gpu_set_lazy_publish(previous_lazy);
+}
+void feedback_after_overwrite(psprecomp::GuestMemory &memory) {
+    run(memory, Case{3, {}});
+    vertex(memory, 0, 4, 4, 0xFFFFFFFFu);
+    vertex(memory, 1, 8, 8, 0xFFFFFFFFu);
+    vertex(memory, 2, 4, 4, 0xFFAABBCCu);
+    vertex(memory, 3, 8, 8, 0xFFAABBCCu);
+    vertex(memory, 4, 12, 4, 0xFFFFFFFFu);
+    vertex(memory, 5, 16, 8, 0xFFFFFFFFu);
+    memory.store32(kVertices + 4u * 24u, std::bit_cast<std::uint32_t>(4.0f));
+    memory.store32(kVertices + 5u * 24u, std::bit_cast<std::uint32_t>(8.0f));
+    const std::vector<std::uint32_t> list{
+        0xA0000000u, 0xA8040020u, 0xB8000505u, 0xC3000003u, 0xC2000000u,
+        0xC6000000u, 0xC7000101u, 0xC9000103u, 0x1E000001u,
+        0x01000000u | (kVertices & 0xFFFFFFu), 0x04060002u,
+        0x1E000000u, 0x01000000u | ((kVertices + 48u) & 0xFFFFFFu), 0x04060002u,
+        0x1E000001u, 0x01000000u | ((kVertices + 96u) & 0xFFFFFFu), 0x04060002u,
+        0x0C000000u};
+    for (std::size_t i = 0; i < list.size(); ++i)
+        memory.store32(kList + static_cast<std::uint32_t>(i * 4u), list[i]);
+    motorstorm::software_ge_execute_list(memory, kList, 0);
+    if (memory.load32(kColor + (6u * 32u + 6u) * 4u) != 0x80AABBCCu ||
+        memory.load32(kColor + (6u * 32u + 14u) * 4u) != 0x80AABBCCu)
+        throw std::runtime_error("Self-feedback must refresh its snapshot after the sampled pixels are overwritten");
 }
 } // namespace
 // GPU texture decoding (DecodeCS) must match the CPU texel path bit for bit
@@ -275,12 +524,12 @@ void indexed_vertex_cache(psprecomp::GuestMemory &memory) {
     if (first.vertex_decodes != 4 || first.vertex_cache_hits != 1020)
         throw std::runtime_error("Indexed draws must decode each reused vertex only once");
     for (unsigned i = 0; i < 4; ++i)
-        if (memory.load32(kColor+(6*32+5+i)*4) != 0xFF102030u+i)
+        if (memory.load32(kColor+(6*32+5+i)*4) != 0x00102030u+i)
             throw std::runtime_error("Cached indexed point output differs from original vertices");
     vertex(memory,0,5,6,0xFFAABBCCu);
     memory.zero(kColor,32*32*4);
     motorstorm::software_ge_execute_list(memory,kList,0);
-    if (memory.load32(kColor+(6*32+5)*4) != 0xFFAABBCCu)
+    if (memory.load32(kColor+(6*32+5)*4) != 0x00AABBCCu)
         throw std::runtime_error("A vertex cache must never retain vertex data across draws");
     std::puts("Indexed vertex reuse: 1024 references decoded 4 times, changed vertices refreshed next draw");
 }
@@ -312,6 +561,10 @@ void replacement_alpha(psprecomp::GuestMemory &memory) {
             draw.framebuffer=kColor; draw.stride=32; draw.format=3; draw.right=draw.bottom=32;
             draw.commands[0x1E]=1; draw.commands[0xB8]=0x101; draw.commands[0xC9]=0x103;
             draw.commands[0xC6]=0x101;
+            // Observe runtime texture alpha through blending; framebuffer
+            // alpha itself stores stencil and must stay zero here.
+            draw.commands[0x21]=1;
+            draw.commands[0xDF]=0x32;
             const auto v=[](float x,float y,float u,float vv) { return motorstorm::GpuVertex{x,y,0,0xFFFFFFFFu,0,u,vv}; };
             const std::array vertices{v(4,4,0,0),v(20,4,2,0),v(4,20,0,2),v(4,20,0,2),v(20,4,2,0),v(20,20,2,2)};
             for (unsigned attempt = 0; attempt < 500; ++attempt) {
@@ -323,7 +576,9 @@ void replacement_alpha(psprecomp::GuestMemory &memory) {
                 if (attempt == 499) throw std::runtime_error("Replacement fixture did not load");
                 Sleep(2);
             }
-            const std::uint32_t expected = ((image ? std::min(alpha,128u) : alpha)<<24)|0x00552211u;
+            const auto effective_alpha = image ? std::min(alpha,128u) : alpha;
+            const std::uint32_t expected = (0x11u * effective_alpha / 255u) |
+                ((0x22u * effective_alpha / 255u) << 8u) | ((0x55u * effective_alpha / 255u) << 16u);
             if (memory.load32(kColor+(10*32+10)*4) != expected)
                 throw std::runtime_error("Skipping an opaque original changed replacement colour or runtime alpha");
         }
@@ -441,7 +696,17 @@ void widescreen_pixels(psprecomp::GuestMemory &memory) {
         };
         const std::array vertices{v(left,top),v(right,top),v(left,bottom),
                                  v(left,bottom),v(right,top),v(right,bottom)};
-        motorstorm::gpu_submit(memory, draw, vertices, nullptr);
+        // HUD artwork is textured. Untextured through-mode draws are screen
+        // effects and deliberately cover the widened scene without compression.
+        motorstorm::GpuTexture hud_texture;
+        if (!hardware && partial_scissor) {
+            hud_texture.key = 0x485544u;
+            hud_texture.levels = {{0xFFFFFFFFu}};
+            draw.texture = true;
+            draw.commands[0x1E] = 1u;
+            draw.commands[0xC9] = 0x103u;
+        }
+        motorstorm::gpu_submit(memory, draw, vertices, draw.texture ? &hud_texture : nullptr);
         motorstorm::gpu_sync(memory);
         return motorstorm::gpu_capture(memory, kColor, 512, 3, 480, 272);
     };
@@ -708,7 +973,8 @@ void enhanced_mip_texels(psprecomp::GuestMemory &memory) {
                         plain[k] += (c >> (k * 8)) & 255u;
                     }
                 }
-            std::uint32_t expected = ((alpha + 2) / 4) << 24;
+            // Mip alpha weights RGB but does not overwrite framebuffer stencil.
+            std::uint32_t expected = 0u;
             for (unsigned k = 0; k < 3; ++k)
                 expected |= (alpha ? (weighted[k] + alpha / 2) / alpha : (plain[k] + 2) / 4) << (k * 8);
             const auto actual = memory.load32(kColor + (y * 32 + x) * 4);
@@ -805,11 +1071,30 @@ int main(int argc, char **argv) {
         return 0;
     }
     // --vulkan runs every hardware check against the Vulkan renderer instead of D3D12.
-    const bool vulkan = argc > 1 && std::string(argv[1]) == "--vulkan";
+    bool vulkan = false, coherence_only = false;
+    for (int i = 1; i < argc; ++i) {
+        vulkan = vulkan || std::string(argv[i]) == "--vulkan";
+        coherence_only = coherence_only || std::string(argv[i]) == "--coherence-only";
+    }
     const char *renderer = vulkan ? "vulkan" : "d3d12";
     try {
         _putenv_s("PSPRECOMP_MOTORSTORM_RESOLUTION", "1");
         _putenv_s("PSPRECOMP_MOTORSTORM_AA", "none");
+        if (coherence_only) {
+            _putenv_s("PSPRECOMP_MOTORSTORM_RENDERER", renderer);
+            for (const char *resolution : {"1", "3"}) {
+                _putenv_s("PSPRECOMP_MOTORSTORM_RESOLUTION", resolution);
+                motorstorm::reset_software_ge();
+                psprecomp::GuestMemory memory;
+                cross_list_feedback(memory);
+                downsample_feedback_bounds(memory);
+                cached_readback_during_recording(memory);
+                feedback_after_overwrite(memory);
+                motorstorm::gpu_shutdown();
+            }
+            std::puts("Cross-list GPU feedback and demand-driven CPU publication passed");
+            return 0;
+        }
         std::vector<Case> cases;
         for (std::uint32_t format = 0; format < 4; ++format) {
             for (std::uint32_t equation = 0; equation < 6; ++equation)
@@ -865,6 +1150,8 @@ int main(int argc, char **argv) {
         run(memory, Case{3, {}});
         if (memory.load16(kDepth + (10 * 32 + 10) * 2) != 50)
             throw std::runtime_error("GPU depth-disabled UI must preserve the preview depth buffer");
+        cross_list_feedback(memory);
+        feedback_after_overwrite(memory);
         // 32-bit colour while racing: 16-bit targets keep the dropped colour
         // bits on the GPU, but what the game reads back stays PSP exact.
         motorstorm::gpu_set_racing(true);

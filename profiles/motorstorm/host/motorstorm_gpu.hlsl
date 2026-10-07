@@ -249,11 +249,13 @@ uint4 texel(int2 p, uint level) {
     uint w,h,n;
     if(feedback.x) {
         w=1u<<(C(0xb8)&15); h=1u<<((C(0xb8)>>8)&15);
-        if(feedback.x==2) { w=rasterExtent(w); h=rasterExtent(h); }
+        if(feedback.x==2 || feedback.x==4) { w=rasterExtent(w); h=rasterExtent(h); }
     }
     else textureImage.GetDimensions(level,w,h,n);
     p = int2(wrap(p.x,w,(C(0xc7)&1)!=0),wrap(p.y,h,(C(0xc7)&256)!=0));
-    if(feedback.x==3) {
+    // 3: the compact color surface at 1x; 4: the same at a raster scale
+    // (offset and pitch in raster pixels, like mode 2).
+    if(feedback.x==3 || feedback.x==4) {
         uint imageWidth,imageHeight,imageLevels;
         textureImage.GetDimensions(0,imageWidth,imageHeight,imageLevels);
         uint stride=max(feedback.z,1);
@@ -336,7 +338,7 @@ uint4 sampleEnhanced(float2 st, float2 gx, float2 gy, float2 size) {
     return uint4(saturate(c)*255+0.5);
 }
 uint4 shade(float2 uv, uint4 v, float clipW) {
-    if(feedback.x==2) uv*=rasterScale();
+    if(feedback.x==2 || feedback.x==4) uv*=rasterScale();
     // A replacement covers the first replace.z rows of the GE texture.
     float2 st = uv/float2(max(replace.yz,1)), stdx = ddx_coarse(st), stdy = ddy_coarse(st);
     uint baseW,baseH,baseLevels; textureImage.GetDimensions(0,baseW,baseH,baseLevels);
@@ -446,6 +448,7 @@ void pixelUpdate(uint2 pixel, uint4 s, bool clearing, uint z) {
     }
     if(clearing) { if(!(C(0xd3)&256)) s.rgb=d.rgb; if(!(C(0xd3)&512)) s.a=d.a; }
     else if(stencil) s.a=stencilOp(C(0xdd)>>16,oldStencil);
+    else s.a=d.a; // source alpha is a blend/test input; framebuffer alpha is stencil
     uint mask=(C(0xe8)&0xffffff)|alphaMask;
     COLOR_AT(index)=packFrame((pack(s)&~mask)|(oldColor&mask));
 }
@@ -533,6 +536,7 @@ float4 fastSample(float2 uv) {
 float4 feedbackColor(int2 p) {
     uint w = 1u << (C(0xb8) & 15);
     uint h = 1u << ((C(0xb8) >> 8) & 15);
+    if (feedback.x == 4) { w = rasterExtent(w); h = rasterExtent(h); }
     p = int2(wrap(p.x, w, (C(0xc7) & 1) != 0), wrap(p.y, h, (C(0xc7) & 256) != 0));
     uint stride = max(feedback.z, 1);
     uint imgW, imgH, levels;
@@ -542,8 +546,9 @@ float4 feedbackColor(int2 p) {
     return textureImage.Load(int3(pixel, 0));
 }
 float4 fastFeedback(float2 uv, float clipW) {
-    // feedback.x == 3: textureImage is the compact color surface. One load, no pack.
-    if (feedback.x == 3) {
+    // feedback.x == 3/4: textureImage is the compact color surface. One load, no pack.
+    if (feedback.x == 4) uv *= rasterScale();
+    if (feedback.x == 3 || feedback.x == 4) {
         bool filterLinear = (C(0xc6) & 257) != 0;
         if (!filterLinear) return saturate(feedbackColor(int2(floor(uv))));
         float2 base = uv - 0.5;
@@ -620,6 +625,14 @@ bool fastRejects(uint4 s) {
     return (C(0x27) & 1) && !compare(pack(s) & (C(0xda) & 0xffffff), C(0xd9) & C(0xda), C(0xd8) & 3);
 }
 uint4 fastQuantize(uint4 color) {
+    // classify_ge_draw only sends unconditional KEEP/ZERO/REPLACE stencil
+    // here when failed depth tests preserve alpha and RGB blending does not
+    // need the replaced source alpha. PSP stencil remains framebuffer alpha.
+    if ((render.w & 64u) != 0u) {
+        uint op = (C(0xdd) >> 16u) & 7u;
+        if (op == 1u) color.a = 0u;
+        else if (op == 2u) color.a = (C(0xdc) >> 8u) & 255u;
+    }
     return bytes(unpackFrame(packFrame(pack(color))));
 }
 // Opaque and blended draws. No discard. Force the depth test before shading so
@@ -679,6 +692,11 @@ float4 PSFastAlphaFeedback(Varying i) : SV_Target0 {
     return float4(fastQuantize(s)) / 255.0;
 }
 struct LoadResult { float4 color : SV_Target0; float depth : SV_Depth; };
+float4 PSLoadColor(Varying i) : SV_Target0 {
+    uint2 pixel = uint2(i.position.xy);
+    if (any(pixel >= surface.xy)) return 0;
+    return float4(bytes(unpackFrame(colorTarget[pixel.y * surface.z + pixel.x]))) / 255.0;
+}
 // Copies the packed R32 buffers into the compact color attachment and the real
 // depth attachment when a hardware draw follows an ordered draw.
 LoadResult PSLoad(Varying i) {
@@ -703,9 +721,17 @@ void PackColorCS(uint3 id : SV_DispatchThreadID) {
 void PackDepthCS(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= surface.xy)) return;
     uint i = id.y * surface.w + id.x;
-    uint pair = hwDepthBits.Load((i & ~1u) * 2u);
-    uint z = (i & 1u) ? (pair >> 16) : (pair & 0xFFFF);
-    depthTarget[i] = z;
+    if (mode.z == 2) {
+        float d = asfloat(hwDepthBits.Load(i * 4u));
+        depthTarget[i] = uint(saturate(d) * 65535.0 + 0.5);
+    } else if (mode.z == 1) {
+        uint raw = hwDepthBits.Load(i * 4u);
+        depthTarget[i] = (raw & 0x00FFFFFFu) >> 8u;
+    } else {
+        uint pair = hwDepthBits.Load((i & ~1u) * 2u);
+        uint z = (i & 1u) ? (pair >> 16) : (pair & 0xFFFF);
+        depthTarget[i] = z;
+    }
 }
 #endif
 // Direct swapchain presentation reads the GE's resident packed framebuffer.

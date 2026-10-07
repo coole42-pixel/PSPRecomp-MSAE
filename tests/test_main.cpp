@@ -23,6 +23,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <utility>
 
 static void require(bool condition, const char *message) {
     if (!condition) throw std::runtime_error(message);
@@ -2043,6 +2044,66 @@ int main() {
                 "Scratchpad clearing or main RAM independence failed");
         require(segmented_memory.contains(0x04000000u, psprecomp::GuestMemory::kVramSize),
                 "PSP EDRAM range was not mapped");
+        // A demand-driven renderer must publish before every VRAM access path,
+        // including host pointers and generated-code mirror accesses.
+        struct VramPublication { psprecomp::GuestMemory *memory; unsigned calls{}; };
+        VramPublication publication{&segmented_memory};
+        segmented_memory.set_vram_access_hook([](void *context) {
+            auto &pending = *static_cast<VramPublication *>(context);
+            ++pending.calls;
+            pending.memory->store32(0x04000000u, 0x76543210u);
+        }, &publication);
+        segmented_memory.arm_vram_hook(true);
+        (void)segmented_memory.raw_pointer(0x08000000u, 4u);
+        require(publication.calls == 0u && segmented_memory.vram_hook_armed(),
+                "RAM access must leave the VRAM publication hook armed");
+        require(segmented_memory.aot_fast_view().aot_load32(0x44600000u) == 0x76543210u &&
+                    publication.calls == 1u && !segmented_memory.vram_hook_armed(),
+                "AOT mirror load must publish once before reading VRAM");
+        segmented_memory.arm_vram_hook(true);
+        segmented_memory.aot_fast_view().aot_store32(0x44200000u, 0xABCDEF01u);
+        require(publication.calls == 2u && segmented_memory.load32(0x04000000u) == 0xABCDEF01u,
+                "AOT mirror store must publish before overwriting GPU pixels");
+        segmented_memory.arm_vram_hook(true);
+        const auto *vram_pointer = std::as_const(segmented_memory).raw_pointer(0x44400000u, 4u);
+        require(vram_pointer && vram_pointer[0] == 0x10u && publication.calls == 3u,
+                "Const host VRAM pointer must observe published pixels");
+        segmented_memory.arm_vram_hook(true);
+        require(segmented_memory.raw_pointer(0x04000000u, 4u) != nullptr && publication.calls == 4u,
+                "Mutable host VRAM pointer must publish before access");
+        segmented_memory.arm_vram_hook(true);
+        require(segmented_memory.vram_bytes()[0] == 0x10u && publication.calls == 5u,
+                "Whole VRAM access must publish before reading");
+        segmented_memory.set_vram_access_hook([](void *) { throw std::runtime_error("GPU publication failed"); }, nullptr);
+        for (bool whole_vram : {false, true}) {
+            segmented_memory.arm_vram_hook(true);
+            bool propagated = false;
+            try {
+                if (whole_vram) (void)segmented_memory.vram_bytes();
+                else (void)segmented_memory.raw_pointer(0x04000000u, 4u);
+            } catch (const std::runtime_error &) { propagated = true; }
+            require(propagated, "GPU publication errors must propagate through host VRAM access");
+        }
+        segmented_memory.set_vram_access_hook(nullptr, nullptr);
+        struct VramRange { std::uint32_t address{}; std::size_t length{}; unsigned calls{}; } range;
+        segmented_memory.set_vram_range_access_hook([](void *context, std::uint32_t address, std::size_t length) {
+            auto &value = *static_cast<VramRange *>(context);
+            value.address = address; value.length = length; ++value.calls;
+        }, &range);
+        segmented_memory.arm_vram_hook(true);
+        (void)segmented_memory.aot_load32(0x441FFFFEu);
+        require(range.calls == 1u && range.address == 0x441FFFFEu && range.length == 4u,
+                "Range coherence hook must describe a complete mirrored scalar read before wrap");
+        segmented_memory.arm_vram_hook(true);
+        std::array<std::uint8_t, 12> range_bytes{};
+        segmented_memory.copy_out(0x445FFFFCu, range_bytes);
+        require(range.calls == 2u && range.address == 0x445FFFFCu && range.length == range_bytes.size(),
+                "Range coherence hook must describe all bytes of a wrapping bulk read");
+        segmented_memory.arm_vram_hook(true);
+        segmented_memory.zero(0x04010000u, 32u);
+        require(range.calls == 3u && range.length == 32u,
+                "Range coherence hook must describe all bytes cleared by a CPU write");
+        segmented_memory.set_vram_access_hook(nullptr, nullptr);
         segmented_memory.store32(0x04000000u, 0x12345678u);
         require(segmented_memory.load32(0x44000000u) == 0x12345678u,
                 "PSP cached/uncached EDRAM aliasing failed");

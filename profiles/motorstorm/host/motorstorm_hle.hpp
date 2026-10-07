@@ -44,6 +44,8 @@ void report_summary();
 
 // Current execution-driven guest clock in microseconds.
 [[nodiscard]] std::uint64_t guest_time_us();
+// Benchmark CPU execution time on the GE worker; excludes blocking waits.
+[[nodiscard]] std::uint64_t ge_worker_cpu_time_ns();
 // True when the INI frame rate replaces the game's own 30 fps pacing.
 [[nodiscard]] bool frame_rate_unlocked();
 

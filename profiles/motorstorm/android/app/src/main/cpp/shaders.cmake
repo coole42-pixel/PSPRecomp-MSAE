@@ -73,7 +73,7 @@ list(APPEND SHADER_HEADERS "${psnoshade}")
 foreach(shader IN ITEMS VSFast:VSFast:vs_6_0:flip PointVSFast:PointVSFast:vs_6_0:flip
     PSFast:PSFast:ps_6_0:position PSFastAlpha:PSFastAlpha:ps_6_0:position PSFastAlphaEarly:PSFastAlphaEarly:ps_6_0:position
     PSFastFeedback:PSFastFeedback:ps_6_0:position PSFastAlphaFeedback:PSFastAlphaFeedback:ps_6_0:position
-    PSLoad:PSLoad:ps_6_0:position
+    PSLoad:PSLoad:ps_6_0:position PSLoadColor:PSLoadColor:ps_6_0:position
     PackColorCS:PackColorCS:cs_6_0:none PackDepthCS:PackDepthCS:cs_6_0:none)
     string(REPLACE ":" ";" parts "${shader}")
     list(GET parts 0 name)

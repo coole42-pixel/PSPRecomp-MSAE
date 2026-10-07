@@ -7,36 +7,85 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 final class GameSettings {
-    /** Internal resolution: 0 = full (matches the display), 1-4 = fixed PSP multiple. */
+    /** Internal resolution: 0 = full (matches the display), 1-5 = fixed PSP multiple. */
     static final String RESOLUTION = "internal_resolution";
-    static final String[] MIN_SCALES = {"0.20", "0.30", "0.40", "0.50", "0.60", "0.70", "0.80", "0.90"};
+    static final String LOGGING_MODE = "logging_mode";
+    static final String TOUCH_UI = "touch_ui";
+    static final String[] LOGGING_MODES = {"standard", "verbose", "off"};
+    static final String[] MIN_SCALES = {"0.50", "0.60", "0.70", "0.80", "0.90"};
+    static final String[] MAX_SCALES = {"0.50", "0.60", "0.70", "0.80", "0.90", "1.00"};
+    static final String[] FIXED_SCALES = {"0.50", "0.60", "0.70", "0.75", "0.80", "0.90", "1.00"};
     private static final int KEEP_SESSIONS = 3;
 
     static SharedPreferences prefs(Context c){return c.getSharedPreferences("settings",0);}
+    /** Apply the shipped graphics preset once, including existing installs. */
+    static void migrateVisualSettings(Context c){
+        if(prefs(c).getInt("visual_settings_version",0)<2)resetGraphics(c);
+    }
+    static void resetGraphics(Context c){
+        prefs(c).edit().putInt(RESOLUTION,2).putBoolean("fxaa",false)
+            .putString("scale_mode","off").putString("scale","0.75")
+            .putString("scale_min","0.50").putString("scale_max","1.00")
+            .putString("sgsr_sharpness","2.0").putString("fps","original")
+            .putBoolean("dynamic_fps",false).putBoolean("enhanced_filtering",false)
+            .putString("render_distance","low").putBoolean("less_pop_in",false)
+            .putBoolean("effects",false).putBoolean("sharpening",false)
+            .putBoolean("color_correction",false).putBoolean("soft_particles",false)
+            .putBoolean("rumble",false).putString(LOGGING_MODE,"standard")
+            .putInt("visual_settings_version",2).apply();
+    }
+    static File logsDirectory(Context c){
+        File dir=new File(c.getExternalFilesDir(null),"logs");
+        if(!dir.exists())dir.mkdirs();
+        return dir;
+    }
     /** Debug/benchmark launches may override the saved resolution for one session. */
     static int override=-1;
     static String scaleOverride;
+    static boolean benchmark;
+    static int benchmarkFps=60;
     static int resolution(Context c){
-        int value=override>=0?override:prefs(c).getInt(RESOLUTION,0);
-        return value<0||value>4?0:value;
+        int value=override>=0?override:prefs(c).getInt(RESOLUTION,2);
+        if(override>=0 && value>5)throw new IllegalArgumentException("Benchmark resolution must be 0 through 5");
+        return value<0||value>5?2:value;
     }
     static File session(Context c)throws Exception{
+        migrateVisualSettings(c);
         File root=c.getExternalFilesDir(null);File data=GameStore.root(c);
         removeOldSessions(root);
         int resolution=resolution(c);
         File output=new File(root,"session-"+System.currentTimeMillis()+".ini");
+        String loggingMode=benchmark?"standard":choice(c,LOGGING_MODE,"standard",LOGGING_MODES);
+        File logFile=loggingMode.equals("off")?null:(benchmark?new File(root,"MotorStormAndroid.log"):new File(logsDirectory(c),"MotorStorm.log"));
+        boolean verbose=loggingMode.equals("verbose");
         // Full resolution is chosen natively from the display; the INI keeps a
         // valid fixed value for the shared config parser.
         String content="[graphics]\nrenderer = vulkan\nresolution = "+(resolution==0?1:resolution)+"\nantialiasing = "+
-            (prefs(c).getBoolean("fxaa",false)?"FXAA":"None")+"\ntexture_filtering = psp\nfps = original\n"+
-            "dynamic_fps = false\nvsync = true\nwidescreen = auto\nrender_distance = normal\nless_pop_in = true\n"+
-            "[enhancements]\nenabled = false\n[window]\nenabled = true\nfullscreen = true\n"+
+            (!benchmark&&prefs(c).getBoolean("fxaa",false)?"FXAA":"None")+"\ntexture_filtering = "+
+            (!benchmark&&prefs(c).getBoolean("enhanced_filtering",false)?"enhanced":"psp")+"\nfps = "+
+            (benchmark?(benchmarkFps==0?"original":Integer.toString(benchmarkFps)):choice(c,"fps","original",new String[]{"original","60"}))+"\n"+
+            "dynamic_fps = "+(!benchmark&&prefs(c).getBoolean("dynamic_fps",false))+"\nvsync = true\nwidescreen = auto\nrender_distance = "+
+            (benchmark?"low":choice(c,"render_distance","low",new String[]{"low","normal","high","ultra"}))+
+            "\nless_pop_in = "+(!benchmark&&prefs(c).getBoolean("less_pop_in",false))+"\n"+
+            "[enhancements]\nenabled = "+(!benchmark&&prefs(c).getBoolean("effects",false))+
+            "\ncolor_depth = 16\ncolor_correction = "+prefs(c).getBoolean("color_correction",false)+
+            "\nsharpening = "+prefs(c).getBoolean("sharpening",false)+
+            "\nsoft_particles = "+prefs(c).getBoolean("soft_particles",false)+
+            "\n[window]\nenabled = true\nfullscreen = true\n"+
             "[audio]\napi = sdl\nenabled = "+prefs(c).getBoolean("audio",true)+"\n"+
-            "[controller]\napi = sdl\nenabled = true\n[textures]\nreplace = false\nbudget_mb = 128\n"+
+            "[controller]\napi = sdl\nenabled = true\nrumble = "+prefs(c).getBoolean("rumble",false)+
+            "\ntrigger_rumble = false\n[textures]\nreplace = false\nbudget_mb = 128\n"+
             "[paths]\neboot = "+new File(data,"EBOOT_DECRYPTED.BIN")+"\ndisc_root = "+new File(data,"disc0")+"\n"+
-            "[logging]\nlog_file = "+new File(root,"MotorStormAndroid.log")+"\n";
+            "[logging]\nlog_file = "+(logFile!=null?logFile.getAbsolutePath():"off")+
+            "\ntrace_imports = "+verbose+
+            "\ntrace_filesystem = "+verbose+
+            "\nverbose = "+verbose+"\n";
         Files.write(output.toPath(),content.getBytes(StandardCharsets.UTF_8),StandardOpenOption.CREATE_NEW);
         return output;
+    }
+    static String choice(Context c,String key,String fallback,String[] allowed){
+        String value=prefs(c).getString(key,fallback);
+        return Arrays.asList(allowed).contains(value)?value:fallback;
     }
     /** Every launch writes an immutable session INI; keep only the newest few. */
     private static void removeOldSessions(File root){
@@ -82,16 +131,18 @@ final class GameSettings {
         File temp=new File(c.getFilesDir(),"driver-temp");temp.mkdirs();
         String selected=prefs(c).getString("driver","");
         DriverStore.Driver driver=selected.isEmpty()?null:DriverStore.read(c,selected);
-        String mode=scaleOverride!=null?scaleOverride:prefs(c).getString("scale_mode","dynamic");
-        if(!mode.equals("off")&&!mode.equals("fixed")&&!mode.equals("dynamic"))mode="dynamic";
+        String mode=scaleOverride!=null?scaleOverride:benchmark?"off":prefs(c).getString("scale_mode","off");
+        if(!mode.equals("off")&&!mode.equals("fixed")&&!mode.equals("dynamic"))mode="off";
+        String loggingMode=benchmark?"standard":choice(c,LOGGING_MODE,"standard",LOGGING_MODES);
         return new String[]{"--config",session.getAbsolutePath(),"--native-lib",c.getApplicationInfo().nativeLibraryDir,
             "--driver-dir",driver==null?"":driver.directory().getAbsolutePath()+"/",
             "--driver-name",driver==null?"":driver.library(),"--driver-temp",temp.getAbsolutePath(),
             "--savedata",saves(c).getAbsolutePath(),
             "--resolution-mode",resolution(c)==0?"auto":"fixed",
             "--scale-mode",mode,"--scale",prefs(c).getString("scale","0.75"),
-            "--scale-min",prefs(c).getString("scale_min","0.20"),
+            "--scale-min",prefs(c).getString("scale_min","0.50"),
             "--scale-max",prefs(c).getString("scale_max","1.00"),
-            "--sgsr-sharpness",prefs(c).getString("sgsr_sharpness","2.0")};
+            "--sgsr-sharpness",prefs(c).getString("sgsr_sharpness","2.0"),
+            "--logging-mode",loggingMode};
     }
 }

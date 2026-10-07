@@ -14,7 +14,7 @@ struct NativeConfig {
     std::string eboot, disc_root, log_file;
     std::uint64_t max_dispatches{4'000'000'000ull};
     std::string renderer{"d3d12"}, antialiasing{"fxaa"};
-    std::uint32_t resolution{4}, window_scale{2};  // resolution: 1-4 or 8
+    std::uint32_t resolution{4}, window_scale{2};  // resolution: 1-5 or 8
     std::uint32_t fps{60};  // 0 = the game's original 30 fps pacing
     bool window{true}, fullscreen{}, audio{true};
     bool dynamic_fps{true};  // fall back to 30 fps instead of running in slow motion

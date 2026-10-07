@@ -240,10 +240,11 @@ DrawInspection inspection_settings() {
     return settings;
 }
 
-void inspect_draw(const DrawInspection &settings, std::uint64_t submission, std::uint64_t draw,
+void inspect_draw(const DrawInspection &settings, const GuestMemory &memory, std::uint64_t submission, std::uint64_t draw,
                   std::uint32_t list, std::uint32_t pc, std::uint32_t primitive) {
     if (!settings.enabled || (settings.select_submission && submission != settings.submission) ||
-        (settings.select_draw && draw != settings.draw))
+        (settings.select_draw && draw != settings.draw) ||
+        (settings.capture && (draw < settings.first || draw > settings.last)))
         return;
     std::error_code error;
     std::filesystem::create_directories(settings.directory, error);
@@ -267,7 +268,7 @@ void inspect_draw(const DrawInspection &settings, std::uint64_t submission, std:
                 else
                     out << "null";
             } else
-                out << value;
+                out << +value;
             separator = true;
         }
         out << "],\n";
@@ -359,6 +360,12 @@ void inspect_draw(const DrawInspection &settings, std::uint64_t submission, std:
     field("framebuffer_stride", state.framebuffer_stride);
     field("framebuffer_format", state.framebuffer_format);
     field("clear_mode", state.clear_mode);
+    if ((state.vertex_type & 0x800000u) && (primitive & 0xFFFFu) <= 12u &&
+        memory.contains(state.vertex_address, 512u)) {
+        std::array<std::uint8_t, 512> raw_vertices{};
+        memory.copy_out(state.vertex_address, raw_vertices);
+        array("vertex_bytes", raw_vertices);
+    }
     array("raw_commands", cmd);
     out << "\"state_moment\":\"before_draw\"\n}\n";
 }
@@ -369,7 +376,8 @@ void capture_draw(const DrawInspection &settings, const GuestMemory &memory, std
         (settings.select_draw && draw != settings.draw) || draw < settings.first || draw > settings.last)
         return;
     const auto &state = g_state;
-    const std::uint32_t width = std::min(480u, state.framebuffer_stride), height = 272u;
+    const std::uint32_t width = std::min(1024u, state.framebuffer_stride);
+    const std::uint32_t height = static_cast<std::uint32_t>(std::clamp(state.scissor_bottom, 1, 1024));
     if (width == 0u || state.framebuffer == 0u)
         return;
     std::vector<std::uint8_t> pixels(static_cast<std::size_t>(width) * height * 3u);
@@ -717,6 +725,8 @@ void store_pixel(GuestMemory &memory, std::int32_t x, std::int32_t y, std::uint3
     }
     if (!clearing && stencil_enabled)
         a = final_stencil;
+    else if (!clearing)
+        a = old_color >> 24u; // ordinary draws preserve the PSP stencil/alpha bits
     const auto mask = (g_state.commands[0xE8u] & 0xFFFFFFu) | ((g_state.commands[0xE9u] & 255u) << 24u);
     const auto packed = (a << 24u) | (b << 16u) | (g << 8u) | r;
     write_frame_pixel(memory, address, (packed & ~mask) | (old_color & mask));
@@ -1727,13 +1737,15 @@ const GpuTexture *gpu_texture(GuestMemory &memory) {
             g_state.texture_format==3 || g_state.texture_format==7 ? 32u : 16u;
         const auto row_bytes=(stride*bpp+7)/8;
         const auto bytes=(g_state.texture_mode&1) ? ((height+7)&~7u)*std::max(16u,(row_bytes+15)&~15u) : height*row_bytes;
-        levels[mip]={address,bytes,width,height,stride};
+        const auto access_bytes = g_state.texture_format <= 7u
+            ? std::max(bytes, texel_extent(g_state.texture_format,width,height,stride,(g_state.texture_mode&1u)!=0u))
+            : bytes;
+        levels[mip]={address,access_bytes,width,height,stride};
         state_key=hash_bytes(state_key,&levels[mip],sizeof(Level));
         // Texel bytes the GPU drew in this list: decode them from that target
         // on the GPU instead of waiting for a readback (single-level only).
         if(max_level==0 && g_state.texture_format<=7u && gpu_texture_decode()) {
-            const auto extent=std::max(bytes,texel_extent(g_state.texture_format,width,height,stride,
-                                                           (g_state.texture_mode&1u)!=0u));
+            const auto extent=access_bytes;
             gpu_source=gpu_source_in_target(address,extent,false,source_version);
             if(!gpu_source && memory.contains(address,extent))
                 gpu_overlay=gpu_overlay_targets(address,extent,source_version);
@@ -1743,7 +1755,7 @@ const GpuTexture *gpu_texture(GuestMemory &memory) {
                 break;
             }
         }
-        gpu_sync_texture(memory,address,bytes);
+        gpu_sync_texture(memory,address,access_bytes);
         settle_gpu_clut(memory);
         if(g_list_texture_epoch!=gpu_memory_epoch()) {
             g_list_texture_keys.clear(); g_list_texture_epoch=gpu_memory_epoch();
@@ -1755,6 +1767,26 @@ const GpuTexture *gpu_texture(GuestMemory &memory) {
         return &cached;
     }
     auto content_key=state_key;
+    // The ranges above have either been synchronized explicitly, or will be
+    // composed from resident GPU surfaces. Reading their RAM shadow is renderer
+    // work, not a guest CPU read of every outstanding framebuffer. Keep the
+    // one-shot guest hook armed for the next real CPU access.
+    struct TextureMemoryRead {
+        GuestMemory &memory;
+        bool armed;
+        std::uint64_t epoch;
+        explicit TextureMemoryRead(GuestMemory &value)
+            : memory(value), armed(value.vram_hook_armed()), epoch(gpu_memory_epoch()) {
+            memory.arm_vram_hook(false);
+        }
+        ~TextureMemoryRead() {
+            // A fallback can publish VRAM while this renderer read is in progress.
+            // In that case the publisher has already armed the hook for any
+            // remaining resident surfaces; do not overwrite that decision.
+            if (epoch == gpu_memory_epoch())
+                memory.arm_vram_hook(armed);
+        }
+    } texture_memory_read(memory);
     // Hash in L1-friendly chunks so no per-texture heap copy is needed; only
     // the content key consumes the bytes, the decoder reads guest memory again.
     std::array<std::uint8_t,16u*1024u> chunk{};
@@ -1832,6 +1864,10 @@ const GpuTexture *gpu_texture(GuestMemory &memory) {
         }
         if(!raw_ok) {
             // CPU path: decoded RGBA levels.
+            if (gpu_overlay) {
+                gpu_sync(memory);
+                texture.gpu_overlay = false;
+            }
             texture.raw.clear();
             for(std::uint32_t mip=0;mip<=max_level;++mip) {
                 const auto &level=levels[mip];
@@ -2615,7 +2651,11 @@ void execute_list(GuestMemory &memory, std::uint32_t address, std::uint32_t stal
             const std::uint32_t count = data & 0xFFFFu;
             const std::uint32_t type = (data >> 16u) & 7u;
             ++draw;
-            inspect_draw(inspection, submission, draw, address, cursor - 4u, data);
+            const bool inspect_selected = inspection.enabled &&
+                (!inspection.select_submission || submission == inspection.submission) &&
+                (!inspection.select_draw || draw == inspection.draw) &&
+                (!inspection.capture || (draw >= inspection.first && draw <= inspection.last));
+            inspect_draw(inspection, memory, submission, draw, address, cursor - 4u, data);
             if (!rasterize) {
                 const auto &layout = layout_for_type(g_state.vertex_type);
                 const std::uint32_t index_type = (g_state.vertex_type >> 11u) & 3u;
@@ -2651,7 +2691,7 @@ void execute_list(GuestMemory &memory, std::uint32_t address, std::uint32_t stal
             const bool gpu_draw=gpu_active() && type<=6u;
             const bool gpu_transform=gpu_draw && type!=6u;
             if(gpu_transform && type>=3u && type<=5u && !(g_state.vertex_type&0x800000u) && gpu_vertices_enabled() &&
-               !inspection.enabled) {
+               !inspect_selected) {
                 std::uint32_t vertex_end=0u;
                 bool submitted=false;
                 {
@@ -2726,8 +2766,8 @@ void execute_list(GuestMemory &memory, std::uint32_t address, std::uint32_t stal
                     perf::Scope submit_profile(perf::kGeSubmit);
                     submit_gpu_primitive(memory,type,vertices);
                 }
-                if(inspection.capture) gpu_sync(memory);
-                capture_draw(inspection,memory,submission,draw);
+                if(inspect_selected && inspection.capture) gpu_sync(memory);
+                if(inspect_selected) capture_draw(inspection,memory,submission,draw);
                 break;
             }
             if(gpu_active()) { gpu_sync(memory); gpu_note_software_draw(); }
@@ -2794,7 +2834,7 @@ void execute_list(GuestMemory &memory, std::uint32_t address, std::uint32_t stal
             default:
                 break;
             }
-            capture_draw(inspection, memory, submission, draw);
+            if(inspect_selected) capture_draw(inspection, memory, submission, draw);
             break;
         }
         default:

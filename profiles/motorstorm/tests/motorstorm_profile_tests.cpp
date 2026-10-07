@@ -741,8 +741,8 @@ int main(int argc,char **argv) {
                 "GE depth-fail stencil operation preserves RGB and depth");
         memory.store32(pixel, 0x55123456u);
         memory.store32(vertices, 0x8000FF00u);
-        require(execute({0x04000001u}) == 0x8000FF00u,
-                "GE writes fragment alpha when stencil is disabled");
+        require(execute({0x04000001u}) == 0x5500FF00u,
+                "GE preserves framebuffer stencil when drawing without stencil testing");
         memory.store32(pixel, 0x55123456u);
         require(execute({0xE90000FFu, 0x04000001u}) == 0x5500FF00u,
                 "GE mask MSB preserves destination alpha/stencil");

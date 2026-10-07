@@ -1,7 +1,9 @@
 #include "motorstorm_arena.hpp"
 #include "motorstorm_config.hpp"
+#include "motorstorm_env.hpp"
 #include "motorstorm_draw_distance.hpp"
 #include "motorstorm_frame_rate.hpp"
+#include "motorstorm_frame_metrics.hpp"
 #include "motorstorm_mobile.hpp"
 #include "motorstorm_pacing.hpp"
 #include "motorstorm_presentation.hpp"
@@ -40,6 +42,18 @@ struct EnvironmentScope {
 
 int main() {
     try {
+        for (const char *unset : {static_cast<const char *>(nullptr), ""}) {
+            check(motorstorm::lazy_publication_policy(unset, true),
+                  "Android defaults to lazy publication without an override");
+            check(!motorstorm::lazy_publication_policy(unset, false),
+                  "Windows retains eager publication without an override");
+        }
+        for (bool android : {false, true}) {
+            check(!motorstorm::lazy_publication_policy("0", android) &&
+                      !motorstorm::lazy_publication_policy("false", android) &&
+                      motorstorm::lazy_publication_policy("1", android),
+                  "explicit publication overrides apply on both platforms");
+        }
         using motorstorm::PixelFeatures;
         using motorstorm::PixelPath;
         using motorstorm::ScaleMode;
@@ -199,9 +213,41 @@ int main() {
             check(!classify_ge_draw(commands.data(), facts).hardware, "framebuffer feedback stays ordered");
             facts.feedback = false;
             facts.raster_half = 4u;
-            check(!classify_ge_draw(commands.data(), facts).hardware, "scales above native 1x stay ordered");
+            check(classify_ge_draw(commands.data(), facts).hardware, "scales above native 1x use the attachment path");
+            facts.raster_half = 0u;
+            check(!classify_ge_draw(commands.data(), facts).hardware, "an invalid raster scale stays ordered");
         }
 
+        {
+            // Alpha is PSP stencil storage. Ordinary textured/blended draws
+            // must preserve it, or later destination-alpha effects overbrighten.
+            std::array<std::uint32_t, 256> c{};
+            motorstorm::GeDrawFacts facts;
+            facts.format = 3;
+            check(motorstorm::classify_ge_draw(c.data(), facts).state.color_write_mask == 7,
+                  "ordinary color draws preserve framebuffer stencil alpha");
+            c[0x21] = 1; c[0xDF] = 2 | (3 << 4);
+            check(motorstorm::classify_ge_draw(c.data(), facts).state.color_write_mask == 7,
+                  "source-alpha RGB blending preserves destination stencil alpha");
+            c[0x21] = 0; c[0xD3] = 1 | 0x200;
+            check(motorstorm::classify_ge_draw(c.data(), facts).state.color_write_mask == 8,
+                  "an explicit alpha clear can still initialize stencil");
+            c[0xD3] = 0; c[0x24] = 1; c[0xDC] = 1 | (0x40 << 8);
+            c[0xDD] = 2 | (2 << 8) | (2 << 16);
+            auto replace = motorstorm::classify_ge_draw(c.data(), facts);
+            check(replace.hardware && replace.framebuffer_alpha_stencil && replace.exact_pixel &&
+                      !replace.state.stencil_test && replace.state.color_write_mask == 15,
+                  "unconditional replace writes stencil directly to framebuffer alpha");
+            c[0x23] = 1; c[0xDE] = 4;
+            check(!motorstorm::classify_ge_draw(c.data(), facts).hardware,
+                  "depth-fail stencil writes require ordered pixel operations");
+            c[0x23] = 0; c[0x21] = 1; c[0xDF] = 2 | (3 << 4);
+            check(!motorstorm::classify_ge_draw(c.data(), facts).hardware,
+                  "stencil replacement cannot overwrite alpha needed by RGB blending");
+            c[0x21] = 0; c[0xDC] = 2 | (0x40 << 8);
+            check(!motorstorm::classify_ge_draw(c.data(), facts).hardware,
+                  "conditional stencil tests keep the framebuffer-alpha ordered route");
+        }
         ScaleSettings dynamic;
         dynamic.mode = ScaleMode::Dynamic;
         dynamic.min_scale = 0.5f;
@@ -300,6 +346,21 @@ int main() {
             check(half > 5u, "fast gameplay climbs back toward full resolution");
             half = drs.update(10u, 5u, false, 80.0, settings, 0);
             check(half == 10u, "leaving gameplay returns to full resolution at once");
+            motorstorm::DynamicResolution two_x;
+            settings.min_scale = 0.2f;
+            half = 4u;
+            for (int w = 0; w < 10; ++w)
+                for (int i = 0; i < motorstorm::DynamicResolution::kWindowFrames; ++i)
+                    half = two_x.update(4u, half, true, 80.0, settings, 0);
+            check(half == 2u, "dynamic scaling at 2x stops at native 1x, not below");
+            motorstorm::DynamicResolution paced;
+            half = 4u;
+            for (int i = 0; i < motorstorm::DynamicResolution::kWindowFrames; ++i)
+                half = paced.update(4u, half, true, 80.0, settings, 0, 33.4);
+            check(half == 4u, "a high GPU time with frames on time keeps the resolution");
+            for (int i = 0; i < motorstorm::DynamicResolution::kWindowFrames; ++i)
+                half = paced.update(4u, half, true, 80.0, settings, 0, 50.0);
+            check(half == 3u, "a high GPU time with late frames steps down");
         }
 
         const auto steer = motorstorm::touch_sample(0.16f, 0.74f);
@@ -317,6 +378,35 @@ int main() {
         const auto directory = std::filesystem::temp_directory_path() / "motorstorm_config_regressions";
         std::filesystem::create_directories(directory);
         const auto path = directory / "settings.ini";
+        {
+            const char *old_bench = std::getenv("PSPRECOMP_MOTORSTORM_BENCH_OUT");
+            const std::string previous_bench = old_bench ? old_bench : "";
+            const auto metric_output = directory / "frame-metric-test.txt";
+            _putenv_s("PSPRECOMP_MOTORSTORM_BENCH_OUT", metric_output.string().c_str());
+            {
+                motorstorm::FrameMetrics metrics;
+                check(metrics.enabled(), "frame telemetry opens its own benchmark output");
+                const motorstorm::FrameMetrics::Metadata origin{42, 115000000, 10, true};
+                metrics.event(origin, "ge", 10, 1000);
+                metrics.request(1, origin);
+                metrics.displayed(1, 5000);
+                metrics.displayed(1, 5000); // repeated feedback cannot count again
+                metrics.request(2, {43, 115016667, 10, true});
+                metrics.displayed(2, 5000); // one display timestamp is one shown frame
+                metrics.request(3, {44, 115033334, 10, true});
+                metrics.displayed(3, 0); // no actual display timestamp is no proof
+                check(metrics.requests() == 3 && metrics.displays() == 1,
+                      "display telemetry counts unique actual displayed images, not queued requests");
+                metrics.event({}, "session_end");
+                metrics.flush();
+            }
+            _putenv_s("PSPRECOMP_MOTORSTORM_BENCH_OUT", previous_bench.c_str());
+            std::ifstream rows(directory / "frame-metric-test-gpu-frame-times.csv");
+            const std::string csv((std::istreambuf_iterator<char>(rows)), std::istreambuf_iterator<char>());
+            check(csv.find("42,115000000,ge,10,1000,10,1") != std::string::npos &&
+                      csv.find(",session_end,") != std::string::npos,
+                  "GPU events retain game-frame identity, guest time, actual scale and clean completion");
+        }
         {
             std::ofstream file(path);
             file << "\xEF\xBB\xBF[graphics]\nresolution=2\nantialiasing=None\nrenderer=auto\nfps=Original\nwidescreen=psp\n"
@@ -358,7 +448,7 @@ int main() {
         for (const char *invalid : {"[graphics]\nresolution=0\n", "[graphics]\nantialiasing=MSAA\n",
                                    "[window]\nfullscreen=perhaps\n", "[window]\nscale=9\n",
                                    "[graphics]\nfps=20\n", "[graphics]\nfps=241\n", "[graphics]\nfps=fast\n",
-                                   "[graphics]\nwidescreen=stretch\n", "[graphics]\nresolution=5\n",
+                                   "[graphics]\nwidescreen=stretch\n", "[graphics]\nresolution=6\n",
                                    "[graphics]\nresolution=16\n", "[graphics]\nrender_distance=far\n",
                                    "[graphics]\nrender_distance=9\n", "[graphics]\nless_pop_in=maybe\n"}) {
             { std::ofstream file(path); file << invalid; }
@@ -368,6 +458,9 @@ int main() {
             check(rejected, "Invalid INI values report the option's file and line");
         }
         {
+            { std::ofstream file(path); file << "[graphics]\nresolution=5\n"; }
+            check(motorstorm::load_native_config(path).resolution == 5u,
+                  "fixed 5x resolution loads without falling back to another scale");
             { std::ofstream file(path); file << "[graphics]\nresolution=8\nless_pop_in=false\nrender_distance=Ultra\n"; }
             const auto eight = motorstorm::load_native_config(path);
             check(eight.resolution == 8u && !eight.less_pop_in && eight.render_distance == "ultra" && eight.warnings.empty(),

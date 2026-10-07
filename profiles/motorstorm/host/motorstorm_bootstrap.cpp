@@ -29,6 +29,19 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <dlfcn.h>
+#include <unwind.h>
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
+#endif
+
 
 namespace {
 // Optional dispatch-PC sampler (PSPRECOMP_MOTORSTORM_PC_SAMPLE=1): counts every
@@ -42,6 +55,122 @@ namespace {
 
 std::mutex g_log_mutex;
 std::FILE *g_log_file = nullptr;
+std::filesystem::path g_current_log_path;
+bool g_verbose_logging{};
+struct TraceWindow { std::chrono::steady_clock::time_point start{}; unsigned emitted{}, suppressed{}; };
+std::unordered_map<std::string, TraceWindow> g_trace_windows;
+
+void flush_log_internal() {
+    if (g_log_file != nullptr) {
+        std::fflush(g_log_file);
+#if defined(_WIN32)
+        const int fd = _fileno(g_log_file);
+        if (fd >= 0) _commit(fd);
+#else
+        const int fd = fileno(g_log_file);
+        if (fd >= 0) fsync(fd);
+#endif
+    }
+}
+
+#if !defined(_WIN32)
+struct BacktraceState {
+    void **current;
+    void **end;
+};
+
+static _Unwind_Reason_Code unwind_callback(struct _Unwind_Context *context, void *arg) {
+    BacktraceState *state = static_cast<BacktraceState *>(arg);
+    uintptr_t pc = _Unwind_GetIP(context);
+    if (pc) {
+        if (state->current == state->end) return _URC_END_OF_STACK;
+        *state->current++ = reinterpret_cast<void *>(pc);
+    }
+    return _URC_NO_REASON;
+}
+
+static size_t capture_backtrace(void **buffer, size_t max) {
+    BacktraceState state{buffer, buffer + max};
+    _Unwind_Backtrace(unwind_callback, &state);
+    return state.current - buffer;
+}
+
+static struct sigaction s_old_handlers[32];
+
+static void crash_signal_handler(int sig, siginfo_t *info, void *) {
+    const char *sig_name = "UNKNOWN";
+    switch (sig) {
+        case SIGSEGV: sig_name = "SIGSEGV (Segmentation fault)"; break;
+        case SIGBUS:  sig_name = "SIGBUS (Bus error)"; break;
+        case SIGABRT: sig_name = "SIGABRT (Abort)"; break;
+        case SIGFPE:  sig_name = "SIGFPE (Floating point error)"; break;
+        case SIGILL:  sig_name = "SIGILL (Illegal instruction)"; break;
+        case SIGTRAP: sig_name = "SIGTRAP (Trap)"; break;
+    }
+
+    char crash_msg[3072];
+    void *fault_addr = info ? info->si_addr : nullptr;
+    int code = info ? info->si_code : 0;
+    pid_t tid = gettid();
+
+    int len = snprintf(crash_msg, sizeof(crash_msg),
+        "\n=======================================================\n"
+        "FATAL CRASH DETECTED!\n"
+        "Signal: %s (%d), code=%d, fault_addr=%p, thread_id=%d\n"
+        "Guest Virtual Time: %llu us\n"
+        "Current Thread: uid=%d, name=\"%s\", dispatch_pc=0x%08X\n"
+        "Callstack backtrace:\n",
+        sig_name, sig, code, fault_addr, static_cast<int>(tid),
+        static_cast<unsigned long long>(guest_time_us()),
+        psprecomp::runtime_thread_uid(), psprecomp::runtime_thread_name(),
+        psprecomp::runtime_dispatch_pc());
+
+    void *stack[32];
+    size_t count = capture_backtrace(stack, 32);
+    for (size_t i = 0; i < count && len < (int)sizeof(crash_msg) - 160; ++i) {
+        Dl_info dlinfo;
+        if (dladdr(stack[i], &dlinfo) && dlinfo.dli_fname) {
+            const char *slash = strrchr(dlinfo.dli_fname, '/');
+            const char *lib = slash ? slash + 1 : dlinfo.dli_fname;
+            uintptr_t offset = (uintptr_t)stack[i] - (uintptr_t)dlinfo.dli_fbase;
+            len += snprintf(crash_msg + len, sizeof(crash_msg) - len,
+                "  #%02zu pc 0x%08zx  %s (%s)\n", i, offset, lib,
+                dlinfo.dli_sname ? dlinfo.dli_sname : "");
+        } else {
+            len += snprintf(crash_msg + len, sizeof(crash_msg) - len,
+                "  #%02zu pc %p\n", i, stack[i]);
+        }
+    }
+    if (len < (int)sizeof(crash_msg) - 64) {
+        len += snprintf(crash_msg + len, sizeof(crash_msg) - len,
+            "=======================================================\n\n");
+    }
+
+#if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_FATAL, "MotorStorm", "%s", crash_msg);
+#endif
+    log_line("CRASH", crash_msg);
+    flush_log_file();
+
+    auto log_path = current_log_file_path();
+    if (!log_path.empty()) {
+        std::filesystem::path crash_path = log_path.parent_path() / "MotorStorm-crash.log";
+        int fd = open(crash_path.string().c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd >= 0) {
+            (void)write(fd, crash_msg, len);
+            fsync(fd);
+            close(fd);
+        }
+    }
+
+    if (sig >= 0 && sig < 32 && s_old_handlers[sig].sa_handler != SIG_DFL && s_old_handlers[sig].sa_sigaction != nullptr) {
+        sigaction(sig, &s_old_handlers[sig], nullptr);
+    } else {
+        signal(sig, SIG_DFL);
+    }
+    raise(sig);
+}
+#endif
 
 std::uint64_t parse_u64(const std::string &text, std::uint64_t fallback) {
     if (text.empty()) return fallback;
@@ -68,13 +197,91 @@ const char *environment(const char *name) {
 
 } // namespace
 
+void flush_log_file() {
+    std::lock_guard<std::mutex> guard(g_log_mutex);
+    flush_log_internal();
+}
+
+std::filesystem::path current_log_file_path() {
+    std::lock_guard<std::mutex> guard(g_log_mutex);
+    return g_current_log_path;
+}
+
+void install_crash_handlers() {
+#if !defined(_WIN32)
+    static char alt_stack[SIGSTKSZ];
+    stack_t ss{};
+    ss.ss_sp = alt_stack;
+    ss.ss_size = sizeof(alt_stack);
+    ss.ss_flags = 0;
+    sigaltstack(&ss, nullptr);
+
+    struct sigaction sa{};
+    sa.sa_sigaction = crash_signal_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+
+    const int signals[] = {SIGSEGV, SIGBUS, SIGABRT, SIGFPE, SIGILL, SIGTRAP};
+    for (int s : signals) {
+        sigaction(s, &sa, &s_old_handlers[s]);
+    }
+#endif
+
+    std::set_terminate([]() {
+        char err[512] = "std::terminate() called";
+        std::exception_ptr ex = std::current_exception();
+        if (ex) {
+            try {
+                std::rethrow_exception(ex);
+            } catch (const std::exception &e) {
+                snprintf(err, sizeof(err), "std::terminate() called with exception: %s", e.what());
+            } catch (...) {
+                snprintf(err, sizeof(err), "std::terminate() called with unknown exception");
+            }
+        }
+        log_line("CRASH", err);
+        flush_log_file();
+        std::abort();
+    });
+}
+
 void log_line(std::string_view category, std::string_view message) {
     std::lock_guard<std::mutex> guard(g_log_mutex);
+    const bool routine = category == "IMPORT" ||
+        (category == "THREAD" && message.starts_with("wake ") &&
+         message.find("value=0x00000000") != std::string_view::npos) ||
+        (category == "DISPATCH" && message.starts_with("switch reason=")) ||
+        (category == "CALLBACK" && (message.starts_with("entering ") || message.starts_with("returned ") ||
+                                    message.starts_with("check ")));
+    if (routine) {
+        if (!g_verbose_logging) return;
+        auto &window = g_trace_windows[std::string(category)];
+        const auto now = std::chrono::steady_clock::now();
+        if (now - window.start >= std::chrono::seconds(2)) {
+            if (window.suppressed) {
+                std::cout << "[LOG] suppressed " << window.suppressed << " routine " << category << " traces\n";
+                if (g_log_file)
+                    std::fprintf(g_log_file, "[LOG] suppressed %u routine %.*s traces\n", window.suppressed,
+                                 static_cast<int>(category.size()), category.data());
+            }
+            window = {now, 0u, 0u};
+        }
+        if (window.emitted++ >= 16u) { ++window.suppressed; return; }
+    }
     std::cout << '[' << category << "] " << message << '\n';
     if (g_log_file != nullptr) {
         std::fprintf(g_log_file, "[%s] %.*s\n", std::string(category).c_str(),
                      static_cast<int>(message.size()), message.data());
         std::fflush(g_log_file);
+        if (category == category::kError || category == "CRASH" || category == "LIFECYCLE") {
+#if defined(_WIN32)
+            const int fd = _fileno(g_log_file);
+            if (fd >= 0) _commit(fd);
+#else
+            const int fd = fileno(g_log_file);
+            if (fd >= 0) fsync(fd);
+#endif
+        }
     }
 }
 
@@ -90,8 +297,22 @@ void log_linef(std::string_view category, const char *format, ...) {
 bool open_log_file(const std::filesystem::path &path) {
     std::lock_guard<std::mutex> guard(g_log_mutex);
     if (g_log_file != nullptr) {
+        flush_log_internal();
         std::fclose(g_log_file);
         g_log_file = nullptr;
+    }
+    if (path.empty() || path == "none" || path == "off") {
+        g_current_log_path.clear();
+        return false;
+    }
+    std::error_code ec;
+    if (std::filesystem::exists(path, ec) && std::filesystem::file_size(path, ec) > 0) {
+        std::filesystem::path prev = path;
+        prev.replace_filename(path.stem().string() + "-prev" + path.extension().string());
+        std::filesystem::copy_file(path, prev, std::filesystem::copy_options::overwrite_existing, ec);
+    }
+    if (path.has_parent_path()) {
+        std::filesystem::create_directories(path.parent_path(), ec);
     }
 #if defined(_MSC_VER)
     FILE *file = nullptr;
@@ -100,15 +321,21 @@ bool open_log_file(const std::filesystem::path &path) {
 #else
     g_log_file = std::fopen(path.string().c_str(), "wb");
 #endif
+    if (g_log_file != nullptr) {
+        g_current_log_path = path;
+        std::setvbuf(g_log_file, nullptr, _IOLBF, 1024);
+    }
     return g_log_file != nullptr;
 }
 
 void close_log_file() {
     std::lock_guard<std::mutex> guard(g_log_mutex);
     if (g_log_file != nullptr) {
+        flush_log_internal();
         std::fclose(g_log_file);
         g_log_file = nullptr;
     }
+    g_current_log_path.clear();
 }
 
 BootstrapPaths resolve_bootstrap_paths(int argc, const char *const *argv,
@@ -179,10 +406,20 @@ BootstrapPaths resolve_bootstrap_paths(int argc, const char *const *argv,
     // --- Log file ----------------------------------------------------------
     if (const char *override_path = environment("PSPRECOMP_MOTORSTORM_LOG"))
         paths.log_file = override_path;
-    else if (!ini.log_file.empty())
-        paths.log_file = ini.source.parent_path() / ini.log_file;
-    else
-        paths.log_file = executable_directory / "MotorStormNative.log";
+    else if (!ini.log_file.empty()) {
+        if (ini.log_file == "none" || ini.log_file == "off") {
+            paths.log_file.clear();
+        } else {
+            std::filesystem::path configured(ini.log_file);
+            if (configured.is_absolute()) {
+                paths.log_file = configured;
+            } else {
+                paths.log_file = ini.source.parent_path() / configured;
+            }
+        }
+    } else {
+        paths.log_file.clear();
+    }
 
     // --- Dispatch cap ------------------------------------------------------
     paths.max_dispatches = 4'000'000'000ull;
@@ -195,6 +432,10 @@ BootstrapPaths resolve_bootstrap_paths(int argc, const char *const *argv,
 }
 
 int run(const BootstrapPaths &paths) {
+    g_verbose_logging = paths.verbose || paths.config.trace_imports;
+    g_trace_windows.clear();
+    log_line("LOG", std::string("mode=") + (g_verbose_logging ? "verbose (routine traces capped at 16/category/2s)"
+                                                              : "standard (routine traces suppressed)"));
     const bool fullscreen_overridden = [] {
         const char *value = std::getenv("PSPRECOMP_MOTORSTORM_FULLSCREEN");
         return value != nullptr && *value != char{};

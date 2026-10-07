@@ -2,6 +2,7 @@
 #include "motorstorm_bootstrap.hpp"
 #include "motorstorm_presentation.hpp"
 #include "motorstorm_perf.hpp"
+#include "motorstorm_env.hpp"
 #include "motorstorm_post.hpp"
 #include "motorstorm_textures.hpp"
 #if defined(MOTORSTORM_VULKAN)
@@ -116,16 +117,16 @@ std::uint32_t physical(std::uint32_t address) {
 // published it), so load_surface compares the stale guest bytes against the
 // last published shadow without waiting and keeps the GPU image when they
 // match.  This removes the per-list publish wait and copy from the race path.
-// PSPRECOMP_MOTORSTORM_GPU_LAZY_PUBLISH=0 (or "false") restores the eager
-// list-start publication for A/B checks.
-bool lazy_publish_enabled() {
-    static const bool value = [] {
-        const char *text = std::getenv("PSPRECOMP_MOTORSTORM_GPU_LAZY_PUBLISH");
-        if (text == nullptr || *text == '\0') return true;
-        return std::strcmp(text, "0") != 0 && std::strcmp(text, "false") != 0;
-    }();
-    return value;
-}
+// Measured on the Windows race benchmark (2026-10-07): lazy publication is
+// correct but slightly slower than eager publication on D3D12 (about -2.6%),
+// because the GE texture/content paths touch VRAM often enough that the hook
+// publishes more in total than the once-per-list eager call.  Windows
+// therefore defaults to eager; PSPRECOMP_MOTORSTORM_GPU_LAZY_PUBLISH=1 forces
+// lazy for A/B checks (Android defaults to lazy in the Vulkan backend).
+bool lazy_publish_setting = [] {
+    return lazy_publication_policy(std::getenv("PSPRECOMP_MOTORSTORM_GPU_LAZY_PUBLISH"), false);
+}();
+bool lazy_publish_enabled() { return lazy_publish_setting; }
 // Raster scales are kept in half units (2 = 1x, 3 = 1.5x, 4 = 2x, ...) so
 // SSAA2x can rasterize at 1.5x per axis. Raster pixel r belongs to native
 // pixel (2r+1)/half; native pixel n starts at raster pixel (n*half)/2. Every
@@ -264,6 +265,7 @@ struct State {
     UINT64 texture_bytes{};
     std::vector<UINT> free_descriptors;
     std::vector<ComPtr<ID3D12Resource>> transient;
+    std::deque<std::pair<UINT64, std::vector<ComPtr<ID3D12Resource>>>> retired_transient;
     bool recording{}, has_commands{};
     std::vector<std::unique_ptr<Surface>> surfaces;
     // GE block transfers out of a target drawn in the current list: the GPU
@@ -406,7 +408,8 @@ struct State {
     }
 };
 std::unique_ptr<State> state;
-void publish_readbacks(State &s, psprecomp::GuestMemory &memory);
+void publish_readbacks(State &s, psprecomp::GuestMemory &memory,
+                       std::uint32_t address = 0u, std::size_t length = 0u);
 int publish_reason = 5;
 struct PublishReason {
     int previous;
@@ -923,7 +926,7 @@ void transition_image(State &s, ID3D12Resource *image, D3D12_RESOURCE_STATES fro
 Surface *drawn_target(State &s, std::uint32_t address, std::uint32_t bytes, bool palette) {
     address = physical(address);
     for (const auto &surface : s.surfaces)
-        if (surface->dirty && (!palette || surface->bpp == 4u) && address >= surface->address &&
+        if ((surface->dirty || surface->readback_pending) && (!palette || surface->bpp == 4u) && address >= surface->address &&
             static_cast<UINT64>(address) + bytes <= surface->address + surface->guest_bytes() &&
             (!palette || (address - surface->address) % 4u == 0u))
             return surface.get();
@@ -1004,7 +1007,7 @@ void decode_level(State &s, const GpuTexture &texture, UINT level, UINT index) {
             for (const auto &surface : s.surfaces) {
                 const UINT64 first = std::max<UINT64>(begin, surface->address);
                 const UINT64 last = std::min<UINT64>(end, surface->address + surface->guest_bytes());
-                if (!surface->dirty || first >= last)
+                if ((!surface->dirty && !surface->readback_pending) || first >= last)
                     continue;
                 auto *resolved = resolve_surface(s, *surface);
                 target_state(s, *surface, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1309,7 +1312,8 @@ ID3D12Resource *feedback_snapshot(State &s, const psprecomp::GuestMemory &memory
     const auto bpp = texture.feedback_format == 3 ? 4u : 2u;
     Surface *source = nullptr;
     for (const auto &candidate : s.surfaces)
-        if (candidate->loaded && candidate->stride == texture.feedback_stride && candidate->bpp == bpp &&
+        if ((candidate->loaded || candidate->dirty || candidate->readback_pending) &&
+            candidate->stride == texture.feedback_stride && candidate->bpp == bpp &&
             address >= candidate->address &&
             address < static_cast<UINT64>(candidate->address) + candidate->guest_bytes()) {
             source = candidate.get();
@@ -1563,10 +1567,12 @@ bool gpu_initialize() {
                 s.output_scale = 3;
             else if (choice == "4" || choice == "4x" || choice == "1920x1088")
                 s.output_scale = 4;
+            else if (choice == "5" || choice == "5x" || choice == "2400x1360")
+                s.output_scale = 5;
             else if (choice == "8" || choice == "8x" || choice == "3840x2176")
                 s.output_scale = 8;
             else
-                throw std::runtime_error("MotorStorm resolution must be 1x, 2x, 3x, 4x or 8x");
+                throw std::runtime_error("MotorStorm resolution must be 1x, 2x, 3x, 4x, 5x or 8x");
         }
         if (const char *value = std::getenv("PSPRECOMP_MOTORSTORM_AA")) {
             const std::string choice = value;
@@ -2037,6 +2043,17 @@ void gpu_submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<c
 namespace {
 // Record the readback of every surface drawn by this list and submit the list.
 // The copies land in the readback buffers once the queue reaches them.
+void retire_completed_resources(State &s) {
+    if (s.recording)
+        return;
+    if (!s.transient.empty()) {
+        s.retired_transient.emplace_back(s.fence_value, std::move(s.transient));
+        s.transient.clear();
+    }
+    const auto completed = s.fence->GetCompletedValue();
+    while (!s.retired_transient.empty() && s.retired_transient.front().first <= completed)
+        s.retired_transient.pop_front();
+}
 void finish_list(State &s) {
     for (const auto &surface : s.surfaces) {
         if (surface->dirty) {
@@ -2069,7 +2086,7 @@ void finish_list(State &s) {
 // Wait for submitted GE work and copy its pixels into guest memory. Bytes the
 // CPU changed after the list ended keep the CPU's value, exactly as if the
 // readback had been published at the list boundary and the CPU wrote after.
-void publish_readbacks(State &s, psprecomp::GuestMemory &memory) {
+void publish_readbacks(State &s, psprecomp::GuestMemory &memory, std::uint32_t address, std::size_t length) {
     memory.arm_vram_hook(false);
     if (s.readback_fence == 0u)
         return;
@@ -2093,6 +2110,8 @@ void publish_readbacks(State &s, psprecomp::GuestMemory &memory) {
         check(s.transfer_ring->Map(0, &range, &mapped), "map GE transfer readback");
         std::vector<std::uint8_t> row;
         for (const auto &transfer : s.pending_transfers) {
+            if (length && !vram_ranges_overlap(address, length, transfer.start(), transfer.bytes()))
+                continue;
             const auto *pixels = static_cast<const std::uint8_t *>(mapped) + transfer.offset;
             row.resize(static_cast<std::size_t>(transfer.width) * transfer.bpp);
             for (std::uint32_t y = 0; y < transfer.height; ++y, pixels += transfer.width * 4u) {
@@ -2110,12 +2129,16 @@ void publish_readbacks(State &s, psprecomp::GuestMemory &memory) {
         }
         D3D12_RANGE none{};
         s.transfer_ring->Unmap(0, &none);
-        s.pending_transfers.clear();
-        s.transfer_used = 0u;
+        std::erase_if(s.pending_transfers, [&](const auto &transfer) {
+            return !length || vram_ranges_overlap(address, length, transfer.start(), transfer.bytes());
+        });
+        if (s.pending_transfers.empty())
+            s.transfer_used = 0u;
     }
     std::vector<std::uint8_t> current;
     for (const auto &surface : s.surfaces) {
-        if (!surface->readback_pending)
+        if (!surface->readback_pending ||
+            (length && !vram_ranges_overlap(address, length, surface->address, surface->guest_bytes())))
             continue;
         void *mapped_pixels{};
         D3D12_RANGE range{0, static_cast<SIZE_T>(surface->native_bytes())};
@@ -2144,12 +2167,23 @@ void publish_readbacks(State &s, psprecomp::GuestMemory &memory) {
         }
         surface->guest_shadow = std::move(published);
         surface->readback_pending = false;
+        surface->loaded = false;
     }
+    const bool unpublished = !s.pending_transfers.empty() ||
+        std::any_of(s.surfaces.begin(), s.surfaces.end(), [](const auto &surface) {
+            return surface->dirty || surface->readback_pending;
+        });
+    if (unpublished)
+        s.readback_fence = s.fence_value;
+    memory.arm_vram_hook(unpublished);
     // A publish can run while a list is recording (VRAM hook); that list may
     // still reference transient resources and cached textures.
     if (s.recording)
         return;
-    s.transient.clear();
+    retire_completed_resources(s);
+    // Descriptor slots cannot be recycled while a submitted draw uses them.
+    if (s.fence->GetCompletedValue() < s.fence_value)
+        return;
     if (s.replacement_bytes > textures::budget_bytes()) {
         std::vector<std::pair<UINT64, std::uint64_t>> oldest;
         for (const auto &[hash, replacement] : s.replacements)
@@ -2209,19 +2243,31 @@ void gpu_end_list(psprecomp::GuestMemory &memory) {
     if (!state || !state->recording)
         return;
     perf::Scope sync_profile(perf::kGpuSync);
-    {
-        PublishReason reason(2);
-        publish_readbacks(*state, memory);
-    }
     finish_list(*state);
+    retire_completed_resources(*state);
     // The game's CPU code reads and writes the framebuffer between lists.
     // Publish the moment anything touches VRAM so it never sees stale pixels.
-    memory.set_vram_access_hook([](void *context) {
+    memory.set_vram_range_access_hook([](void *context, std::uint32_t address, std::size_t length) {
         if (publish_guard)
             publish_guard();
         if (state) {
+            auto &guest = *static_cast<psprecomp::GuestMemory *>(context);
+            const bool surface_hit = std::any_of(state->surfaces.begin(), state->surfaces.end(),
+                [&](const auto &surface) {
+                    return (surface->dirty || surface->readback_pending) &&
+                        vram_ranges_overlap(address, length, surface->address, surface->guest_bytes());
+                });
+            const bool transfer_hit = std::any_of(state->pending_transfers.begin(), state->pending_transfers.end(),
+                [&](const auto &transfer) {
+                    return vram_ranges_overlap(address, length, transfer.start(), transfer.bytes());
+                });
+            if (!surface_hit && !transfer_hit) {
+                ++report.unrelated_vram_accesses;
+                guest.arm_vram_hook(state->readback_fence != 0u || state->recording);
+                return;
+            }
             PublishReason reason(3);
-            publish_readbacks(*state, *static_cast<psprecomp::GuestMemory *>(context));
+            publish_readbacks(*state, guest, address, length);
         }
     }, &memory);
     memory.arm_vram_hook(state->readback_fence != 0u);
@@ -2231,6 +2277,10 @@ void gpu_settle(psprecomp::GuestMemory &memory) {
     MOTORSTORM_VULKAN_ROUTE(settle(memory))
 #if defined(_WIN32)
     if (state) {
+        if (deferred_readback && lazy_publish_enabled()) {
+            retire_completed_resources(*state);
+            return;
+        }
         PublishReason reason(4);
         publish_readbacks(*state, memory);
     }
@@ -2240,6 +2290,20 @@ void gpu_set_deferred_readback(bool enabled) noexcept {
     MOTORSTORM_VULKAN_FORWARD(set_deferred_readback(enabled))
     deferred_readback = enabled;
 }
+void gpu_set_lazy_publish(bool enabled) noexcept {
+    MOTORSTORM_VULKAN_FORWARD(set_lazy_publish(enabled))
+#if defined(_WIN32)
+    lazy_publish_setting = enabled;
+#endif
+}
+bool gpu_lazy_publish() noexcept {
+    MOTORSTORM_VULKAN_ROUTE(lazy_publish())
+#if defined(_WIN32)
+    return lazy_publish_setting;
+#else
+    return false;
+#endif
+}
 void gpu_set_publish_guard(void (*guard)()) noexcept {
     MOTORSTORM_VULKAN_FORWARD(set_publish_guard(guard))
     publish_guard = guard;
@@ -2247,23 +2311,30 @@ void gpu_set_publish_guard(void (*guard)()) noexcept {
 bool gpu_sync_texture(psprecomp::GuestMemory &memory, std::uint32_t address, std::uint32_t bytes) {
     MOTORSTORM_VULKAN_ROUTE(sync_texture(memory, address, bytes))
 #if defined(_WIN32)
-    if (!state)
+    if (!state || bytes == 0u)
         return false;
     address = physical(address);
-    for (const auto &pending : state->pending_transfers)
-        if (address < static_cast<UINT64>(pending.start()) + pending.bytes() &&
-            pending.start() < static_cast<UINT64>(address) + bytes) {
-            ++report.feedback_syncs;
-            gpu_sync(memory);
-            return true;
-        }
-    for (const auto &target : state->surfaces)
-        if (target->dirty && address < static_cast<UINT64>(target->address) + target->guest_bytes() &&
-            target->address < static_cast<UINT64>(address) + bytes) {
-            ++report.feedback_syncs;
-            gpu_sync(memory);
-            return true;
-        }
+    const bool vram = address >= 0x04000000u && address < 0x04200000u;
+    const auto overlaps = [&](std::uint32_t target, UINT64 size) {
+        return vram ? vram_ranges_overlap(address, bytes, target, size)
+                    : address < static_cast<UINT64>(target) + size && target < static_cast<UINT64>(address) + bytes;
+    };
+    const bool hit = std::any_of(state->pending_transfers.begin(), state->pending_transfers.end(),
+        [&](const auto &pending) { return overlaps(pending.start(), pending.bytes()); }) ||
+        std::any_of(state->surfaces.begin(), state->surfaces.end(), [&](const auto &target) {
+            return (target->dirty || target->readback_pending) && overlaps(target->address, target->guest_bytes());
+        });
+    if (hit) {
+        ++report.feedback_syncs;
+        const bool resume = state->recording;
+        if (resume)
+            finish_list(*state);
+        PublishReason reason(1);
+        publish_readbacks(*state, memory, address, vram ? bytes : 0u);
+        if (resume)
+            begin(*state);
+        return true;
+    }
 #endif
     return false;
 }
@@ -2333,7 +2404,7 @@ bool gpu_source_in_target(std::uint32_t address, std::uint32_t bytes, bool palet
                           std::uint64_t &version) noexcept {
     MOTORSTORM_VULKAN_ROUTE(source_in_target(address, bytes, palette, version))
 #if defined(_WIN32)
-    if (!state || !state->recording || bytes == 0u || (palette && bytes % 4u != 0u))
+    if (!state || bytes == 0u || (palette && bytes % 4u != 0u))
         return false;
     const auto start = physical(address);
     for (const auto &pending : state->pending_transfers)
@@ -2352,7 +2423,7 @@ bool gpu_source_in_target(std::uint32_t address, std::uint32_t bytes, bool palet
 bool gpu_overlay_targets(std::uint32_t address, std::uint32_t bytes, std::uint64_t &version) noexcept {
     MOTORSTORM_VULKAN_ROUTE(overlay_targets(address, bytes, version))
 #if defined(_WIN32)
-    if (!state || !state->recording || bytes == 0u)
+    if (!state || bytes == 0u)
         return false;
     const UINT64 begin = physical(address), end = begin + bytes;
     for (const auto &pending : state->pending_transfers)
@@ -2361,7 +2432,7 @@ bool gpu_overlay_targets(std::uint32_t address, std::uint32_t bytes, std::uint64
     bool any = false;
     version = 0u;
     for (const auto &surface : state->surfaces) {
-        if (!surface->dirty || begin >= surface->address + surface->guest_bytes() || surface->address >= end)
+        if ((!surface->dirty && !surface->readback_pending) || begin >= surface->address + surface->guest_bytes() || surface->address >= end)
             continue;
         if (surface->bpp != 4u)
             return false;
@@ -2401,7 +2472,8 @@ bool gpu_feedback_available(std::uint32_t address, std::uint32_t stride, std::ui
     address = physical(address);
     const auto bpp = format == 3 ? 4u : 2u;
     for (const auto &target : state->surfaces)
-        if (target->loaded && target->stride == stride && target->bpp == bpp && address >= target->address &&
+        if ((target->loaded || target->dirty || target->readback_pending) &&
+            target->stride == stride && target->bpp == bpp && address >= target->address &&
             address < static_cast<UINT64>(target->address) + target->guest_bytes())
             return true;
 #endif

@@ -42,6 +42,15 @@ bool open_log_file(const std::filesystem::path &path);
 // Stops logging to a file and closes it.
 void close_log_file();
 
+// Flushes and commits log buffers to storage (fsync).
+void flush_log_file();
+
+// Returns the path to the currently opened log file (empty if none).
+std::filesystem::path current_log_file_path();
+
+// Installs crash signal handlers (SIGSEGV, SIGABRT, SIGBUS, etc.) and std::terminate.
+void install_crash_handlers();
+
 struct BootstrapPaths {
     NativeConfig config;
     std::filesystem::path psp_executable;

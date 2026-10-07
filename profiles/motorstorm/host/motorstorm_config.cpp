@@ -97,7 +97,7 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
         if (section == "graphics") {
             if (key == "resolution") {
                 const auto scale = number(1u, 8u);
-                if (scale > 4u && scale != 8u) invalid("must be 1, 2, 3, 4 or 8");
+                if (scale > 5u && scale != 8u) invalid("must be 1, 2, 3, 4, 5 or 8");
                 config.resolution = static_cast<std::uint32_t>(scale);
             }
             else if (key == "less_pop_in") config.less_pop_in = boolean();

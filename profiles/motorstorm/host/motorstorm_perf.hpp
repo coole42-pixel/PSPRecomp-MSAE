@@ -15,8 +15,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <string>
 #include <vector>
+#include "motorstorm_gpu.hpp"
 
 namespace motorstorm::perf {
 
@@ -125,6 +127,9 @@ struct BenchWindow {
     std::array<std::uint64_t, kSlotCount> start_ticks{};
     std::uint64_t previous_frame_ns{};
     std::vector<std::uint64_t> frame_intervals_ns;
+    GpuReport start_gpu{};
+    std::uint32_t min_raster_half{UINT32_MAX}, max_raster_half{};
+    std::uint64_t race_frames{};
 };
 
 inline BenchWindow &bench_window() {
@@ -155,6 +160,11 @@ inline bool bench_frame(std::uint64_t guest_us, std::uint64_t frames, std::uint6
     if (!window.enabled || window.finished) return false;
     if (!window.started) {
         if (guest_us < window.start_us) return false;
+#if defined(__ANDROID__)
+        if (gpu_report().active && !gpu_report().racing) return false;
+#endif
+        std::error_code old_report_error;
+        std::filesystem::remove(window.output, old_report_error);
         window.started = true;
         window.start_wall_ns = now_ns();
         window.start_us_actual = guest_us;
@@ -163,10 +173,16 @@ inline bool bench_frame(std::uint64_t guest_us, std::uint64_t frames, std::uint6
         window.start_audio_underruns = audio_underruns;
         window.start_audio_device_dry = audio_device_dry;
         window.start_ticks = ticks();
+        window.start_gpu = gpu_report();
+        window.min_raster_half = window.max_raster_half = window.start_gpu.raster_half;
         window.previous_frame_ns = window.start_wall_ns;
         return false;
     }
     const auto frame_now = now_ns();
+    const auto frame_gpu = gpu_report();
+    if (frame_gpu.racing) ++window.race_frames;
+    window.min_raster_half = std::min(window.min_raster_half, frame_gpu.raster_half);
+    window.max_raster_half = std::max(window.max_raster_half, frame_gpu.raster_half);
     window.frame_intervals_ns.push_back(frame_now - window.previous_frame_ns);
     window.previous_frame_ns = frame_now;
     if (guest_us < window.end_us) return false;
@@ -184,8 +200,10 @@ inline bool bench_frame(std::uint64_t guest_us, std::uint64_t frames, std::uint6
     const double sections = section_ms[kGeDecode] + section_ms[kGeSubmit] + section_ms[kGpuSync] +
                             section_ms[kPresent] + section_ms[kAudioWait];
     const double other = static_cast<double>(wall_seconds) * 1000.0 - sections;
+    const GpuReport end_gpu = gpu_report();
 
-    std::ofstream report(window.output, std::ios::trunc);
+    const std::string temporary = window.output + ".tmp";
+    std::ofstream report(temporary, std::ios::trunc);
     const auto field = [&](const char *key, auto value) {
         report << key << '=' << value << '\n';
     };
@@ -198,7 +216,26 @@ inline bool bench_frame(std::uint64_t guest_us, std::uint64_t frames, std::uint6
     field("frames", frame_span);
     field("ge_submissions", submission_span);
     field("wall_ms", static_cast<std::int64_t>(wall_seconds * 1000.0 + 0.5));
-    field("guest_ms", guest_us_span);
+    field("guest_us", guest_us_span);
+    field("guest_ms", static_cast<double>(guest_us_span) / 1000.0);
+    const char *target_fps = std::getenv("PSPRECOMP_MOTORSTORM_FPS");
+    field("target_fps", target_fps ? target_fps : "0");
+    const char *bench_mode = std::getenv("PSPRECOMP_MOTORSTORM_BENCH_MODE");
+    field("mode", bench_mode ? bench_mode : "unspecified");
+    field("resolution_scale", end_gpu.resolution_scale);
+    field("min_raster_half", window.min_raster_half);
+    field("max_raster_half", window.max_raster_half);
+    field("gpu_snapshot_frames", end_gpu.presents - window.start_gpu.presents);
+    field("gpu_skipped_frames", end_gpu.skipped_presents - window.start_gpu.skipped_presents);
+    field("gpu_superseded_frames", end_gpu.superseded_presents - window.start_gpu.superseded_presents);
+    field("race_frames", window.race_frames);
+    field("display_timing_supported", end_gpu.display_timing_supported ? 1 : 0);
+    field("present_requests", end_gpu.present_requests - window.start_gpu.present_requests);
+    field("displayed_frames", end_gpu.displayed_frames - window.start_gpu.displayed_frames);
+    field("direct_image_presents", end_gpu.direct_image_presents - window.start_gpu.direct_image_presents);
+    field("snapshot_image_bytes", end_gpu.snapshot_image_bytes - window.start_gpu.snapshot_image_bytes);
+    field("snapshot_buffer_bytes", end_gpu.snapshot_buffer_bytes - window.start_gpu.snapshot_buffer_bytes);
+    field("present_convert_dispatches", end_gpu.present_convert_dispatches - window.start_gpu.present_convert_dispatches);
     field("guest_per_wall", guest_seconds / wall_seconds);
     field("fps", static_cast<double>(frame_span) / guest_seconds);
     field("wall_fps", static_cast<double>(frame_span) / wall_seconds);
@@ -214,6 +251,34 @@ inline bool bench_frame(std::uint64_t guest_us, std::uint64_t frames, std::uint6
     field("frame_p95_ms", percentile(0.95));
     field("frame_p99_ms", percentile(0.99));
     field("frame_max_ms", ms(window.frame_intervals_ns.back()));
+    field("gpu_draws", end_gpu.draws - window.start_gpu.draws);
+    field("gpu_fast_draws", end_gpu.draws_ps_fast - window.start_gpu.draws_ps_fast);
+    field("gpu_fast_alpha_draws", end_gpu.draws_ps_fast_alpha - window.start_gpu.draws_ps_fast_alpha);
+    field("gpu_ordered_draws", end_gpu.draws_ps_ordered - window.start_gpu.draws_ps_ordered);
+    field("gpu_fast_vertices", end_gpu.hardware_vertices - window.start_gpu.hardware_vertices);
+    field("gpu_ordered_vertices", end_gpu.ordered_vertices - window.start_gpu.ordered_vertices);
+    field("gpu_switches_hw_to_ordered", end_gpu.switches_hw_to_ordered - window.start_gpu.switches_hw_to_ordered);
+    field("gpu_switches_ordered_to_hw", end_gpu.switches_ordered_to_hw - window.start_gpu.switches_ordered_to_hw);
+    field("gpu_pass_endings", end_gpu.render_pass_endings - window.start_gpu.render_pass_endings);
+    field("gpu_pack_color", end_gpu.pack_color_dispatches - window.start_gpu.pack_color_dispatches);
+    field("gpu_pack_depth", end_gpu.pack_depth_dispatches - window.start_gpu.pack_depth_dispatches);
+    field("gpu_buffer_syncs", end_gpu.framebuffer_syncs - window.start_gpu.framebuffer_syncs);
+    field("reject_stencil", end_gpu.reject_stencil - window.start_gpu.reject_stencil);
+    field("reject_blend_16bit", end_gpu.reject_blend_16bit - window.start_gpu.reject_blend_16bit);
+    field("reject_blend_double_alpha", end_gpu.reject_blend_double_alpha - window.start_gpu.reject_blend_double_alpha);
+    field("reject_blend_narrow", end_gpu.reject_blend_narrow - window.start_gpu.reject_blend_narrow);
+    field("reject_blend_equation", end_gpu.reject_blend_equation - window.start_gpu.reject_blend_equation);
+    field("reject_blend_factor_unknown", end_gpu.reject_blend_factor_unknown - window.start_gpu.reject_blend_factor_unknown);
+    field("reject_blend_fix_conflict", end_gpu.reject_blend_fix_conflict - window.start_gpu.reject_blend_fix_conflict);
+    field("reject_feedback", end_gpu.reject_feedback - window.start_gpu.reject_feedback);
+    field("reject_soft_particles", end_gpu.reject_soft_particles - window.start_gpu.reject_soft_particles);
+    field("reject_hud_tag", end_gpu.reject_hud_tag - window.start_gpu.reject_hud_tag);
+    field("reject_extended_color", end_gpu.reject_extended_color - window.start_gpu.reject_extended_color);
+    field("reject_raster_half_zero", end_gpu.reject_raster_half_zero - window.start_gpu.reject_raster_half_zero);
+    field("reject_color_test", end_gpu.reject_color - window.start_gpu.reject_color);
+    field("reject_write_mask", end_gpu.reject_mask - window.start_gpu.reject_mask);
+    field("reject_target_size_mismatch", end_gpu.reject_target_size_mismatch - window.start_gpu.reject_target_size_mismatch);
+    field("reject_other", end_gpu.reject_other - window.start_gpu.reject_other);
     field("ge_decode_ms", section_ms[kGeDecode]);
     field("ge_convert_ms", section_ms[kGeConvert]);
     field("texture_ms", section_ms[kTexture]);
@@ -228,11 +293,16 @@ inline bool bench_frame(std::uint64_t guest_us, std::uint64_t frames, std::uint6
     field("sections_ms", sections);
     field("other_ms", other);
     report << "[BENCH] name=" << window.name << " frames=" << frame_span
-           << " ge=" << submission_span << " guest_ms=" << guest_us_span
+           << " ge=" << submission_span << " guest_ms=" << (guest_us_span / 1000u)
            << " wall_ms=" << static_cast<std::int64_t>(wall_seconds * 1000.0 + 0.5)
            << " guest_per_wall=" << (guest_seconds / wall_seconds)
            << " sections_ms=" << sections << " other_ms=" << other << '\n';
+    field("completed", 1);
     report.close();
+    std::error_code rename_error;
+    std::filesystem::rename(temporary, window.output, rename_error);
+    if (rename_error)
+        std::fprintf(stderr, "[BENCH] cannot publish report: %s\n", rename_error.message().c_str());
 
     char line[512]{};
     std::snprintf(line, sizeof(line),
@@ -240,7 +310,7 @@ inline bool bench_frame(std::uint64_t guest_us, std::uint64_t frames, std::uint6
                   "guest_per_wall=%.3f sections_ms=%.1f other_ms=%.1f\n",
                   window.name.c_str(), static_cast<unsigned long long>(frame_span),
                   static_cast<unsigned long long>(submission_span),
-                  static_cast<unsigned long long>(guest_us_span),
+                  static_cast<unsigned long long>(guest_us_span / 1000u),
                   static_cast<long long>(wall_seconds * 1000.0 + 0.5),
                   guest_seconds / wall_seconds, sections, other);
     std::fwrite(line, 1, std::strlen(line), stderr);

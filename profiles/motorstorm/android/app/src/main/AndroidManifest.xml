@@ -4,6 +4,7 @@
     <uses-feature android:name="android.hardware.gamepad" android:required="false" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <application android:label="MotorStorm Native" android:theme="@android:style/Theme.Material.NoActionBar"
+        android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher"
         android:allowBackup="false" android:appCategory="game" android:extractNativeLibs="true">
         <activity android:name=".LauncherActivity" android:exported="true">
             <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>

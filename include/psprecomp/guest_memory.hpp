@@ -1,6 +1,7 @@
 #pragma once
 
 #include <bit>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -249,8 +250,8 @@ public:
     // and depth buffers once per primitive and then indexes raw memory, instead
     // of paying canonicalization plus a bounds check on every pixel.  Callers
     // must keep the range valid; nothing here is revalidated afterwards.
-    [[nodiscard]] std::uint8_t *raw_pointer(std::uint32_t address, std::size_t length) noexcept;
-    [[nodiscard]] const std::uint8_t *raw_pointer(std::uint32_t address, std::size_t length) const noexcept;
+    [[nodiscard]] std::uint8_t *raw_pointer(std::uint32_t address, std::size_t length);
+    [[nodiscard]] const std::uint8_t *raw_pointer(std::uint32_t address, std::size_t length) const;
 
     [[nodiscard]] std::uint8_t load8(std::uint32_t address) const;
     [[nodiscard]] std::uint16_t load16(std::uint32_t address) const;
@@ -269,29 +270,43 @@ public:
 
     [[nodiscard]] std::string read_c_string(std::uint32_t address, std::size_t max_length = 256u) const;
     [[nodiscard]] const std::vector<std::uint8_t> &bytes() const noexcept;
-    [[nodiscard]] const std::vector<std::uint8_t> &vram_bytes() const noexcept;
+    [[nodiscard]] const std::vector<std::uint8_t> &vram_bytes() const;
 
     // One-shot notification of the next EDRAM access. A renderer that defers
     // publishing GPU output into VRAM arms it; the first load or store that
     // touches VRAM (generated code, interpreter or host copies) disarms it and
     // runs the hook before the access, so every reader sees published pixels.
+    // A range-aware hook may leave unrelated GPU targets resident and rearm
+    // itself. Bulk accesses report their complete remaining range before copying.
     using VramAccessHook = void (*)(void *context);
+    using VramRangeAccessHook = void (*)(void *context, std::uint32_t address, std::size_t length);
     void set_vram_access_hook(VramAccessHook hook, void *context) noexcept {
         vram_hook_ = hook;
+        vram_range_hook_ = nullptr;
         vram_hook_context_ = context;
     }
-    void arm_vram_hook(bool armed) const noexcept { vram_hook_armed_ = armed && vram_hook_ != nullptr; }
-    [[nodiscard]] bool vram_hook_armed() const noexcept { return vram_hook_armed_; }
+    void set_vram_range_access_hook(VramRangeAccessHook hook, void *context) noexcept {
+        vram_hook_ = nullptr;
+        vram_range_hook_ = hook;
+        vram_hook_context_ = context;
+    }
+    void arm_vram_hook(bool armed) const noexcept {
+        vram_hook_armed_.store(armed && (vram_hook_.load() != nullptr || vram_range_hook_.load() != nullptr));
+    }
+    [[nodiscard]] bool vram_hook_armed() const noexcept { return vram_hook_armed_.load(); }
 
 private:
-    void notify_vram_access() const {
-        if (!vram_hook_armed_) return;
-        vram_hook_armed_ = false;
-        vram_hook_(vram_hook_context_);
+    void notify_vram_access(std::uint32_t address, std::size_t length) const {
+        if (!vram_hook_armed_.load() || !vram_hook_armed_.exchange(false)) return;
+        if (const auto hook = vram_range_hook_.load())
+            hook(vram_hook_context_.load(), address, length);
+        else if (const auto hook = vram_hook_.load())
+            hook(vram_hook_context_.load());
     }
-    VramAccessHook vram_hook_{};
-    void *vram_hook_context_{};
-    mutable bool vram_hook_armed_{};
+    std::atomic<VramAccessHook> vram_hook_{};
+    std::atomic<VramRangeAccessHook> vram_range_hook_{};
+    std::atomic<void *> vram_hook_context_{};
+    mutable std::atomic<bool> vram_hook_armed_{};
 
     enum class Region { Scratchpad, Vram, Ram };
     struct ResolvedAddress {

@@ -92,7 +92,6 @@ struct PixelFeatures {
 // - Live framebuffer reads without a valid snapshot, soft-particle depth fade,
 //   HUD depth tags, and 32-bit color stored in a 16-bit target stay ordered.
 //   A copied feedback image is sampled with the PSP's integer texel filter.
-// - Raster scales other than native 1x (raster_half 2). Those stay exact.
 //
 // Command 0xE6 (logic op) is stored and ignored by both the CPU rasterizer and
 // pixelUpdate(). It does not select the fallback; doing so would push ordinary
@@ -122,6 +121,8 @@ struct GeDrawFacts {
     bool wide_blends{true};
     // Color-tested draws take the hardware route (PSPRECOMP_MOTORSTORM_HW_COLOR_TEST=0).
     bool hardware_color_test{true};
+    // Experimental native stencil requires an explicit renderer capability.
+    bool hardware_stencil{};
 };
 
 struct HardwarePixelState {
@@ -142,15 +143,68 @@ struct HardwarePixelState {
     std::uint8_t constant_g{};
     std::uint8_t constant_b{};
     bool alpha_discard{};
+    bool stencil_test{};
+    std::uint8_t stencil_compare{7}; // VkCompareOp, default ALWAYS
+    std::uint8_t stencil_fail_op{};   // VkStencilOp
+    std::uint8_t stencil_depth_fail_op{}; // VkStencilOp
+    std::uint8_t stencil_pass_op{};   // VkStencilOp
+    std::uint8_t stencil_reference{};
+    std::uint8_t stencil_compare_mask{0xFF};
+    std::uint8_t stencil_write_mask{0xFF};
 };
+
+enum class GeRejectReason : std::uint8_t {
+    None = 0,
+    RasterHalfZero,
+    Feedback,
+    SoftParticles,
+    HudTag,
+    ExtendedColor,
+    Stencil,
+    ColorTest,
+    WriteMask,
+    Blend16Bit,
+    BlendNarrow,
+    BlendEquation,
+    BlendDoubleAlpha,
+    BlendFactorUnknown,
+    BlendFixConflict,
+    TargetSizeMismatch,
+    Other
+};
+
+[[nodiscard]] inline const char *ge_reject_reason_name(GeRejectReason reason) {
+    switch (reason) {
+        case GeRejectReason::None: return "None";
+        case GeRejectReason::RasterHalfZero: return "RasterHalfZero";
+        case GeRejectReason::Feedback: return "Feedback";
+        case GeRejectReason::SoftParticles: return "SoftParticles";
+        case GeRejectReason::HudTag: return "HudTag";
+        case GeRejectReason::ExtendedColor: return "ExtendedColor";
+        case GeRejectReason::Stencil: return "Stencil";
+        case GeRejectReason::ColorTest: return "ColorTest";
+        case GeRejectReason::WriteMask: return "WriteMask";
+        case GeRejectReason::Blend16Bit: return "Blend16Bit";
+        case GeRejectReason::BlendNarrow: return "BlendNarrow";
+        case GeRejectReason::BlendEquation: return "BlendEquation";
+        case GeRejectReason::BlendDoubleAlpha: return "BlendDoubleAlpha";
+        case GeRejectReason::BlendFactorUnknown: return "BlendFactorUnknown";
+        case GeRejectReason::BlendFixConflict: return "BlendFixConflict";
+        case GeRejectReason::TargetSizeMismatch: return "TargetSizeMismatch";
+        default: return "Other";
+    }
+}
 
 struct DrawPixelRoute {
     bool hardware{};
     bool exact_pixel{};
+    bool framebuffer_alpha_stencil{};
+    bool color_only{}; // Backend attachment choice; not a PSP pixel operation.
     HardwarePixelState state{};
     const char *fragment_entry{"PS"};
     bool runs_pixel_update{true};
     CompactColorFormat color_format{CompactColorFormat::PackedR32Uint};
+    GeRejectReason reject_reason{GeRejectReason::None};
 };
 
 [[nodiscard]] inline const char *compact_color_format_name(CompactColorFormat format) {
@@ -159,27 +213,65 @@ struct DrawPixelRoute {
 
 [[nodiscard]] inline DrawPixelRoute classify_ge_draw(const std::uint32_t commands[256], GeDrawFacts facts) {
     DrawPixelRoute ordered;
-    if (!commands)
+    if (!commands) {
+        ordered.reject_reason = GeRejectReason::Other;
         return ordered;
+    }
     const auto command = [&](std::uint32_t index) { return commands[index]; };
     const bool clearing = (command(0xD3) & 1u) != 0u;
-    const auto reject = [&] { return ordered; };
+    const auto reject = [&](GeRejectReason reason) {
+        ordered.reject_reason = reason;
+        return ordered;
+    };
     // Keep blended, feedback, and stateful pixel operations on the packed
     // ordered path. The hardware shader implements integer texture math and
     // quantizes its output to the target format.
-    if (facts.raster_half != 2u || facts.feedback || facts.soft_particles || facts.hud_tag ||
-        facts.extended_color)
-        return reject();
-    if (!clearing && (command(0x24) & 1u) != 0u)
-        return reject();
+    if (facts.raster_half == 0u)
+        return reject(GeRejectReason::RasterHalfZero);
+    if (facts.feedback)
+        return reject(GeRejectReason::Feedback);
+    if (facts.soft_particles)
+        return reject(GeRejectReason::SoftParticles);
+    if (facts.hud_tag)
+        return reject(GeRejectReason::HudTag);
+    if (facts.extended_color)
+        return reject(GeRejectReason::ExtendedColor);
+    const bool stencil_enabled = !clearing && (command(0x24) & 1u) != 0u;
+    // Simple unconditional stencil writes can use the COLOR alpha attachment
+    // directly. This keeps PSP stencil/alpha together across path transitions.
+    // A failed depth test may not require an alpha write, and replacing output
+    // alpha is only safe when RGB blending does not consume source alpha.
+    const std::uint32_t stencil_ops = command(0xDD);
+    const std::uint32_t stencil_pass = (stencil_ops >> 16u) & 7u;
+    const bool depth_can_fail = facts.valid_depth && (command(0x23) & 1u) != 0u &&
+                                (command(0xDE) & 7u) != 1u;
+    const std::uint32_t blend_src = command(0xDF) & 15u, blend_dst = (command(0xDF) >> 4u) & 15u;
+    const auto uses_source_alpha = [](std::uint32_t factor) {
+        return factor == 2u || factor == 3u || factor == 6u || factor == 7u;
+    };
+    const bool alpha_stencil = stencil_enabled && facts.format == 3u &&
+        (command(0xDC) & 7u) == 1u && stencil_pass <= 2u &&
+        (!depth_can_fail || ((stencil_ops >> 8u) & 7u) == 0u) &&
+        (stencil_pass == 0u || (command(0x21) & 1u) == 0u ||
+         (!uses_source_alpha(blend_src) && !uses_source_alpha(blend_dst)));
+    if (stencil_enabled) {
+        if (!alpha_stencil && !facts.hardware_stencil)
+            return reject(GeRejectReason::Stencil);
+        const std::uint32_t op = command(0xDD);
+        if ((op & 7u) > 5u || ((op >> 8u) & 7u) > 5u || ((op >> 16u) & 7u) > 5u)
+            return reject(GeRejectReason::Stencil);
+    }
     // The color test reads only the fragment's own color: the discard shader
     // runs it on the exact integer color, like the ordered shader.
     const bool color_test = !clearing && (command(0x27) & 1u) != 0u;
     if (color_test && !facts.hardware_color_test)
-        return reject();
+        return reject(GeRejectReason::ColorTest);
 
     const bool write_color = !clearing || (command(0xD3) & 0x100u) != 0u;
-    const bool write_alpha = facts.format != 0u && (!clearing || (command(0xD3) & 0x200u) != 0u);
+    // PSP framebuffer alpha stores stencil. Source alpha participates in RGB
+    // blending/testing, but never overwrites stencil on ordinary color draws.
+    const bool write_alpha = facts.format != 0u &&
+                             (clearing ? (command(0xD3) & 0x200u) != 0u : stencil_enabled);
     std::uint8_t write_mask = 0;
     const auto channel = [&](std::uint32_t keep, int bit, bool enabled) {
         if (!enabled || keep == 0xFFu)
@@ -194,14 +286,32 @@ struct DrawPixelRoute {
     if (!channel(rgb_keep & 0xFFu, 0x1, write_color) || !channel((rgb_keep >> 8) & 0xFFu, 0x2, write_color) ||
         !channel((rgb_keep >> 16) & 0xFFu, 0x4, write_color) ||
         !channel(command(0xE9) & 0xFFu, 0x8, write_alpha))
-        return reject();
+        return reject(GeRejectReason::WriteMask);
 
     // PSP compare order is not VkCompareOp order.
     static constexpr std::uint8_t kCompare[]{0, 7, 2, 5, 1, 3, 4, 6};
     HardwarePixelState hw;
     hw.color_write_mask = write_mask;
+    if (alpha_stencil && stencil_pass == 0u)
+        hw.color_write_mask = static_cast<std::uint8_t>(hw.color_write_mask & ~0x8u);
     hw.src_alpha_factor = 1; // ONE: framebuffer alpha becomes the source alpha
     hw.dst_alpha_factor = 0; // ZERO
+    if (stencil_enabled && !alpha_stencil) {
+        // PSP stencil op order: 0: KEEP, 1: ZERO, 2: REPLACE, 3: INVERT (5), 4: INCR (3), 5: DECR (4)
+        static constexpr std::uint8_t kStencilOp[]{0, 1, 2, 5, 3, 4, 0, 0};
+        const std::uint32_t test = command(0xDC);
+        const std::uint32_t op = command(0xDD);
+        hw.stencil_test = true;
+        hw.stencil_compare = kCompare[test & 7u];
+        hw.stencil_reference = static_cast<std::uint8_t>((test >> 8u) & 0xFFu);
+        hw.stencil_compare_mask = static_cast<std::uint8_t>((test >> 16u) & 0xFFu);
+        hw.stencil_fail_op = kStencilOp[op & 7u];
+        hw.stencil_depth_fail_op = kStencilOp[(op >> 8u) & 7u];
+        hw.stencil_pass_op = kStencilOp[(op >> 16u) & 7u];
+        // In PSP GE, alpha write mask command 0xE9 controls alpha/stencil channel write mask.
+        // bit=0: write, bit=1: keep/masked.
+        hw.stencil_write_mask = static_cast<std::uint8_t>(~(command(0xE9) & 0xFFu));
+    }
     if (facts.valid_depth && clearing) {
         hw.depth_test = true;
         hw.depth_compare = 7; // ALWAYS
@@ -221,26 +331,26 @@ struct DrawPixelRoute {
         // Doubled alpha factors (6-9) and the absolute difference stay ordered
         // and exact. Without wide_blends only source-alpha/one-minus is taken.
         if (facts.format != 3u)
-            return reject();
+            return reject(GeRejectReason::Blend16Bit);
         if (!facts.wide_blends) {
             if (src != 2u || dst != 3u || equation != 0u)
-                return reject();
+                return reject(GeRejectReason::BlendNarrow);
             hw.blend = true;
             hw.src_factor = 6; // SRC_ALPHA
             hw.dst_factor = 7; // ONE_MINUS_SRC_ALPHA
             hw.blend_op = 0;   // ADD
         } else {
             if (equation > 4u)
-                return reject();
+                return reject(GeRejectReason::BlendEquation);
             // GE factor -> VkBlendFactor. 0/1 name the other side's color.
             // 10 (FIX) is resolved below; 0xFF marks a factor Vulkan lacks.
             static constexpr std::uint8_t kSource[]{4, 5, 6, 7, 8, 9, 0xFF, 0xFF, 0xFF, 0xFF, 10};
             static constexpr std::uint8_t kDestination[]{2, 3, 6, 7, 8, 9, 0xFF, 0xFF, 0xFF, 0xFF, 10};
             if (src > 10u || dst > 10u)
-                return reject();
+                return reject(GeRejectReason::BlendFactorUnknown);
             std::uint8_t src_factor = kSource[src], dst_factor = kDestination[dst];
             if (src_factor == 0xFF || dst_factor == 0xFF)
-                return reject();
+                return reject(GeRejectReason::BlendDoubleAlpha);
             const std::uint32_t fix_src = command(0xE0) & 0xFFFFFFu, fix_dst = command(0xE1) & 0xFFFFFFu;
             // A fixed color of white or black is ONE or ZERO. Vulkan has one
             // blend constant: both sides may use it only when they share it
@@ -258,7 +368,7 @@ struct DrawPixelRoute {
                 else if (!constant) { constant = true; constant_rgb = fix_dst; }
                 else if (fix_dst == fix_src) dst_factor = 10;
                 else if ((fix_src ^ fix_dst) == 0xFFFFFFu) dst_factor = 11; // ONE_MINUS_CONSTANT_COLOR
-                else return reject();
+                else return reject(GeRejectReason::BlendFixConflict);
             }
             hw.blend = true;
             hw.src_factor = src_factor;
@@ -281,13 +391,15 @@ struct DrawPixelRoute {
 
     DrawPixelRoute route;
     route.hardware = true;
-    route.exact_pixel = color_test || facts.format != 3u || facts.feedback_snapshot || facts.enhanced_filtering ||
+    route.framebuffer_alpha_stencil = alpha_stencil;
+    route.exact_pixel = alpha_stencil || color_test || facts.format != 3u || facts.feedback_snapshot || facts.enhanced_filtering ||
                         facts.texture_replacement ||
                         (!clearing && (command(0x1E) & 1u) != 0u && !facts.simple_texture_filter);
     route.state = hw;
     route.fragment_entry = hw.alpha_discard ? "PSFastAlpha" : "PSFast";
     route.runs_pixel_update = false;
     route.color_format = CompactColorFormat::Rgba8Unorm;
+    route.reject_reason = GeRejectReason::None;
     return route;
 }
 
@@ -391,14 +503,19 @@ public:
     static constexpr int kUpCooldownWindows = 3;
 
     // Returns the raster_half to use for the next frame.
+    // frame_ms is the wall time since the previous present (negative when
+    // unknown). GPU timestamps alone overstate the load on some drivers, so a
+    // window only steps down when its frames are also arriving late.
     [[nodiscard]] std::uint32_t update(std::uint32_t base_half, std::uint32_t current_half, bool gameplay,
-                                       double gpu_ms, const ScaleSettings &settings, int thermal_status) {
+                                       double gpu_ms, const ScaleSettings &settings, int thermal_status,
+                                       double frame_ms = -1.0) {
         const float ceiling = thermal_scale_ceiling(settings.max_scale, thermal_status);
-        // Respect the configured floor even when the selected output is only
-        // 1x. Sub-native raster sizes use the ordered pixel path; its hardware
-        // pixel fast path remains gated to raster_half 2.
+        // Dynamic scaling never goes below native 1x (raster_half 2) when the
+        // selected output is above it: sub-native rasters look far worse than
+        // the PSP image. At 1x output the configured floor still applies.
         const std::uint32_t bottom =
-            raster_half_for_scale(base_half, std::min(settings.min_scale, ceiling));
+            std::max(raster_half_for_scale(base_half, std::min(settings.min_scale, ceiling)),
+                     std::min(base_half, 2u));
         const std::uint32_t top =
             std::max(bottom, raster_half_for_scale(base_half, std::max(settings.min_scale, ceiling)));
         if (settings.mode == ScaleMode::Off) {
@@ -417,17 +534,25 @@ public:
         if (gpu_ms >= 0.0) {
             sum_ms_ += gpu_ms;
             ++frames_;
+            if (frame_ms >= 0.0) {
+                ++timed_;
+                if (frame_ms > frame_budget_ms(settings.target_fps) * 1.10)
+                    ++late_;
+            }
         }
         if (frames_ < kWindowFrames)
             return std::clamp(current_half, bottom, top);
         const double average = sum_ms_ / frames_;
+        // Without frame times every window counts as late (GPU time alone).
+        const bool late = timed_ == 0 || late_ * 5 >= timed_;
         sum_ms_ = 0.0;
         frames_ = 0;
+        timed_ = late_ = 0;
         if (cooldown_ > 0)
             --cooldown_;
         const double budget = frame_budget_ms(settings.target_fps);
         std::uint32_t next = std::clamp(current_half, bottom, top);
-        if (average > budget * 0.90) {
+        if (average > budget * 0.90 && late) {
             if (next > bottom)
                 --next;
             cooldown_ = kUpCooldownWindows;
@@ -439,12 +564,14 @@ public:
     void reset() noexcept {
         sum_ms_ = 0.0;
         frames_ = 0;
+        timed_ = late_ = 0;
         cooldown_ = 0;
     }
 
 private:
     double sum_ms_{};
     int frames_{};
+    int timed_{}, late_{};  // frames with a wall time, and of those, late ones
     int cooldown_{};
 };
 
@@ -524,14 +651,10 @@ struct TouchSample {
         sample.buttons |= 0x0100u; // L, brake
     else if (x >= 0.78f && x <= 0.94f && y < 0.20f)
         sample.buttons |= 0x0200u; // R, accelerate
-    else if (x >= 0.30f && x <= 0.38f && y < 0.18f)
-        sample.buttons |= 0x0008u; // pause skin, Start
     else if (x >= 0.40f && x <= 0.48f && y < 0.18f)
         sample.buttons |= 0x0001u; // Select
     else if (x >= 0.52f && x <= 0.60f && y < 0.18f)
         sample.buttons |= 0x0008u; // Start
-    else if (x >= 0.62f && x <= 0.70f && y < 0.18f)
-        sample.buttons |= 0x0001u; // menu skin, Select
     else if (x >= 0.78f && x <= 0.90f && y >= 0.48f && y <= 0.60f)
         sample.buttons |= 0x1000u; // Triangle
     else if (x >= 0.90f && y >= 0.60f && y <= 0.74f)

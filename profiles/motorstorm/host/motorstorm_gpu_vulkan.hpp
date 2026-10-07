@@ -41,6 +41,8 @@ bool present(psprecomp::GuestMemory &, void *window, std::uint32_t framebuffer, 
 // Shared settings forwarded by motorstorm_gpu.cpp.
 void set_racing(bool racing) noexcept;
 void set_deferred_readback(bool enabled) noexcept;
+void set_lazy_publish(bool enabled) noexcept;
+bool lazy_publish() noexcept;
 void set_publish_guard(void (*guard)()) noexcept;
 void set_output_size(std::uint32_t width, std::uint32_t height) noexcept;
 void set_guest_widescreen(bool active) noexcept;

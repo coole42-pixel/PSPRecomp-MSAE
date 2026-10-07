@@ -16,9 +16,19 @@ if (-not (Test-Path -LiteralPath $java)) { throw 'Pass a valid -JavaHome or set 
 $arguments = @("-Dorg.gradle.java.home=$JavaHome", '-jar', (Join-Path $GradleHome 'lib/gradle-gradle-cli-main-9.3.1.jar'),
     '-p', $project, 'assembleDebug', '--no-daemon', '--console=plain')
 if ($Offline) { $arguments += '--offline' }
-& $java @arguments
-if ($LASTEXITCODE -ne 0) { throw "Android build failed: $LASTEXITCODE" }
+# Java/Gradle diagnostics on stderr are not a failed build. Windows PowerShell
+# promotes redirected native stderr to NativeCommandError; decide by exit code.
+$buildErrorPolicy = $ErrorActionPreference
+try {
+    $ErrorActionPreference = 'Continue'
+    & $java @arguments
+    $buildExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $buildErrorPolicy
+}
+if ($buildExitCode -ne 0) { throw "Android build failed: $buildExitCode" }
 if ($Install) {
-    & adb install -r (Join-Path $project 'app/build/outputs/apk/debug/app-debug.apk')
+    $adb = if (Test-Path 'C:\platform-tools\adb.exe') { 'C:\platform-tools\adb.exe' } else { 'adb' }
+    & $adb install -r (Join-Path $project 'app/build/outputs/apk/debug/app-debug.apk')
     if ($LASTEXITCODE -ne 0) { throw 'APK install failed' }
 }

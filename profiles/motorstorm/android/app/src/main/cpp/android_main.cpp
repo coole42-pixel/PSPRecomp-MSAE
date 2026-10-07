@@ -19,10 +19,14 @@ struct Session { motorstorm::BootstrapPaths paths; std::atomic<bool> done{}; int
 static void *run_guest(void *opaque){
     auto &session=*static_cast<Session *>(opaque);
     try { session.result=motorstorm::run(session.paths); }
-    catch(const std::exception &e){motorstorm::log_line("ERROR",e.what());}
+    catch(const std::exception &e){
+        motorstorm::log_line("ERROR",e.what());
+        motorstorm::flush_log_file();
+    }
     session.done=true;return nullptr;
 }
 int main(int argc, char **argv) {
+    motorstorm::install_crash_handlers();
     // Back reaches the game as a key (mapped to Start) instead of closing it.
     SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
     // AAudio usage GAME: routed and ducked as game audio.
@@ -41,6 +45,16 @@ int main(int argc, char **argv) {
             setenv("PSPRECOMP_TIME_TICK_DISPATCHES","0",1);
             setenv("PSPRECOMP_MOTORSTORM_PROFILE","1",1);
             setenv("PSPRECOMP_MOTORSTORM_WAIT_STATS","1",1);
+            continue;
+        }
+        if(key=="--bench-mode"){
+            if(i+1>=argc)return 2;
+            const std::string mode=argv[++i];
+            if(mode!="paced"&&mode!="throughput")return 2;
+            setenv("PSPRECOMP_MOTORSTORM_BENCH_MODE",mode.c_str(),1);
+            if(mode=="throughput")setenv("PSPRECOMP_MOTORSTORM_UNTHROTTLED","1",1);
+            else unsetenv("PSPRECOMP_MOTORSTORM_UNTHROTTLED");
+            setenv("PSPRECOMP_MOTORSTORM_AUDIO",mode=="throughput"?"0":"1",1);
             continue;
         }
         if(key=="--input-script"||key=="--bench-out"||key=="--audio-capture"){
@@ -84,7 +98,14 @@ int main(int argc, char **argv) {
             const char *env=key=="--savedata"?"PSPRECOMP_MOTORSTORM_SAVEDATA":key=="--driver-dir"?"MOTORSTORM_ANDROID_DRIVER_DIR":key=="--driver-name"?"MOTORSTORM_ANDROID_DRIVER_NAME":
                 key=="--native-lib"?"MOTORSTORM_ANDROID_NATIVE_LIB_DIR":"MOTORSTORM_ANDROID_DRIVER_TEMP";
             if(argv[++i][0])setenv(env,argv[i],1);else unsetenv(env);
-        }else arguments.push_back(argv[i]);
+            continue;
+        }
+        if(key=="--logging-mode"){
+            if(i+1>=argc)return 2;
+            setenv("PSPRECOMP_MOTORSTORM_LOGGING_MODE",argv[++i],1);
+            continue;
+        }
+        arguments.push_back(argv[i]);
     }
     // Not forced: TU_DEBUG=gmem measured 60.7 ms vs 72.6 ms per 1x race frame
     // on MrPurple T30 but presented whole black frames (2-5 per 8 s; 0 with the
@@ -111,11 +132,16 @@ int main(int argc, char **argv) {
                 motorstorm::log_line("HEARTBEAT","guest_us="+std::to_string(motorstorm::guest_time_us())+
                     " audio_queued="+std::to_string(audio.buffered_frames)+" audio_buffers="+std::to_string(audio.queued_buffers)+
                     " underruns="+std::to_string(audio.underruns)+" blocked_ms="+std::to_string(motorstorm::audio_blocked_us()/1000));
+                motorstorm::flush_log_file();
             }
         }
         pthread_join(guest,nullptr);result=session.result;
         motorstorm::gpu_shutdown();motorstorm::textures::shutdown();motorstorm::audio_shutdown();
         motorstorm::controller_shutdown();motorstorm::window_shutdown();motorstorm::close_log_file();
-    } catch(const std::exception &e){__android_log_print(ANDROID_LOG_ERROR,"MotorStorm","%s",e.what());}
+    } catch(const std::exception &e){
+        motorstorm::log_line("FATAL",e.what());
+        motorstorm::flush_log_file();
+        __android_log_print(ANDROID_LOG_ERROR,"MotorStorm","%s",e.what());
+    }
     SDL_Quit();return result;
 }

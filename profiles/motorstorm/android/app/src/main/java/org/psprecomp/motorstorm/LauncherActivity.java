@@ -10,15 +10,29 @@ import java.util.List;
 
 public final class LauncherActivity extends Activity {
     private TextView status;
+    private Button loggingToggle;
     private static final int IMPORT_DRIVER=41, IMPORT_ISO=42, IMPORT_EBOOT=43;
     private Thread importWorker;
+
+    @Override protected void onResume() {
+        super.onResume();
+        if(loggingToggle!=null)updateLoggingToggleText(loggingToggle);
+    }
+
+    private void updateLoggingToggleText(Button b){
+        String mode=GameSettings.choice(this,GameSettings.LOGGING_MODE,"standard",GameSettings.LOGGING_MODES);
+        String label=mode.equals("verbose")?"Verbose (traces)":(mode.equals("off")?"Off":"Standard");
+        b.setText("Logging mode: "+label);
+    }
+
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        GameSettings.migrateVisualSettings(this);
         LinearLayout root = new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(32,32,32,32);
         TextView title = new TextView(this); title.setText("MotorStorm: Arctic Edge"); title.setTextSize(30);root.addView(title);
         status = new TextView(this);
-        status.setText("Android bring-up build\nGame renderer is not ready yet. Run device diagnostics first.");root.addView(status);
+        status.setText(GameStore.ready(this)?"Ready to play":"Import your game files to start.");root.addView(status);
         Button probe = new Button(this);probe.setText("Probe Vulkan driver and display");root.addView(probe);
         probe.setOnClickListener(v -> probeSelected());
         Button select=new Button(this);select.setText("Vulkan driver: System / Imported");root.addView(select);
@@ -42,47 +56,27 @@ public final class LauncherActivity extends Activity {
         Button cancel=new Button(this);cancel.setText("Cancel import");root.addView(cancel);
         cancel.setOnClickListener(v -> {if(importWorker!=null)importWorker.interrupt();});
         Button settings=new Button(this);settings.setText("Game settings");root.addView(settings);
-        settings.setOnClickListener(v -> {
-            LinearLayout options=new LinearLayout(this);options.setOrientation(LinearLayout.VERTICAL);options.setPadding(28,12,28,12);
-            TextView resolutionLabel=new TextView(this);resolutionLabel.setText("Internal resolution (applies next launch)");options.addView(resolutionLabel);
-            Spinner scale=new Spinner(this);scale.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,
-                new String[]{"Full (matches the display, default)","1× (480×272)","2×","3×","4×"}));
-            scale.setSelection(GameSettings.resolution(this));options.addView(scale);
-            CheckBox audio=new CheckBox(this);audio.setText("Sound and music");audio.setChecked(GameSettings.prefs(this).getBoolean("audio",true));options.addView(audio);
-            CheckBox fxaa=new CheckBox(this);fxaa.setText("FXAA");fxaa.setChecked(GameSettings.prefs(this).getBoolean("fxaa",false));options.addView(fxaa);
-            TextView scaleModeLabel=new TextView(this);scaleModeLabel.setText("Render scale");options.addView(scaleModeLabel);
-            Spinner scaleMode=new Spinner(this);
-            String[] modes=new String[]{"Off (always full)","Fixed scale","Dynamic in gameplay (menus stay full)"};
-            scaleMode.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,modes));
-            String savedMode=GameSettings.prefs(this).getString("scale_mode","dynamic");
-            scaleMode.setSelection(savedMode.equals("off")?0:savedMode.equals("fixed")?1:2);
-            options.addView(scaleMode);
-            TextView minLabel=new TextView(this);minLabel.setText("Lowest gameplay resolution (dynamic)");options.addView(minLabel);
-            Spinner minScale=new Spinner(this);
-            minScale.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"50%","60%","70%","80%","90%"}));
-            minScale.setSelection(Math.max(0,java.util.Arrays.asList(GameSettings.MIN_SCALES).indexOf(GameSettings.prefs(this).getString("scale_min","0.20"))));
-            options.addView(minScale);
-            TextView sharpLabel=new TextView(this);sharpLabel.setText("SGSR sharpness (1 to 2)");options.addView(sharpLabel);
-            android.widget.EditText sharp=new android.widget.EditText(this);
-            sharp.setText(GameSettings.prefs(this).getString("sgsr_sharpness","2.0"));
-            options.addView(sharp);
-            TextView info=new TextView(this);info.setText("Original 30 fps · PSP filtering · effects off\nMenus, pause and movies always render at full resolution. In a race, dynamic scale lowers resolution only when GPU time exceeds the frame budget; SGSR 1 upscales to the display.");options.addView(info);
-            new AlertDialog.Builder(this).setTitle("Game settings").setView(options).setPositiveButton("Save",(d,w) -> {
-                String mode=scaleMode.getSelectedItemPosition()==0?"off":scaleMode.getSelectedItemPosition()==1?"fixed":"dynamic";
-                String sharpness=sharp.getText().toString().trim();
-                if(sharpness.isEmpty())sharpness="2.0";
-                try{float value=Float.parseFloat(sharpness);sharpness=Float.toString(Math.max(1f,Math.min(2f,value)));}catch(NumberFormatException e){sharpness="2.0";}
-                GameSettings.prefs(this).edit().putInt(GameSettings.RESOLUTION,scale.getSelectedItemPosition()).putBoolean("audio",audio.isChecked())
-                    .putBoolean("fxaa",fxaa.isChecked()).putString("scale_mode",mode).putString("sgsr_sharpness",sharpness)
-                    .putString("scale_min",GameSettings.MIN_SCALES[minScale.getSelectedItemPosition()]).apply();
-            }).setNegativeButton("Cancel",null).show();
+        settings.setOnClickListener(v -> showSettings());
+        loggingToggle=new Button(this);
+        updateLoggingToggleText(loggingToggle);
+        loggingToggle.setOnClickListener(v -> {
+            String current=GameSettings.choice(this,GameSettings.LOGGING_MODE,"standard",GameSettings.LOGGING_MODES);
+            int nextIdx=(java.util.Arrays.asList(GameSettings.LOGGING_MODES).indexOf(current)+1)%GameSettings.LOGGING_MODES.length;
+            String next=GameSettings.LOGGING_MODES[nextIdx];
+            GameSettings.prefs(this).edit().putString(GameSettings.LOGGING_MODE,next).apply();
+            updateLoggingToggleText(loggingToggle);
+            Toast.makeText(this,"Logging mode set to: "+next.toUpperCase(),Toast.LENGTH_SHORT).show();
         });
-        Button play=new Button(this);play.setText("Play (development build)");root.addView(play);
+        root.addView(loggingToggle);
+        Button viewLogs=new Button(this);viewLogs.setText("View saved logs / crash info");root.addView(viewLogs);
+        viewLogs.setOnClickListener(v -> showLogsDialog());
+        Button play=new Button(this);play.setText("Play");root.addView(play);
         play.setOnClickListener(v -> {
             if(!GameStore.ready(this)){status.setText("Import an ISO and matching decrypted EBOOT first");return;}
             startActivity(new Intent(this,GameActivity.class));
         });
         TextView location = new TextView(this);location.setText("Reports: "+new File(getExternalFilesDir(null),"diagnostics"));root.addView(location);
+        TextView logsLocation = new TextView(this);logsLocation.setText("Logs: "+GameSettings.logsDirectory(this));root.addView(logsLocation);
         setContentView(root);
         // Debug automation only accepts a file within this app's external directory.
         if((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE)!=0 &&
@@ -100,6 +94,157 @@ public final class LauncherActivity extends Activity {
                 if(!source.getCanonicalPath().startsWith(getExternalFilesDir(null).getCanonicalPath()+File.separator))throw new java.io.IOException("Invalid automation input");
                 importGame(key.equals("import_iso")?IMPORT_ISO:IMPORT_EBOOT,new FileInputStream(source));
             }catch(Exception e){status.setText("Import failed: "+e);}
+        }
+    }
+    private Spinner settingChoice(LinearLayout root,String label,String[] labels,int selected){
+        TextView text=new TextView(this);text.setText(label);root.addView(text);
+        Spinner choice=new Spinner(this);
+        choice.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,labels));
+        choice.setSelection(Math.max(0,Math.min(labels.length-1,selected)));root.addView(choice);return choice;
+    }
+    private CheckBox settingToggle(LinearLayout root,String label,String key,boolean fallback){
+        CheckBox box=new CheckBox(this);box.setText(label);box.setChecked(GameSettings.prefs(this).getBoolean(key,fallback));
+        root.addView(box);return box;
+    }
+    private int settingIndex(String key,String fallback,String[] values){
+        return java.util.Arrays.asList(values).indexOf(GameSettings.choice(this,key,fallback,values));
+    }
+    private void showSettings(){
+        LinearLayout options=new LinearLayout(this);options.setOrientation(LinearLayout.VERTICAL);options.setPadding(28,12,28,12);
+        ScrollView scroll=new ScrollView(this);scroll.addView(options);
+        TextView info=new TextView(this);
+        info.setText("Default: 2x resolution, original 30 fps, low draw distance, optional effects off. Changes apply next launch. Menus and races always fill the screen.");options.addView(info);
+        Spinner resolution=settingChoice(options,"Internal resolution",new String[]{"Full (matches display)","1x (480 x 272)","2x (960 x 544, default)","3x","4x","5x (2400 x 1360)"},GameSettings.resolution(this));
+        String[] fpsValues={"original","60"};
+        Spinner fps=settingChoice(options,"Frame rate",new String[]{"Original (30 fps, default)","60 fps"},settingIndex("fps","original",fpsValues));
+        CheckBox dynamicFps=settingToggle(options,"Fall back to 30 fps when 60 fps cannot be sustained","dynamic_fps",false);
+        CheckBox fxaa=settingToggle(options,"FXAA antialiasing","fxaa",false);
+        CheckBox filtering=settingToggle(options,"Enhanced texture filtering (anisotropic and mipmaps)","enhanced_filtering",false);
+        String[] distanceValues={"low","normal","high","ultra"};
+        Spinner distance=settingChoice(options,"Draw distance",new String[]{"Low (default)","Normal","High","Ultra"},settingIndex("render_distance","low",distanceValues));
+        CheckBox popIn=settingToggle(options,"Fade distant objects to reduce pop-in","less_pop_in",false);
+        String[] modeValues={"off","fixed","dynamic"};
+        Spinner mode=settingChoice(options,"Render scale",new String[]{"Off (stable resolution, default)","Fixed scale","Dynamic during gameplay"},settingIndex("scale_mode","off",modeValues));
+        Spinner fixed=settingChoice(options,"Fixed render scale",new String[]{"50%","60%","70%","75%","80%","90%","100%"},settingIndex("scale","0.75",GameSettings.FIXED_SCALES));
+        Spinner min=settingChoice(options,"Dynamic minimum resolution",new String[]{"50%","60%","70%","80%","90%"},settingIndex("scale_min","0.50",GameSettings.MIN_SCALES));
+        Spinner max=settingChoice(options,"Dynamic maximum resolution",new String[]{"50%","60%","70%","80%","90%","100%"},settingIndex("scale_max","1.00",GameSettings.MAX_SCALES));
+        String[] sharpValues={"1.0","1.5","2.0"};
+        Spinner sharp=settingChoice(options,"Upscaler sharpness (fixed/dynamic scale)",new String[]{"1.0 (soft)","1.5","2.0 (sharp)"},settingIndex("sgsr_sharpness","2.0",sharpValues));
+        CheckBox effects=settingToggle(options,"Enable optional race effects","effects",false);
+        CheckBox color=settingToggle(options,"Color correction (requires race effects)","color_correction",false);
+        CheckBox sharpen=settingToggle(options,"Sharpening (requires race effects)","sharpening",false);
+        CheckBox particles=settingToggle(options,"Soft particles (requires race effects)","soft_particles",false);
+        CheckBox audio=settingToggle(options,"Sound and music","audio",true);
+        CheckBox rumble=settingToggle(options,"Controller vibration","rumble",false);
+        CheckBox touchUi=settingToggle(options,"Show touch controls (hide automatically after controller input)",GameSettings.TOUCH_UI,true);
+        String[] loggingLabels={"Standard (essential events & crashes)","Verbose (full traces & filesystem)","Off (no log file)"};
+        Spinner logging=settingChoice(options,"Logging mode",loggingLabels,settingIndex(GameSettings.LOGGING_MODE,"standard",GameSettings.LOGGING_MODES));
+        AlertDialog dialog=new AlertDialog.Builder(this).setTitle("Game settings").setView(scroll)
+            .setPositiveButton("Save",null).setNegativeButton("Cancel",null).setNeutralButton("Reset defaults",null).create();
+        dialog.setOnShowListener(ignored -> {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+                String minimum=GameSettings.MIN_SCALES[min.getSelectedItemPosition()];
+                String maximum=GameSettings.MAX_SCALES[max.getSelectedItemPosition()];
+                if(Float.parseFloat(minimum)>Float.parseFloat(maximum)){
+                    Toast.makeText(this,"Dynamic minimum must not exceed maximum",Toast.LENGTH_SHORT).show();return;
+                }
+                GameSettings.prefs(this).edit().putInt(GameSettings.RESOLUTION,resolution.getSelectedItemPosition())
+                    .putString("fps",fpsValues[fps.getSelectedItemPosition()]).putBoolean("dynamic_fps",dynamicFps.isChecked())
+                    .putBoolean("fxaa",fxaa.isChecked()).putBoolean("enhanced_filtering",filtering.isChecked())
+                    .putString("render_distance",distanceValues[distance.getSelectedItemPosition()]).putBoolean("less_pop_in",popIn.isChecked())
+                    .putString("scale_mode",modeValues[mode.getSelectedItemPosition()]).putString("scale",GameSettings.FIXED_SCALES[fixed.getSelectedItemPosition()])
+                    .putString("scale_min",minimum).putString("scale_max",maximum).putString("sgsr_sharpness",sharpValues[sharp.getSelectedItemPosition()])
+                    .putBoolean("effects",effects.isChecked()).putBoolean("color_correction",color.isChecked())
+                    .putBoolean("sharpening",sharpen.isChecked()).putBoolean("soft_particles",particles.isChecked())
+                    .putBoolean("audio",audio.isChecked()).putBoolean("rumble",rumble.isChecked())
+                    .putBoolean(GameSettings.TOUCH_UI,touchUi.isChecked())
+                    .putString(GameSettings.LOGGING_MODE,GameSettings.LOGGING_MODES[logging.getSelectedItemPosition()]).apply();
+                if(loggingToggle!=null)updateLoggingToggleText(loggingToggle);
+                dialog.dismiss();
+            });
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> {
+                GameSettings.resetGraphics(this);
+                if(loggingToggle!=null)updateLoggingToggleText(loggingToggle);
+                dialog.dismiss();showSettings();
+            });
+        });
+        dialog.show();
+    }
+    private void showLogsDialog(){
+        File logsDir=GameSettings.logsDirectory(this);
+        java.util.List<File> allLogs=new java.util.ArrayList<>();
+        File[] dirFiles=logsDir.listFiles((d,name)->name.endsWith(".log")||name.endsWith(".txt"));
+        if(dirFiles!=null)allLogs.addAll(java.util.Arrays.asList(dirFiles));
+        File extDir=getExternalFilesDir(null);
+        if(extDir!=null){
+            File[] rootLogs=extDir.listFiles((d,name)->name.endsWith(".log"));
+            if(rootLogs!=null)for(File rf:rootLogs)if(!allLogs.contains(rf))allLogs.add(rf);
+        }
+        if(allLogs.isEmpty()){
+            new AlertDialog.Builder(this)
+                .setTitle("Saved Logs")
+                .setMessage("No logs found yet in:\n"+logsDir.getAbsolutePath()+"\n\nLogs are automatically created here when you play.")
+                .setPositiveButton("OK",null)
+                .show();
+            return;
+        }
+        allLogs.sort((a,b)->Long.compare(b.lastModified(),a.lastModified()));
+        String[] labels=new String[allLogs.size()];
+        for(int i=0;i<allLogs.size();i++){
+            File f=allLogs.get(i);
+            long kb=f.length()/1024;
+            labels[i]=f.getName()+" ("+(kb>0?kb+" KB":f.length()+" B")+")";
+        }
+        new AlertDialog.Builder(this)
+            .setTitle("Saved Logs ("+logsDir.getAbsolutePath()+")")
+            .setItems(labels,(d,which)->viewLogFile(allLogs.get(which)))
+            .setPositiveButton("Close",null)
+            .setNeutralButton("Clear all",(d,which)->{
+                for(File f:allLogs)f.delete();
+                Toast.makeText(this,"Logs cleared",Toast.LENGTH_SHORT).show();
+            })
+            .show();
+    }
+    private void viewLogFile(File file){
+        try{
+            String content;
+            long maxBytes=64*1024;
+            if(file.length()>maxBytes){
+                try(java.io.RandomAccessFile raf=new java.io.RandomAccessFile(file,"r")){
+                    raf.seek(file.length()-maxBytes);
+                    byte[] bytes=new byte[(int)maxBytes];
+                    raf.readFully(bytes);
+                    content="... [Showing last "+(maxBytes/1024)+" KB] ...\n"+new String(bytes,java.nio.charset.StandardCharsets.UTF_8);
+                }
+            } else {
+                content=new String(java.nio.file.Files.readAllBytes(file.toPath()),java.nio.charset.StandardCharsets.UTF_8);
+            }
+            if(content.isEmpty())content="(File is empty)";
+            TextView tv=new TextView(this);
+            tv.setText(content);
+            tv.setTextSize(10);
+            tv.setTypeface(android.graphics.Typeface.MONOSPACE);
+            tv.setPadding(24,16,24,16);
+            tv.setTextIsSelectable(true);
+            ScrollView sv=new ScrollView(this);
+            sv.addView(tv);
+            new AlertDialog.Builder(this)
+                .setTitle(file.getName())
+                .setView(sv)
+                .setPositiveButton("Close",null)
+                .setNeutralButton("Copy",(d,which)->{
+                    android.content.ClipboardManager cm=(android.content.ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
+                    if(cm!=null){
+                        cm.setPrimaryClip(android.content.ClipData.newPlainText("MotorStorm Log",tv.getText()));
+                        Toast.makeText(this,"Copied to clipboard",Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .setNegativeButton("Delete",(d,which)->{
+                    if(file.delete())Toast.makeText(this,"Deleted "+file.getName(),Toast.LENGTH_SHORT).show();
+                })
+                .show();
+        }catch(Exception e){
+            Toast.makeText(this,"Failed to read log: "+e.getMessage(),Toast.LENGTH_LONG).show();
         }
     }
     private void pick(int request){startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"),request);}

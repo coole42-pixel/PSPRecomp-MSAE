@@ -365,6 +365,7 @@ public:
         if (error_) std::rethrow_exception(std::exchange(error_, nullptr));
     }
     bool on_thread() const noexcept { return std::this_thread::get_id() == id_.load(); }
+    std::uint64_t cpu_time_ns() const noexcept { return cpu_ns_.load(); }
     void stop() {
         {
             std::unique_lock lock(mutex_);
@@ -393,6 +394,13 @@ private:
                 failed = error_ != nullptr;
             }
             if (!failed) {
+#if defined(__ANDROID__)
+                const auto thread_cpu_ns = [] {
+                    timespec value{}; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value);
+                    return static_cast<std::uint64_t>(value.tv_sec) * 1000000000ull + value.tv_nsec;
+                };
+                const auto cpu_begin = perf::enabled() ? thread_cpu_ns() : 0u;
+#endif
                 try {
                     motorstorm::software_ge_execute_segment(runtime_->memory(), segment.list, segment.stall,
                                                             segment.rasterize, segment.submission,
@@ -401,6 +409,9 @@ private:
                     std::lock_guard lock(mutex_);
                     error_ = std::current_exception();
                 }
+#if defined(__ANDROID__)
+                if (cpu_begin) cpu_ns_ += thread_cpu_ns() - cpu_begin;
+#endif
             }
             std::lock_guard lock(mutex_);
             busy_ = false;
@@ -410,6 +421,7 @@ private:
     Runtime *runtime_{};
     std::thread thread_;
     std::atomic<std::thread::id> id_{};
+    std::atomic<std::uint64_t> cpu_ns_{};
     std::mutex mutex_;
     std::condition_variable changed_;
     std::deque<Segment> queue_;
@@ -501,6 +513,22 @@ void update_widescreen_camera(Runtime &runtime, bool racing) {
         cameras.clear();
         gpu_set_guest_widescreen(false);
     };
+#if defined(__ANDROID__)
+    // A camera field found by scanning RAM does not tell us whether queued GE
+    // work already contains that camera's old or new projection. Switching the
+    // global shader fallback after rewriting it can alternate the field of view.
+    // Use the deterministic shader widening path on Android until camera
+    // projection construction is hooked at its actual guest execution point.
+    static bool shader_path_logged = false;
+    if (racing && gpu_widescreen_enabled() && !shader_path_logged) {
+        log_line(category::kGe, "Android widescreen: stable shader path (camera RAM patch disabled)");
+        shader_path_logged = true;
+    }
+    if (!cameras.empty()) restore();
+    gpu_set_guest_widescreen(false);
+    wait = 0u;
+    return;
+#endif
     if (!racing || !gpu_widescreen_enabled()) {
         if (!cameras.empty()) restore();
         wait = 0u;
@@ -4998,6 +5026,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
 }
 
 std::uint64_t guest_time_us() { return g_virtual_time_us; }
+std::uint64_t ge_worker_cpu_time_ns() { return g_ge_thread.cpu_time_ns(); }
 bool frame_rate_unlocked() { return g_frame_rate.unlocked; }
 
 void report_summary() {
@@ -5083,13 +5112,32 @@ void report_summary() {
                 << " feedback_syncs=" << gpu.feedback_syncs << " feedback_draws=" << gpu.feedback_draws
                 << " hardware_pixel_draws=" << gpu.hardware_pixel_draws
                 << " ordered_pixel_draws=" << gpu.ordered_pixel_draws
+                << " fast_draws=" << gpu.draws_ps_fast
+                << " fast_alpha=" << gpu.draws_ps_fast_alpha
+                << " ordered_draws=" << gpu.draws_ps_ordered
+                << " switches_h2o=" << gpu.switches_hw_to_ordered
+                << " switches_o2h=" << gpu.switches_ordered_to_hw
+                << " pass_endings=" << gpu.render_pass_endings
+                << " pack_color=" << gpu.pack_color_dispatches
+                << " pack_depth=" << gpu.pack_depth_dispatches
+                << " buffer_syncs=" << gpu.framebuffer_syncs
                 << " pixel_path_switches=" << gpu.pixel_path_switches
                 << " hardware_alpha_draws=" << gpu.hardware_alpha_draws
                 << " reject_feedback=" << gpu.reject_feedback
                 << " reject_stencil=" << gpu.reject_stencil
+                << " reject_blend_16bit=" << gpu.reject_blend_16bit
+                << " reject_blend_double_alpha=" << gpu.reject_blend_double_alpha
+                << " reject_blend_narrow=" << gpu.reject_blend_narrow
+                << " reject_blend_equation=" << gpu.reject_blend_equation
+                << " reject_blend_fix_conflict=" << gpu.reject_blend_fix_conflict
+                << " reject_soft_particles=" << gpu.reject_soft_particles
+                << " reject_hud_tag=" << gpu.reject_hud_tag
+                << " reject_extended_color=" << gpu.reject_extended_color
+                << " reject_raster_half_zero=" << gpu.reject_raster_half_zero
                 << " reject_color=" << gpu.reject_color
                 << " reject_mask=" << gpu.reject_mask
                 << " reject_blend=" << gpu.reject_blend
+                << " reject_target_size_mismatch=" << gpu.reject_target_size_mismatch
                 << " reject_other=" << gpu.reject_other
                 << " hw_packs=" << gpu.hw_packs
                 << " hw_pack_ms=" << (gpu.hw_pack_ns / 1000000u)

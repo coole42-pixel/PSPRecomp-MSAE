@@ -105,6 +105,9 @@
     X(vkCmdSetViewport)                                                                                            \
     X(vkCmdSetScissor)                                                                                             \
     X(vkCmdSetBlendConstants)                                                                                      \
+    X(vkCmdSetStencilCompareMask)                                                                                  \
+    X(vkCmdSetStencilWriteMask)                                                                                    \
+    X(vkCmdSetStencilReference)                                                                                    \
     X(vkCmdFillBuffer)                                                                                             \
     X(vkCmdWriteTimestamp)                                                                                         \
     X(vkCreatePipelineCache)                                                                                       \
@@ -124,7 +127,8 @@
     X(vkCmdSetDepthCompareOp)                                                                                      \
     X(vkCmdSetColorBlendEnableEXT)                                                                                 \
     X(vkCmdSetColorBlendEquationEXT)                                                                               \
-    X(vkCmdSetColorWriteMaskEXT)
+    X(vkCmdSetColorWriteMaskEXT)                                                                                   \
+    X(vkGetPastPresentationTimingGOOGLE)
 
 #if defined(__ANDROID__)
 #define MOTORSTORM_VK_MOBILE_DEVICE(X) \

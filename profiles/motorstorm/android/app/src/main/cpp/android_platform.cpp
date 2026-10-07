@@ -16,6 +16,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstdio>
+#include <cmath>
 #include <mutex>
 #include <thread>
 #include <cstring>
@@ -104,36 +106,363 @@ void window_start(){if(!display)display=SDL_CreateWindow("MotorStorm: Arctic Edg
 void window_set_fullscreen(bool value){if(display)SDL_SetWindowFullscreen(display,value);}
 bool window_fullscreen(){return true;}
 bool window_close_requested(){return stopped;}
+static std::string fmt1(double val){char buf[32];std::snprintf(buf,sizeof(buf),"%.1f",val);return buf;}
+static std::string fmt2(double val){char buf[32];std::snprintf(buf,sizeof(buf),"%.2f",val);return buf;}
+
+struct PerfTracker {
+    std::mutex mutex;
+    std::uint64_t total_frames{0};
+    std::uint64_t total_late_frames{0};
+    std::uint64_t total_stutters{0};
+    std::uint64_t session_start_us{0};
+
+    // Frame time histogram: 0 to 127 ms in 1 ms steps (bucket 127 is >= 127 ms)
+    std::uint32_t histogram[128]{};
+
+    // Window tracking (2.0s windows)
+    std::uint64_t window_start_us{0};
+    std::uint64_t window_frames{0};
+    std::uint64_t window_late_frames{0};
+    std::uint64_t window_stutters{0};
+    double window_sum_ms{0.0};
+    double window_max_ms{0.0};
+    double window_min_ms{9999.0};
+    double window_gpu_sum_ms{0.0};
+    std::uint64_t window_gpu_samples{0};
+
+    // Cumulative causes across window
+    double window_cause_pipeline_ms{0.0};
+    double window_cause_readback_ms{0.0};
+    double window_cause_audio_ms{0.0};
+    double window_cause_present_ms{0.0};
+    double window_cause_cpu_ms{0.0};
+    std::uint64_t window_gpu_overload_frames{0};
+
+    // Lifetime metrics
+    double total_pipeline_compile_ms{0.0};
+    std::uint64_t total_pipelines_created{0};
+    double total_readback_wait_ms{0.0};
+    std::uint64_t total_readback_waits{0};
+    double worst_stutter_ms{0.0};
+    std::uint64_t worst_stutter_frame{0};
+    std::string worst_stutter_cause;
+
+    GpuReport prev_report{};
+    std::uint64_t prev_audio_blocked_us{0};
+    std::uint64_t last_stutter_log_us{0};
+    bool initialized{false};
+
+    void on_resume() {
+        std::lock_guard lock(mutex);
+        window_start_us = host_time_us();
+        initialized = false;
+    }
+
+    void record_frame(double flip_interval_ms, double present_cost_ms, const GpuReport &report,
+                      uint64_t audio_blocked_us, int target_fps) {
+        std::lock_guard lock(mutex);
+        const double budget_ms = frame_budget_ms(target_fps);
+        const double late_threshold_ms = budget_ms * 1.15;
+        const double stutter_threshold_ms = budget_ms * 1.45;
+        const uint64_t now = host_time_us();
+
+        if (!initialized || flip_interval_ms <= 0.0) {
+            initialized = true;
+            if (!session_start_us) session_start_us = now;
+            window_start_us = now;
+            prev_report = report;
+            prev_audio_blocked_us = audio_blocked_us;
+            return;
+        }
+
+        ++total_frames;
+        ++window_frames;
+        window_sum_ms += flip_interval_ms;
+        if (flip_interval_ms > window_max_ms) window_max_ms = flip_interval_ms;
+        if (flip_interval_ms < window_min_ms) window_min_ms = flip_interval_ms;
+
+        const int h_idx = std::clamp(static_cast<int>(flip_interval_ms), 0, 127);
+        histogram[h_idx]++;
+
+        const bool is_late = (flip_interval_ms > late_threshold_ms);
+        const bool is_stutter = (flip_interval_ms > stutter_threshold_ms);
+        if (is_late) {
+            ++total_late_frames;
+            ++window_late_frames;
+        }
+        if (is_stutter) {
+            ++total_stutters;
+            ++window_stutters;
+        }
+
+        // Deltas since last frame
+        const uint64_t delta_pipelines = report.pipelines_created >= prev_report.pipelines_created ?
+            (report.pipelines_created - prev_report.pipelines_created) : 0;
+        const double delta_pipeline_ms = (report.pipeline_create_ns >= prev_report.pipeline_create_ns ?
+            (report.pipeline_create_ns - prev_report.pipeline_create_ns) : 0) / 1'000'000.0;
+        total_pipeline_compile_ms += delta_pipeline_ms;
+        total_pipelines_created += delta_pipelines;
+        window_cause_pipeline_ms += delta_pipeline_ms;
+
+        uint64_t curr_pub_waits = 0, curr_pub_wait_ns = 0;
+        uint64_t prev_pub_waits = 0, prev_pub_wait_ns = 0;
+        for (int i = 0; i < 6; ++i) {
+            curr_pub_waits += report.publish_waits[i];
+            curr_pub_wait_ns += report.publish_wait_ns[i];
+            prev_pub_waits += prev_report.publish_waits[i];
+            prev_pub_wait_ns += prev_report.publish_wait_ns[i];
+        }
+        const uint64_t delta_pub_waits = curr_pub_waits >= prev_pub_waits ? curr_pub_waits - prev_pub_waits : 0;
+        const double delta_pub_wait_ms = (curr_pub_wait_ns >= prev_pub_wait_ns ?
+            curr_pub_wait_ns - prev_pub_wait_ns : 0) / 1'000'000.0;
+        total_readback_wait_ms += delta_pub_wait_ms;
+        total_readback_waits += delta_pub_waits;
+        window_cause_readback_ms += delta_pub_wait_ms;
+
+        const double delta_audio_blocked_ms = (audio_blocked_us >= prev_audio_blocked_us ?
+            (audio_blocked_us - prev_audio_blocked_us) : 0) / 1000.0;
+        window_cause_audio_ms += delta_audio_blocked_ms;
+
+        window_cause_present_ms += present_cost_ms;
+
+        const double gpu_ms = report.last_gpu_ms;
+        if (gpu_ms >= 0.0) {
+            window_gpu_sum_ms += gpu_ms;
+            ++window_gpu_samples;
+            if (gpu_ms > budget_ms) ++window_gpu_overload_frames;
+        }
+
+        const uint64_t delta_sw_draws = report.software_draws >= prev_report.software_draws ?
+            (report.software_draws - prev_report.software_draws) : 0;
+
+        const double cpu_work_ms = std::max(0.0, flip_interval_ms - delta_pipeline_ms - delta_pub_wait_ms
+                                            - delta_audio_blocked_ms - present_cost_ms);
+        window_cause_cpu_ms += cpu_work_ms;
+
+        // Diagnose root causes for this stutter/drop
+        if (is_stutter) {
+            std::string primary;
+            double max_contrib = 0.0;
+            std::string causes;
+
+            if (delta_pipeline_ms >= 2.0) {
+                causes += "pipeline_compile=" + fmt1(delta_pipeline_ms) + "ms (" + std::to_string(delta_pipelines) + " PSO), ";
+                if (delta_pipeline_ms > max_contrib) { max_contrib = delta_pipeline_ms; primary = "Shader/pipeline compile (" + fmt1(delta_pipeline_ms) + "ms)"; }
+            }
+            if (gpu_ms > budget_ms) {
+                const double excess = gpu_ms - budget_ms;
+                causes += "gpu_overload=" + fmt1(gpu_ms) + "ms (scale=" + fmt2(report.render_scale) + "), ";
+                if (excess > max_contrib) { max_contrib = excess; primary = "GPU bottleneck (" + fmt1(gpu_ms) + "ms > " + fmt1(budget_ms) + "ms)"; }
+            }
+            if (delta_pub_wait_ms >= 1.5) {
+                causes += "vram_readback_wait=" + fmt1(delta_pub_wait_ms) + "ms (" + std::to_string(delta_pub_waits) + " waits), ";
+                if (delta_pub_wait_ms > max_contrib) { max_contrib = delta_pub_wait_ms; primary = "VRAM readback wait (" + fmt1(delta_pub_wait_ms) + "ms)"; }
+            }
+            if (present_cost_ms >= 8.0) {
+                causes += "presentation_wait=" + fmt1(present_cost_ms) + "ms, ";
+                if (present_cost_ms > max_contrib) { max_contrib = present_cost_ms; primary = "Presentation/VSync wait (" + fmt1(present_cost_ms) + "ms)"; }
+            }
+            if (delta_audio_blocked_ms >= 3.0) {
+                causes += "audio_stall=" + fmt1(delta_audio_blocked_ms) + "ms, ";
+                if (delta_audio_blocked_ms > max_contrib) { max_contrib = delta_audio_blocked_ms; primary = "Audio backpressure (" + fmt1(delta_audio_blocked_ms) + "ms)"; }
+            }
+            if (delta_sw_draws > 0) {
+                causes += "sw_draws=" + std::to_string(delta_sw_draws) + ", ";
+            }
+            if (cpu_work_ms > budget_ms * 1.1) {
+                causes += "cpu_work=" + fmt1(cpu_work_ms) + "ms, ";
+                const double excess = cpu_work_ms - budget_ms;
+                if (excess > max_contrib) { max_contrib = excess; primary = "CPU work (" + fmt1(cpu_work_ms) + "ms)"; }
+            }
+            if (primary.empty()) {
+                primary = "General delay (" + fmt1(flip_interval_ms) + "ms)";
+            }
+            if (causes.ends_with(", ")) causes.resize(causes.size() - 2);
+
+            if (flip_interval_ms > worst_stutter_ms) {
+                worst_stutter_ms = flip_interval_ms;
+                worst_stutter_frame = total_frames;
+                worst_stutter_cause = primary;
+            }
+
+            // Rate-limit individual stutter logs to at most 3 per second
+            if (now - last_stutter_log_us >= 333'333ull) {
+                last_stutter_log_us = now;
+                log_line("PERF_STUTTER", "frame=" + std::to_string(total_frames) + " took=" + fmt1(flip_interval_ms) +
+                         "ms (target=" + fmt1(budget_ms) + "ms, +" + fmt1(flip_interval_ms - budget_ms) +
+                         "ms late) | primary: " + primary + " | breakdown: " + (causes.empty() ? "none" : causes));
+            }
+        }
+
+        // Periodic window check (every 2.0 seconds)
+        const uint64_t window_duration_us = now - window_start_us;
+        if (window_duration_us >= 2'000'000ull && window_frames > 0) {
+            const double duration_sec = static_cast<double>(window_duration_us) / 1'000'000.0;
+            const double fps = static_cast<double>(window_frames) / duration_sec;
+            const double avg_ms = window_sum_ms / window_frames;
+            const double late_pct = (window_late_frames * 100.0) / window_frames;
+            const double gpu_avg = window_gpu_samples > 0 ? (window_gpu_sum_ms / window_gpu_samples) : 0.0;
+            const std::string timing_detail = " | frame=" + std::to_string(total_frames) +
+                " host_unattributed_avg_ms=" + fmt1(window_cause_cpu_ms / window_frames) +
+                " readback_ms=" + fmt1(window_cause_readback_ms) +
+                " present_ms=" + fmt1(window_cause_present_ms) +
+                " audio_wait_ms=" + fmt1(window_cause_audio_ms) +
+                " compile_ms=" + fmt1(window_cause_pipeline_ms) +
+                " gpu_avg_ms=" + fmt1(gpu_avg);
+            // Keep trigger-level coherence counters in live logs, including
+            // sessions stopped without a clean shutdown census.
+            std::string coherence = "cumulative publishes(draw/sync/end/cpu/start/other)=";
+            for (unsigned i = 0; i < report.publishes.size(); ++i)
+                coherence += (i ? "/" : "") + std::to_string(report.publishes[i]);
+            coherence += " wait_ms=";
+            for (unsigned i = 0; i < report.publish_wait_ns.size(); ++i)
+                coherence += (i ? "/" : "") + fmt1(report.publish_wait_ns[i] / 1'000'000.0);
+            coherence += " pk_c=" + std::to_string(report.pack_color_dispatches) +
+                         " pk_d=" + std::to_string(report.pack_depth_dispatches) +
+                         " direct=" + std::to_string(report.direct_image_presents);
+            coherence += " unrelated=" + std::to_string(report.unrelated_vram_accesses);
+            coherence += " tail_gpu=" + std::to_string(report.feedback_tail_compositions);
+            char sync_range[160];
+            std::snprintf(sync_range, sizeof(sync_range), " texture_sync_last=0x%08X/%u target=0x%08X bpp=%u",
+                          report.texture_sync_address, report.texture_sync_bytes,
+                          report.texture_sync_target, report.texture_sync_bpp);
+            coherence += sync_range;
+            char cpu_range[96];
+            std::snprintf(cpu_range, sizeof(cpu_range), " cpu_last=0x%08X/%llu racing=%u",
+                          report.cpu_vram_address, static_cast<unsigned long long>(report.cpu_vram_bytes),
+                          report.racing ? 1u : 0u);
+            coherence += cpu_range;
+            coherence += " query_prefetch=" + std::to_string(report.query_prefetches) +
+                         " query_bytes=" + std::to_string(report.query_prefetch_bytes);
+            coherence += " depth_readonly=" + std::to_string(report.readonly_depth_passes) +
+                         " color_restore=" + std::to_string(report.color_only_restores) +
+                         " depth_restore=" + std::to_string(report.depth_restores);
+            log_line("VRAM_COHERENCE", coherence);
+
+            std::string dominant_bottleneck = "None (smooth)";
+            if (window_cause_pipeline_ms >= 15.0) {
+                dominant_bottleneck = "Pipeline/shader compilation (" + fmt1(window_cause_pipeline_ms) + "ms total in 2s)";
+            } else if (window_cause_readback_ms >= 15.0 && window_cause_readback_ms >= window_cause_cpu_ms &&
+                       window_cause_readback_ms >= window_cause_present_ms) {
+                dominant_bottleneck = "VRAM readback sync (" + fmt1(window_cause_readback_ms) + "ms total in 2s)";
+            } else if (window_gpu_overload_frames >= window_frames / 3) {
+                dominant_bottleneck = "GPU rendering (avg " + fmt1(gpu_avg) + "ms vs " + fmt1(budget_ms) + "ms budget, scale=" + fmt2(report.render_scale) + ")";
+            } else if (window_cause_readback_ms >= 15.0) {
+                dominant_bottleneck = "VRAM readback sync (" + fmt1(window_cause_readback_ms) + "ms total in 2s)";
+            } else if (window_cause_audio_ms >= 15.0) {
+                dominant_bottleneck = "Audio thread backpressure (" + fmt1(window_cause_audio_ms) + "ms total in 2s)";
+            } else if (late_pct >= 25.0) {
+                dominant_bottleneck = "CPU work (avg cpu " + fmt1(window_cause_cpu_ms / window_frames) + "ms)";
+            }
+
+            if (late_pct >= 25.0 || fps < target_fps * 0.75) {
+                log_line("PERF_REGRESSION", "sustained drop to " + fmt1(fps) + " fps (target " + std::to_string(target_fps) +
+                         " fps) | late=" + std::to_string(window_late_frames) + "/" + std::to_string(window_frames) +
+                         " (" + fmt1(late_pct) + "%) | stutters=" + std::to_string(window_stutters) +
+                         " | primary cause: " + dominant_bottleneck + timing_detail);
+            } else {
+                log_line("PERF", "fps=" + fmt1(fps) + " (avg=" + fmt1(avg_ms) + "ms, min=" + fmt1(window_min_ms) +
+                         "ms, max=" + fmt1(window_max_ms) + "ms) | late=" + std::to_string(window_late_frames) +
+                         "/" + std::to_string(window_frames) + " (" + fmt1(late_pct) + "%) | gpu_avg=" +
+                         fmt1(gpu_avg) + "ms (scale=" + fmt2(report.render_scale) + ") | stutters=" +
+                         std::to_string(window_stutters) + timing_detail);
+            }
+
+            window_start_us = now;
+            window_frames = 0;
+            window_late_frames = 0;
+            window_stutters = 0;
+            window_sum_ms = 0.0;
+            window_max_ms = 0.0;
+            window_min_ms = 9999.0;
+            window_gpu_sum_ms = 0.0;
+            window_gpu_samples = 0;
+            window_cause_pipeline_ms = 0.0;
+            window_cause_readback_ms = 0.0;
+            window_cause_audio_ms = 0.0;
+            window_cause_present_ms = 0.0;
+            window_cause_cpu_ms = 0.0;
+            window_gpu_overload_frames = 0;
+        }
+
+        prev_report = report;
+        prev_audio_blocked_us = audio_blocked_us;
+    }
+
+    void log_summary() {
+        std::lock_guard lock(mutex);
+        if (total_frames == 0) return;
+        const uint64_t now = host_time_us();
+        const double duration_sec = session_start_us ? static_cast<double>(now - session_start_us) / 1'000'000.0 : 0.0;
+        const double avg_fps = duration_sec > 0.0 ? static_cast<double>(total_frames) / duration_sec : 0.0;
+        const double late_pct = (total_late_frames * 100.0) / total_frames;
+
+        const uint32_t p01_count = std::max(1u, static_cast<uint32_t>(total_frames / 100u));
+        uint32_t accum = 0;
+        double p99_frame_ms = 33.3;
+        for (int i = 127; i >= 0; --i) {
+            accum += histogram[i];
+            if (accum >= p01_count) {
+                p99_frame_ms = static_cast<double>(i);
+                break;
+            }
+        }
+        const double one_pct_low_fps = p99_frame_ms > 0.0 ? (1000.0 / p99_frame_ms) : 0.0;
+
+        log_line("PERF_SUMMARY", "frames=" + std::to_string(total_frames) + " duration=" + fmt1(duration_sec) +
+                 "s | avg_fps=" + fmt1(avg_fps) + " | 1%_low_fps=" + fmt1(one_pct_low_fps) +
+                 " | late_frames=" + std::to_string(total_late_frames) + "/" + std::to_string(total_frames) +
+                 " (" + fmt1(late_pct) + "%) | total_stutters=" + std::to_string(total_stutters) +
+                 " | pipeline_compiles=" + fmt1(total_pipeline_compile_ms) + "ms (" + std::to_string(total_pipelines_created) + " PSOs)" +
+                 " | vram_readback_waits=" + fmt1(total_readback_wait_ms) + "ms (" + std::to_string(total_readback_waits) + " waits)" +
+                 (worst_stutter_ms > 0.0 ? (" | worst_stutter=" + fmt1(worst_stutter_ms) + "ms at frame " +
+                  std::to_string(worst_stutter_frame) + " (" + worst_stutter_cause + ")") : ""));
+        flush_log_file();
+    }
+};
+
+static PerfTracker g_perf_tracker;
+static std::uint64_t g_last_present_us{0};
+
 void window_present(psprecomp::GuestMemory &memory,std::uint32_t fb,std::uint32_t stride,std::uint32_t format,std::uint32_t width,std::uint32_t height){
     android::pause_wait();
-    static std::uint64_t count{}, previous{}, last_present{};
+    static std::uint64_t count{}, previous{};
+    static double last_present_cost_ms{0.0};
     const auto now=host_time_us();
+    const double flip_interval_ms=g_last_present_us?static_cast<double>(now-g_last_present_us)/1000.0:0.0;
+    const char *fps_env=std::getenv("PSPRECOMP_MOTORSTORM_FPS");
+    const int target=fps_env&&std::strcmp(fps_env,"60")==0?60:30;
+    const auto report=gpu_report();
+
     if(const char *bench=std::getenv("PSPRECOMP_MOTORSTORM_BENCH_OUT")) {
         if(now-previous>2000000) {
             log_line("ANDROID", "guest_us="+std::to_string(guest_time_us())+" flips="+std::to_string(count)+
-                " gpu_draws="+std::to_string(gpu_report().draws));previous=now;
+                " gpu_draws="+std::to_string(report.draws));previous=now;
         }
-        const auto report=gpu_report();
-        const double cpu_ms=last_present?static_cast<double>(now-last_present)/1000.0:0;
-        const char *fps=std::getenv("PSPRECOMP_MOTORSTORM_FPS");
-        const int target=fps&&std::strcmp(fps,"60")==0?60:30;
-        const int late=cpu_ms>frame_budget_ms(target)?1:0;
+        const int late=flip_interval_ms>frame_budget_ms(target)?1:0;
         std::string path=bench;
         const auto slash=path.find_last_of("/\\");
-        path=(slash==std::string::npos?std::string():path.substr(0,slash+1))+"frame-times.csv";
+        if(path.ends_with(".txt"))path.resize(path.size()-4);
+        path+="-frame-times.csv";
         static std::ofstream out(path,std::ios::trunc);
         static bool header=false;
-        if(!header){out<<"cpu_ms,gpu_ms,render_scale,late\n";header=true;}
-        out<<cpu_ms<<','<<report.last_gpu_ms<<','<<report.render_scale<<','<<late<<'\n';
+        if(!header){out<<"flip_interval_ms,legacy_gpu_ms,render_scale,late\n";header=true;}
+        out<<flip_interval_ms<<','<<report.last_gpu_ms<<','<<report.render_scale<<','<<late<<'\n';
         if((count&63u)==0u)out.flush();
         ++count;
     }
-    last_present=now;
+
+    g_perf_tracker.record_frame(flip_interval_ms, last_present_cost_ms, report,
+                                motorstorm::audio_blocked_us(), target);
+
+    g_last_present_us=now;
+    const auto t_pres_start=host_time_us();
     if(!stopped && display)gpu_present(memory,display,fb,stride,format,width,height);
+    last_present_cost_ms=static_cast<double>(host_time_us()-t_pres_start)/1000.0;
 }
 PadInput window_input(){std::lock_guard lock(input_mutex);PadInput result=live;result.buttons|=pressed;pressed=0;return result;}
 std::uint32_t window_pad(){return window_input().buttons;}
-void window_shutdown(){if(display){SDL_DestroyWindow(display);display=nullptr;}}
+void window_shutdown(){g_perf_tracker.log_summary();if(display){SDL_DestroyWindow(display);display=nullptr;}}
 ControllerSettings controller_settings_from_environment(){ControllerSettings out;out.api="sdl";return out;}
 void controller_start(){}
 void controller_shutdown(){for(auto &[id,pad]:pads)SDL_CloseGamepad(pad);pads.clear();}
@@ -219,6 +548,9 @@ void request_stop(){stopped=true;paused=false;pause_cv.notify_all();}
 // event watch runs then, before SDL's pump blocks for the paused activity.
 void enter_background(){
     if(paused.exchange(true))return;
+    log_line("LIFECYCLE","Game entered background; syncing logs");
+    g_perf_tracker.log_summary();
+    flush_log_file();
     controller_set_focus(false);
     std::lock_guard lock(audio_mutex);if(audio_stream)SDL_PauseAudioStreamDevice(audio_stream);
 }
@@ -226,6 +558,8 @@ void enter_foreground(){
     {std::lock_guard lock(audio_mutex);if(audio_stream)SDL_ResumeAudioStreamDevice(audio_stream);}
     {std::lock_guard lock(input_mutex);paused=false;}
     pause_cv.notify_all();
+    g_perf_tracker.on_resume();
+    g_last_present_us = 0;
 }
 bool SDLCALL lifecycle_watch(void *,SDL_Event *event){
     if(event->type==SDL_EVENT_WILL_ENTER_BACKGROUND)enter_background();
@@ -237,7 +571,12 @@ void pause_wait(){if(paused){std::unique_lock lock(input_mutex);pause_cv.wait(lo
 void pump_events(){
     SDL_Event event;
     while(SDL_PollEvent(&event)){
-        if(event.type==SDL_EVENT_QUIT||event.type==SDL_EVENT_TERMINATING)request_stop();
+        if(event.type==SDL_EVENT_QUIT||event.type==SDL_EVENT_TERMINATING){
+            log_line("LIFECYCLE","Game terminating or closing; syncing logs");
+            g_perf_tracker.log_summary();
+            flush_log_file();
+            request_stop();
+        }
         if(event.type==SDL_EVENT_WILL_ENTER_BACKGROUND)enter_background();
         if(event.type==SDL_EVENT_DID_ENTER_FOREGROUND)enter_foreground();
         // Back opens the game's pause menu (Start) instead of closing the game.
@@ -282,5 +621,9 @@ Java_org_psprecomp_motorstorm_GameActivity_setTouch(JNIEnv *, jclass, jint butto
     motorstorm::android::skin_axis_y.store(axis_y);
     motorstorm::android::skin_analog.store(analog ? 1 : 0);
     motorstorm::android::skin_generation.store(1);
+}
+extern "C" JNIEXPORT void JNICALL
+Java_org_psprecomp_motorstorm_GameActivity_flushLog(JNIEnv *, jclass) {
+    motorstorm::flush_log_file();
 }
 #endif

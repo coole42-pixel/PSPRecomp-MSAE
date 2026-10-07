@@ -15,8 +15,11 @@
 //     the previous one wrote memory (the D3D12 resource-state transitions).
 #include "motorstorm_gpu_vulkan.hpp"
 #include "motorstorm_mobile.hpp"
+#include "motorstorm_frame_metrics.hpp"
+#include "motorstorm_hle.hpp"
 #include "motorstorm_bootstrap.hpp"
 #include "motorstorm_perf.hpp"
+#include "motorstorm_env.hpp"
 #include "motorstorm_post.hpp"
 #include "motorstorm_presentation.hpp"
 #include "motorstorm_textures.hpp"
@@ -36,6 +39,7 @@
 #include <deque>
 #include <filesystem>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -108,6 +112,7 @@ std::atomic<std::uint64_t> output_size{(480ull << 32) | 272u};
 #include "motorstorm_spirv_PSFastFeedback.h"
 #include "motorstorm_spirv_PSFastAlphaFeedback.h"
 #include "motorstorm_spirv_PSLoad.h"
+#include "motorstorm_spirv_PSLoadColor.h"
 #include "motorstorm_spirv_PackColorCS.h"
 #include "motorstorm_spirv_PackDepthCS.h"
 #include <android/native_window.h>
@@ -143,16 +148,33 @@ std::uint32_t physical(std::uint32_t address) {
         address = 0x04000000u | (address & 0x1FFFFFu);
     return address;
 }
-// Lazy readback publication; see the D3D12 copy in motorstorm_gpu.cpp.
-// PSPRECOMP_MOTORSTORM_GPU_LAZY_PUBLISH=0 (or "false") restores the eager
-// list-start publication for A/B checks.
-bool lazy_publish_enabled() {
-    static const bool value = [] {
-        const char *text = std::getenv("PSPRECOMP_MOTORSTORM_GPU_LAZY_PUBLISH");
-        if (text == nullptr || *text == '\0') return true;
-        return std::strcmp(text, "0") != 0 && std::strcmp(text, "false") != 0;
+// Lazy readback publication; see the D3D12 copy in motorstorm_gpu.cpp.  The
+// Windows race benchmark measured lazy as correct but much slower here (about
+// -35% at 1x: 11k hook-triggered publishes with 2.75 s of waits per run), so
+// Windows defaults to eager while Android keeps the lazy default.
+// PSPRECOMP_MOTORSTORM_GPU_LAZY_PUBLISH=1 (or 0) overrides either way.
+bool lazy_publish_setting = [] {
+    const char *text = std::getenv("PSPRECOMP_MOTORSTORM_GPU_LAZY_PUBLISH");
+#if defined(__ANDROID__)
+    return lazy_publication_policy(text, true);
+#else
+    return lazy_publication_policy(text, false);
+#endif
+}();
+bool lazy_publish_enabled() { return lazy_publish_setting; }
+bool query_prefetch_enabled() {
+    static const bool enabled = [] {
+        const char *text = std::getenv("PSPRECOMP_MOTORSTORM_GPU_QUERY_PREFETCH");
+        return text && std::strcmp(text, "1") == 0;
     }();
-    return value;
+    return enabled;
+}
+bool preserve_readonly_depth() {
+    static const bool enabled = [] {
+        const char *text = std::getenv("PSPRECOMP_MOTORSTORM_PRESERVE_READONLY_DEPTH");
+        return text && std::strcmp(text, "1") == 0;
+    }();
+    return enabled;
 }
 // Raster scales in half units; see motorstorm_gpu.cpp.
 constexpr UINT raster_extent(UINT native, UINT half) { return native * half / 2u; }
@@ -291,10 +313,10 @@ Image make_image(UINT width, UINT height, UINT mips, VkFormat format, VkImageUsa
     check(vkCreateImageView(g_device, &view, nullptr, &result.view), "create texture view");
     return result;
 }
-Image make_depth_image(UINT width, UINT height) {
+Image make_depth_image(UINT width, UINT height, VkFormat format = VK_FORMAT_D16_UNORM, bool stencil = false) {
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.imageType = VK_IMAGE_TYPE_2D;
-    info.format = VK_FORMAT_D16_UNORM;
+    info.format = format;
     info.extent = {width, height, 1};
     info.mipLevels = 1;
     info.arrayLayers = 1;
@@ -312,8 +334,11 @@ Image make_depth_image(UINT width, UINT height) {
     VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     view.image = result.image;
     view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view.format = VK_FORMAT_D16_UNORM;
-    view.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    view.format = format;
+    VkImageAspectFlags aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (stencil)
+        aspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
+    view.subresourceRange = {aspect, 0, 1, 0, 1};
     check(vkCreateImageView(g_device, &view, nullptr, &result.view), "create depth view");
     return result;
 }
@@ -349,6 +374,9 @@ struct Surface {
     UINT64 native_version{~0ull};
     std::vector<std::uint8_t> guest_shadow;
     bool loaded{}, dirty{}, readback_pending{};
+    UINT64 readback_fence{};
+    UINT64 last_cpu_query_list{};
+    bool cpu_queried{};
     float aspect_scale{1.0f};
     std::uint32_t depth_address{}, depth_stride{};
     UINT64 version{}, snapshot_version{~0ull};
@@ -442,6 +470,16 @@ void limit_to_present(UINT &width, UINT &height) {
 #endif
 // PSPRECOMP_MOTORSTORM_VERTEX_BATCH=0 dispatches VertexCS once per draw (as
 // before) instead of once per submission. Android only.
+// PSPRECOMP_MOTORSTORM_HW_SCALED_FEEDBACK=0: at raster scales above 1x,
+// render-target textures are copied and packed per draw again (as before)
+// instead of sampled from the compact image.
+[[maybe_unused]] bool hardware_scaled_feedback() {
+    static const bool value = [] {
+        const char *text = std::getenv("PSPRECOMP_MOTORSTORM_HW_SCALED_FEEDBACK");
+        return !(text && std::strcmp(text, "0") == 0);
+    }();
+    return value;
+}
 [[maybe_unused]] bool vertex_batching() {
     static const bool value = [] {
         const char *text = std::getenv("PSPRECOMP_MOTORSTORM_VERTEX_BATCH");
@@ -510,6 +548,7 @@ struct CommandSlot {
     VkQueryPool queries{};
     bool timed{};
     bool pre_timed{};
+    FrameMetrics::Metadata frame;
 };
 constexpr UINT kConstantsStride = 1280;
 constexpr UINT kPresentConstantBytes = kConstantsStride;
@@ -565,12 +604,18 @@ struct Context {
 
 struct State {
     Context ctx;
+    FrameMetrics metrics;
+    UINT64 game_frame_id{1}, previous_prepare_ns{}, previous_record_ns{}, previous_guest_cpu_ns{}, previous_ge_cpu_ns{}, previous_frame_ns{};
+    bool display_timing{};
+    std::uint32_t display_present_id{};
     VkDevice device{};
     VkQueue queue{}, present_queue{};
     // A family with a single queue shares it between the GE and presenter threads.
     bool shared_queue{};
     std::mutex queue_mutex;
-    CommandSlot slots[kCommandSlotCapacity + 1];
+    // GE chunk slots, then kPresentSlots slots for presentation snapshots.
+    CommandSlot slots[kCommandSlotCapacity + 3];
+    UINT present_rotation{};
     VkCommandBuffer cmd{};
     UINT slot_index{};
     UINT ge_slot{};  // last GE chunk slot; lists continue the rotation from it
@@ -599,10 +644,14 @@ struct State {
     std::vector<HwFramebuffer> hw_framebuffers;
     Surface *attachment_color{}, *attachment_depth{};
     Surface attachment_dummy_depth;
-    VkRenderPass hw_pass_load{}, hw_pass_clear{};
+    VkRenderPass hw_pass_load{}, hw_pass_clear{}, hw_color_pass_load{}, hw_color_pass_clear{};
+    VkFormat hw_depth_format{VK_FORMAT_D16_UNORM};
+    bool hw_stencil_ok{};
     struct HwPipeKey {
-    std::uint8_t topology{}, depth_test{}, depth_write{}, depth_compare{};
+        std::uint8_t topology{}, depth_test{}, depth_write{}, depth_compare{};
         std::uint8_t blend{}, blend_op{}, src{}, dst{}, mask{}, cull{}, alpha{}, feedback{};
+        std::uint8_t stencil_test{}, stencil_fail_op{}, stencil_depth_fail_op{}, stencil_pass_op{}, stencil_compare{};
+        std::uint8_t color_only{};
         bool operator==(const HwPipeKey &other) const {
             return std::memcmp(this, &other, sizeof(HwPipeKey)) == 0;
         }
@@ -620,10 +669,12 @@ struct State {
     std::vector<HwPipeKey> hw_pipe_order;  // creation order, saved for prewarming
     std::size_t hw_keys_saved{};
     bool prewarming{};
-    VkPipeline hw_load_pipeline{}, pack_color_pipeline{}, pack_depth_pipeline{};
+    VkPipeline hw_load_pipeline{}, hw_color_load_pipeline{}, hw_color_restore_pipeline{}, pack_color_pipeline{}, pack_depth_pipeline{};
     Buffer hw_depth_staging;
     bool hw_depth_ok{};
     bool rendering_hardware{};
+    bool hw_depth_written{}, ordered_depth_written{};
+    int last_draw_hardware{-1};
     Surface *hw_pass_color{}, *hw_pass_depth{};
 #endif
     VkPipeline expand_pipeline{}, resolve_pipeline{}, capture_pipeline{}, decode_pipeline{}, mip_pipeline{},
@@ -660,6 +711,30 @@ struct State {
     UINT64 texture_bytes{};
     std::vector<Buffer> transient;
     std::vector<Image> transient_images;
+    std::vector<std::unique_ptr<Surface>> retired_surfaces;
+    std::vector<VkFramebuffer> transient_framebuffers;
+    // Resources retired by earlier lists, freed once the GPU passes `fence`.
+    struct RetiredBatch {
+        VkDevice device{};
+        UINT64 fence{};
+        std::vector<VkFramebuffer> framebuffers;
+        std::vector<Buffer> buffers;
+        std::vector<Image> images;
+        std::vector<std::unique_ptr<Surface>> surfaces;
+        RetiredBatch() = default;
+        RetiredBatch(RetiredBatch &&) noexcept = default;
+        RetiredBatch &operator=(RetiredBatch &&) = delete;
+        RetiredBatch(const RetiredBatch &) = delete;
+        ~RetiredBatch() {
+            // Framebuffers reference image views. Destroy them before the
+            // batch's images/surfaces, even when the GE queue never goes idle.
+#if defined(__ANDROID__)
+            for (auto framebuffer : framebuffers)
+                vkDestroyFramebuffer(device, framebuffer, nullptr);
+#endif
+        }
+    };
+    std::deque<RetiredBatch> retired;
     bool recording{}, has_commands{};
     // Command-buffer recording state.
     bool rendering{}, unflushed{};
@@ -761,6 +836,7 @@ struct State {
         bool timed_post{};
         bool timed_present{};
         UINT64 bytes{}, fence{}, copy_fence{};
+        FrameMetrics::Metadata origin;
         FrameState state{FrameState::Free};
         std::uint32_t width{}, height{}, stride{}, format{};
         bool racing{};
@@ -771,6 +847,8 @@ struct State {
         Buffer rgba_words;
         Image rgba;
         UINT rgba_width{}, rgba_height{};
+        VkImageLayout rgba_layout{VK_IMAGE_LAYOUT_UNDEFINED};
+        bool direct_rgba{};
     };
     int ready_frame{-1};
     static constexpr UINT kPresentFrames = 3;
@@ -818,13 +896,13 @@ struct State {
         presenter_stop = false;
     }
     void destroy_swapchain() noexcept {
-        for (auto view : swap_views)
-            vkDestroyImageView(device, view, nullptr);
 #if defined(__ANDROID__)
         for (auto framebuffer : swap_framebuffers)
             vkDestroyFramebuffer(device, framebuffer, nullptr);
         swap_framebuffers.clear();
 #endif
+        for (auto view : swap_views)
+            vkDestroyImageView(device, view, nullptr);
         swap_views.clear();
         swap_images.clear();
         for (auto semaphore : render_done)
@@ -839,6 +917,12 @@ struct State {
         if (!device)
             return;
         vkDeviceWaitIdle(device);
+        retired.clear();
+#if defined(__ANDROID__)
+        for (auto framebuffer : transient_framebuffers)
+            vkDestroyFramebuffer(device, framebuffer, nullptr);
+#endif
+        transient_framebuffers.clear();
 #if defined(__ANDROID__)
         for (auto framebuffer : attachment_framebuffers) vkDestroyFramebuffer(device, framebuffer, nullptr);
         for (const auto &framebuffer : hw_framebuffers)
@@ -847,10 +931,14 @@ struct State {
         if (attachment_pass) vkDestroyRenderPass(device, attachment_pass, nullptr);
         if (hw_pass_load) vkDestroyRenderPass(device, hw_pass_load, nullptr);
         if (hw_pass_clear) vkDestroyRenderPass(device, hw_pass_clear, nullptr);
+        if (hw_color_pass_load) vkDestroyRenderPass(device, hw_color_pass_load, nullptr);
+        if (hw_color_pass_clear) vkDestroyRenderPass(device, hw_color_pass_clear, nullptr);
         if (programmable_pass) vkDestroyRenderPass(device, programmable_pass, nullptr);
         if (swapchain_pass) vkDestroyRenderPass(device, swapchain_pass, nullptr);
         if (hw_load_pipeline) vkDestroyPipeline(device, hw_load_pipeline, nullptr);
+        if (hw_color_load_pipeline) vkDestroyPipeline(device, hw_color_load_pipeline, nullptr);
         if (pack_color_pipeline) vkDestroyPipeline(device, pack_color_pipeline, nullptr);
+        if (hw_color_restore_pipeline) vkDestroyPipeline(device, hw_color_restore_pipeline, nullptr);
         if (pack_depth_pipeline) vkDestroyPipeline(device, pack_depth_pipeline, nullptr);
         for (const auto &pipeline : hw_pipelines)
             vkDestroyPipeline(device, pipeline.second, nullptr);
@@ -907,7 +995,13 @@ struct State {
     }
 };
 std::unique_ptr<State> state;
-void publish_readbacks(State &s, psprecomp::GuestMemory &memory);
+void publish_readbacks(State &s, psprecomp::GuestMemory &memory,
+                       std::uint32_t address = 0u, std::size_t length = 0u);
+void finish_list(State &s, bool materialize = false, std::uint32_t address = 0u, std::size_t length = 0u);
+void retire_completed_resources(State &s);
+void retire_framebuffers(State &s);
+void collect_post_timings(State &s, State::PresentFrame &frame);
+void collect_display_timings(State &s);
 int publish_reason = 5;
 struct PublishReason {
     int previous;
@@ -940,6 +1034,7 @@ enum WaitSite { kWaitSlot, kWaitArena, kWaitSync, kWaitVertex, kWaitPublish, kWa
 std::uint64_t wait_ns[kWaitSites]{}, wait_count[kWaitSites]{};
 std::uint64_t pass_begins{}, attachment_loads{}, buffer_syncs{}, draw_calls{};
 std::unordered_map<std::uint32_t, std::uint64_t> rejected_blends;
+std::unordered_map<std::uint32_t, std::uint64_t> rejected_stencils;
 double prepass_gpu_ms{};
 // Diagnostics only (wrong output): isolate GPU cost of the draws themselves
 // and of rasterization-order attachment access.
@@ -1007,6 +1102,7 @@ MOTORSTORM_NOINLINE void end_rendering(State &s) {
     if (s.rendering) {
 #if defined(__ANDROID__)
         vkCmdEndRenderPass(s.cmd);
+        ++stats.render_pass_endings;
         if (s.pixel_path == PixelPath::FixedFunctionProgrammable) {
             s.rendering = false;
             s.unflushed = true;
@@ -1020,6 +1116,10 @@ MOTORSTORM_NOINLINE void end_rendering(State &s) {
             for (auto target : targets) {
                 if (!target || target->address == 0)
                     continue;
+                if (target == s.hw_pass_depth && preserve_readonly_depth() && !s.hw_stencil_ok && !s.hw_depth_written) {
+                    ++stats.readonly_depth_passes;
+                    continue;
+                }
                 target->hw_dirty = true;
                 target->hw_matches = true;
                 target->image_newer = false;
@@ -1034,6 +1134,10 @@ MOTORSTORM_NOINLINE void end_rendering(State &s) {
         // brought up to date only when something reads them (sync_buffer).
         Surface *targets[]{s.attachment_color, s.attachment_depth};
         for (auto target : targets) {
+            if (target == s.attachment_depth && preserve_readonly_depth() && !s.hw_stencil_ok && !s.ordered_depth_written) {
+                ++stats.readonly_depth_passes;
+                continue;
+            }
             target->image_newer = true;
             target->hw_matches = false;
             target->hw_dirty = false;
@@ -1082,6 +1186,7 @@ void sync_buffer(State &s, Surface &surface) {
     vkCmdCopyImageToBuffer(s.cmd, surface.attachment.image, VK_IMAGE_LAYOUT_GENERAL, surface.image.buffer, 1, &region);
     surface.image_newer = false;
     ++buffer_syncs;
+    ++stats.framebuffer_syncs;
     wrote(s);
 #else
     (void)s;
@@ -1130,11 +1235,7 @@ void bind_sets(State &s, VkCommandBuffer cmd) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.layout, 1, 1, &s.sampler_set, 0, nullptr);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.layout, 1, 1, &s.sampler_set, 0, nullptr);
 }
-// Start recording into a slot, waiting only when that slot is still executing.
-void open_chunk(State &s, UINT index) {
-    CommandSlot &slot = s.slots[index];
-    if (slot.pending) {
-        wait_value(s, slot.fence_value, kWaitSlot);
+void collect_slot_timings(State &s, CommandSlot &slot) {
         if (slot.timed && slot.queries) {
             UINT64 stamps[2]{};
             if (vkGetQueryPoolResults(s.device, slot.queries, 0, 2, sizeof(stamps), stamps, sizeof(UINT64),
@@ -1158,6 +1259,8 @@ void open_chunk(State &s, UINT index) {
                 }
                 s.gpu_accum += static_cast<double>(stamps[1] - stamps[0]) * s.timestamp_period / 1.0e6;
                 ++s.gpu_samples;
+                s.metrics.event(slot.frame, "ge", static_cast<UINT64>(stamps[0] * s.timestamp_period),
+                                static_cast<UINT64>(stamps[1] * s.timestamp_period));
 #else
                 stats.last_gpu_ms = static_cast<double>(stamps[1] - stamps[0]) * s.timestamp_period / 1.0e6;
 #endif
@@ -1172,10 +1275,19 @@ void open_chunk(State &s, UINT index) {
                 prepass_gpu_ms += milliseconds;
 #if defined(__ANDROID__)
                 s.gpu_accum += milliseconds;
+                s.metrics.event(slot.frame, "vertex", static_cast<UINT64>(stamps[0] * s.timestamp_period),
+                                static_cast<UINT64>(stamps[1] * s.timestamp_period));
 #endif
             }
             slot.pre_timed = false;
         }
+}
+// Start recording into a slot, waiting only when that slot is still executing.
+void open_chunk(State &s, UINT index) {
+    CommandSlot &slot = s.slots[index];
+    if (slot.pending) {
+        wait_value(s, slot.fence_value, kWaitSlot);
+        collect_slot_timings(s, slot);
         slot.pending = false;
     }
     check(vkResetCommandPool(s.device, slot.pool, 0), "reset command pool");
@@ -1183,7 +1295,10 @@ void open_chunk(State &s, UINT index) {
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check(vkBeginCommandBuffer(slot.cmd, &begin), "begin GE chunk");
     s.slot_index = index;
-    if (index != kCommandSlotCapacity)
+#if defined(__ANDROID__)
+    slot.frame = {s.game_frame_id, guest_time_us(), s.raster_half, s.racing};
+#endif
+    if (index < kCommandSlotCapacity)
         s.ge_slot = index;
     s.cmd = slot.cmd;
     s.recording = true;
@@ -1206,7 +1321,10 @@ void open_chunk(State &s, UINT index) {
         slot.timed = true;
     }
 }
-constexpr UINT kPresentSlot = kCommandSlotCapacity;
+// Presentation snapshots rotate through their own slots. With one slot, each
+// present waited for the previous frame's snapshot copy, which sits behind all
+// of that frame's GE work, so the guest stalled on the GPU every frame.
+constexpr UINT kPresentSlot = kCommandSlotCapacity, kPresentSlots = 3u;
 void begin(State &s, UINT slot = UINT_MAX) {
     if (s.recording)
         return;
@@ -1367,7 +1485,11 @@ void compute(State &s, VkPipeline pipeline, const Constants &constants, View sou
 // Render targets.
 bool hud_tag_enabled(const State &s, const Surface &color, std::uint32_t stride) {
     const bool separate_hud = (s.post.active() && s.post.hud_ungraded) ||
+#if defined(__ANDROID__)
                               (select_upscaler(s.scale_settings) == Upscaler::Sgsr1Spatial && s.antialiasing != 1);
+#else
+                              false;
+#endif
     return s.racing && separate_hud && (stride == 480u || stride == 512u) &&
            color.address >= 0x04000000u && color.address < 0x04200000u;
 }
@@ -1389,6 +1511,13 @@ VkBuffer resolve_surface(State &s, Surface &surface) {
 void load_surface(State &s, Surface &surface, const psprecomp::GuestMemory &memory) {
     if (surface.loaded)
         return;
+    // Until publication, guest RAM is an old shadow of this surface. Preserve
+    // the resident image across lists instead of uploading that shadow again.
+    if (surface.readback_pending && lazy_publish_enabled() &&
+        surface.address >= 0x04000000u && surface.address < 0x04200000u) {
+        surface.loaded = true;
+        return;
+    }
     std::vector<std::uint8_t> guest(static_cast<std::size_t>(surface.guest_bytes()));
     if (surface.readback_pending && !lazy_publish_enabled()) {
         memory.copy_out(surface.address, guest);
@@ -1431,12 +1560,11 @@ void load_surface(State &s, Surface &surface, const psprecomp::GuestMemory &memo
     surface.touch_all();
     s.has_commands = true;
 }
-void gpu_sync_impl(psprecomp::GuestMemory &memory);
 Surface &get_surface(State &s, psprecomp::GuestMemory &memory, std::uint32_t address, std::uint32_t stride,
                      std::uint32_t height, std::uint32_t bpp, std::uint32_t format = 4) {
     address = physical(address);
     for (const auto &candidate : s.surfaces)
-        if (candidate->address == address && candidate->stride == stride && candidate->bpp == bpp &&
+        if (candidate->address == address && candidate->stride == stride && candidate->bpp == bpp && candidate->format == format &&
             candidate->height >= height && candidate->raster_half == s.raster_half) {
             candidate->format = format;
             load_surface(s, *candidate, memory);
@@ -1448,15 +1576,32 @@ Surface &get_surface(State &s, psprecomp::GuestMemory &memory, std::uint32_t add
         const auto end = static_cast<UINT64>(address) + static_cast<UINT64>(stride) * height * bpp;
         if (address < static_cast<UINT64>(candidate->address) + candidate->guest_bytes() &&
             candidate->address < end) {
-            gpu_sync_impl(memory);
+            if (diag_flag("PSPRECOMP_MOTORSTORM_TRACE_SYNC")) {
+                static unsigned samples = 0;
+                if (samples++ < 64u) {
+                    std::ostringstream trace;
+                    trace << "reinterpret new=" << std::hex << address << " old=" << candidate->address << std::dec
+                          << " new_extent=" << stride << 'x' << height << " bpp=" << bpp << " format=" << format
+                          << " old_extent=" << candidate->stride << 'x' << candidate->height
+                          << " bpp=" << candidate->bpp << " format=" << candidate->format;
+                    log_line("VRAM_SYNC", trace.str());
+                }
+            }
+            // A new interpretation needs only the bytes it aliases. Keep
+            // unrelated scene targets resident instead of packing them all.
+            PublishReason reason(1);
+            publish_readbacks(s, memory, address,
+                address >= 0x04000000u && address < 0x04200000u ? static_cast<std::size_t>(end - address) : 0u);
+            retire_framebuffers(s);
             begin(s);
-            s.surfaces.erase(std::remove_if(s.surfaces.begin(), s.surfaces.end(),
-                                            [&](const auto &other) {
-                                                return address < static_cast<UINT64>(other->address) +
-                                                                     other->guest_bytes() &&
-                                                       other->address < end;
-                                            }),
-                             s.surfaces.end());
+            // Queued present snapshots and chunks may still read the old
+            // surfaces' buffers and images: retire them until the GPU is idle.
+            const auto kept = std::stable_partition(s.surfaces.begin(), s.surfaces.end(), [&](const auto &other) {
+                return !(address < static_cast<UINT64>(other->address) + other->guest_bytes() &&
+                         other->address < end);
+            });
+            std::move(kept, s.surfaces.end(), std::back_inserter(s.retired_surfaces));
+            s.surfaces.erase(kept, s.surfaces.end());
             break;
         }
     }
@@ -1516,7 +1661,7 @@ void queue_identify_copy(State &s, std::uint64_t key, UINT width, UINT height) {
 Surface *drawn_target(State &s, std::uint32_t address, std::uint32_t bytes, bool palette) {
     address = physical(address);
     for (const auto &surface : s.surfaces)
-        if (surface->dirty && (!palette || surface->bpp == 4u) && address >= surface->address &&
+        if ((surface->dirty || surface->readback_pending) && (!palette || surface->bpp == 4u) && address >= surface->address &&
             static_cast<UINT64>(address) + bytes <= surface->address + surface->guest_bytes() &&
             (!palette || (address - surface->address) % 4u == 0u))
             return surface.get();
@@ -1577,7 +1722,7 @@ void decode_level(State &s, const GpuTexture &texture, UINT level, UINT index) {
             for (const auto &surface : s.surfaces) {
                 const UINT64 first = std::max<UINT64>(begin_address, surface->address);
                 const UINT64 last = std::min<UINT64>(end, surface->address + surface->guest_bytes());
-                if (!surface->dirty || first >= last)
+                if ((!surface->dirty && !surface->readback_pending) || first >= last)
                     continue;
                 const VkBuffer resolved = resolve_surface(s, *surface);
                 outside(s);
@@ -1809,14 +1954,15 @@ void expand_into(State &s, View source, VkBuffer destination, UINT64 from, const
     wrote(s);
     s.transient.push_back(std::move(scratch));
 }
-VkBuffer feedback_snapshot(State &s, const psprecomp::GuestMemory &memory, const GpuTexture &texture,
+VkBuffer feedback_snapshot(State &s, psprecomp::GuestMemory &memory, const GpuTexture &texture,
                            std::array<std::uint32_t, 4> &constants, const Surface::Rect *sampled = nullptr,
                            VkImageView *hardware_view = nullptr, const Surface *draw_color = nullptr) {
     const auto address = physical(texture.feedback_address);
     const auto bpp = texture.feedback_format == 3 ? 4u : 2u;
     Surface *source = nullptr;
     for (const auto &candidate : s.surfaces)
-        if (candidate->loaded && candidate->stride == texture.feedback_stride && candidate->bpp == bpp &&
+        if ((candidate->loaded || candidate->dirty || candidate->readback_pending) &&
+            candidate->stride == texture.feedback_stride && candidate->bpp == bpp &&
             address >= candidate->address &&
             address < static_cast<UINT64>(candidate->address) + candidate->guest_bytes()) {
             source = candidate.get();
@@ -1832,23 +1978,54 @@ VkBuffer feedback_snapshot(State &s, const psprecomp::GuestMemory &memory, const
         const auto rows = static_cast<UINT>((bytes + texture.feedback_stride * 4 - 1) / (texture.feedback_stride * 4));
         bytes = static_cast<UINT64>(raster_pitch) * raster_extent(rows, half) * 4;
     }
-    auto initialize_tail = [&](VkBuffer destination, UINT64 from) {
-        if (from >= bytes)
+    auto initialize_tail = [&](VkBuffer destination, UINT64 from, UINT64 limit) {
+        limit = std::min(limit, bytes);
+        if (from >= limit)
             return;
-        UINT64 native_from = from, native_bytes = bytes - from;
+        UINT64 native_from = from, native_bytes = limit - from;
         if (scaled) {
             const UINT first_row = native_row_of_boundary(static_cast<UINT>(from / (raster_pitch * 4ull)), half);
-            const UINT end_row = native_row_of_boundary(static_cast<UINT>(bytes / (raster_pitch * 4ull)), half);
+            const UINT end_row = native_row_of_boundary(static_cast<UINT>(limit / (raster_pitch * 4ull)), half);
             native_from = static_cast<UINT64>(first_row) * source->stride * 4;
             native_bytes = static_cast<UINT64>(end_row - std::min(end_row, first_row)) * source->stride * 4;
             if (native_bytes == 0)
                 return;
         }
-        const auto offset = allocate(s, native_bytes, 4);
-        auto *out = reinterpret_cast<std::uint32_t *>(s.mapped + offset);
         const auto base = source ? source->address : address;
         const UINT64 first_texel = native_from / 4, texels = native_bytes / 4;
         const auto start = base + static_cast<std::uint32_t>(first_texel * bpp);
+        const UINT64 guest_bytes = texels * bpp;
+        const UINT64 end = static_cast<UINT64>(start) + guest_bytes;
+        // Feedback padding can contain another GPU target. Reading that target
+        // through the CPU hook used to publish and wait again for every strip.
+        // Compose exact RGBA8 guest bytes on the GPU, then expand if necessary.
+        // Other formats and pending transfers retain range-scoped coherence.
+        static const bool gpu_feedback_tail = [] {
+            const char *text = std::getenv("PSPRECOMP_MOTORSTORM_GPU_FEEDBACK_TAIL");
+            return !(text && std::strcmp(text, "0") == 0);
+        }();
+        bool compose = gpu_feedback_tail && bpp == 4u && start >= 0x04000000u && end <= 0x04200000u;
+        for (const auto &surface : s.surfaces)
+            if ((surface->dirty || surface->readback_pending) &&
+                vram_ranges_overlap(start, guest_bytes, surface->address, surface->guest_bytes()) &&
+                (surface->bpp != 4u || surface->address + surface->guest_bytes() > 0x04200000ull))
+                compose = false;
+        for (const auto &transfer : s.pending_transfers)
+            if (vram_ranges_overlap(start, guest_bytes, transfer.start(), transfer.bytes()))
+                compose = false;
+        // Synchronize before reserving upload memory: publication can end the
+        // current chunk and change the upload arena used by begin().
+        if (!compose)
+            sync_texture(memory, start, static_cast<std::uint32_t>(guest_bytes));
+        const auto offset = allocate(s, native_bytes, 4);
+        auto *out = reinterpret_cast<std::uint32_t *>(s.mapped + offset);
+        struct ShadowRead {
+            const psprecomp::GuestMemory &memory;
+            bool armed;
+            explicit ShadowRead(const psprecomp::GuestMemory &value)
+                : memory(value), armed(value.vram_hook_armed()) { memory.arm_vram_hook(false); }
+            ~ShadowRead() { memory.arm_vram_hook(armed); }
+        } shadow_read(memory);
         if (memory.contains(start, static_cast<std::size_t>(texels * bpp))) {
             if (bpp == 4) {
                 memory.copy_out(start, {reinterpret_cast<std::uint8_t *>(out), static_cast<std::size_t>(texels * 4)});
@@ -1866,16 +2043,42 @@ VkBuffer feedback_snapshot(State &s, const psprecomp::GuestMemory &memory, const
                     memory.contains(at, bpp) ? (bpp == 4 ? memory.aot_load32(at) : memory.aot_load16(at)) : 0;
             }
         }
+        View native = upload_view(s, offset);
+        Buffer composed;
+        if (compose) {
+            for (const auto &surface : s.surfaces) {
+                const UINT64 first = std::max<UINT64>(start, surface->address);
+                const UINT64 last = std::min<UINT64>(end, surface->address + surface->guest_bytes());
+                if ((!surface->dirty && !surface->readback_pending) || first >= last)
+                    continue;
+                if (!composed) {
+                    composed = make_buffer(native_bytes, Memory::Device);
+                    outside(s);
+                    copy_buffer(s, composed.buffer, 0, s.upload.buffer, offset, native_bytes);
+                    wrote(s);
+                }
+                const VkBuffer resolved = resolve_surface(s, *surface);
+                outside(s);
+                copy_buffer(s, composed.buffer, first - start, resolved, first - surface->address, last - first);
+                wrote(s);
+            }
+            if (composed)
+                native = {composed.buffer, 0};
+        }
         if (!scaled) {
             outside(s);
-            copy_buffer(s, destination, from, s.upload.buffer, offset, native_bytes);
+            copy_buffer(s, destination, from, native.buffer, native.offset, native_bytes);
             wrote(s);
         } else {
             Constants expand{};
             expand.surface = {source->stride, static_cast<UINT>(native_bytes / 4 / source->stride), raster_pitch, 0};
             expand.render[0] = half;
-            expand_into(s, upload_view(s, offset), destination, from, expand, raster_pitch,
+            expand_into(s, native, destination, from, expand, raster_pitch,
                         raster_extent(expand.surface[1], half));
+        }
+        if (composed) {
+            ++stats.feedback_tail_compositions;
+            s.transient.push_back(std::move(composed));
         }
     };
     constants = {1, static_cast<UINT>(first), texture.feedback_stride, texture.feedback_format};
@@ -1887,42 +2090,57 @@ VkBuffer feedback_snapshot(State &s, const psprecomp::GuestMemory &memory, const
                      raster_pitch, texture.feedback_format};
     if (!source) {
         Buffer image = make_buffer(bytes, Memory::Device);
-        initialize_tail(image.buffer, 0);
+        initialize_tail(image.buffer, 0, bytes);
         const VkBuffer result = image.buffer;
         s.transient.push_back(std::move(image));
         return result;
     }
+    // Track the texels read before choosing either snapshot representation.
+    // A list can overwrite an earlier snapshot's source between feedback draws.
+    const int origin_x = static_cast<int>(first % source->stride), origin_y = static_cast<int>(first / source->stride);
+    Surface::Rect read{origin_x, origin_y, origin_x + static_cast<int>(texture.width),
+                       origin_y + static_cast<int>(texture.height)};
+    if (sampled)
+        read = {origin_x + sampled->left, origin_y + sampled->top, origin_x + sampled->right,
+                origin_y + sampled->bottom};
+    const bool inside = read.left >= 0 && read.top >= 0 && read.right <= static_cast<int>(source->stride) &&
+                        read.bottom <= static_cast<int>(source->height);
 #if defined(__ANDROID__)
     // Sample the compact color image instead of packing it back to R32. A draw
     // that also writes the image samples a copy so the attachment stays writable.
-    if (!scaled && hardware_view && source->hw_color && source->hw_matches && !source->image_newer &&
+    // Mode 4 is the same at a raster scale: the offset and pitch computed for
+    // mode 2 above address the compact image in raster pixels.
+    const UINT compact_mode = scaled ? 4u : 3u;
+    if ((!scaled || hardware_scaled_feedback()) && hardware_view && source->hw_color && source->hw_matches &&
+        !source->image_newer && inside &&
         source->raster_stride() > 0 && source->raster_height() > 0) {
         const bool writing = draw_color == source;
         const bool attached = s.rendering_hardware && (s.hw_pass_color == source || s.hw_pass_depth == source);
         if (!writing && !attached && source->hw_color_layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
             *hardware_view = source->hw_color.view;
-            constants[0] = 3;
+            constants[0] = compact_mode;
             return source->image.buffer;
         }
         if (!writing) {
             transition_image(s, source->hw_color.image, source->hw_color_layout,
                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
             *hardware_view = source->hw_color.view;
-            constants[0] = 3;
+            constants[0] = compact_mode;
             s.unflushed = false;
             return source->image.buffer;
         }
         const UINT width = source->raster_stride(), height = source->raster_height();
         if (source->hw_sample && (source->hw_sample_width != width || source->hw_sample_height != height)) {
-            source->hw_sample.reset();
+            s.transient_images.push_back(std::move(source->hw_sample));  // may still be sampled
             source->hw_sample_layout = VK_IMAGE_LAYOUT_UNDEFINED;
             source->hw_sample_version = ~0ull;
         }
         if (source->hw_sample && source->hw_sample_width == width && source->hw_sample_height == height &&
             source->hw_sample_layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
-            source->hw_sample_list == s.list_serial) {
+            source->hw_sample_list == s.list_serial &&
+            (source->hw_sample_version == source->version || source->hw_sample_clean(read))) {
             *hardware_view = source->hw_sample.view;
-            constants[0] = 3;
+            constants[0] = compact_mode;
             return source->image.buffer;
         }
         if (!source->hw_sample) {
@@ -1949,7 +2167,7 @@ VkBuffer feedback_snapshot(State &s, const psprecomp::GuestMemory &memory, const
         source->hw_sample_list = s.list_serial;
         source->hw_sample_dirty.clear();
         *hardware_view = source->hw_sample.view;
-        constants[0] = 3;
+        constants[0] = compact_mode;
         wrote(s);
         s.unflushed = false;
         return source->image.buffer;
@@ -1963,25 +2181,22 @@ VkBuffer feedback_snapshot(State &s, const psprecomp::GuestMemory &memory, const
         source->snapshot_bytes = bytes;
         source->snapshot_version = ~0ull;
     }
-    // Pixels this draw reads, in surface coordinates: the texels its UVs
-    // cover (plus a filter margin), else the whole texture.
-    const int origin_x = static_cast<int>(first % source->stride), origin_y = static_cast<int>(first / source->stride);
-    Surface::Rect read{origin_x, origin_y, origin_x + static_cast<int>(texture.width),
-                       origin_y + static_cast<int>(texture.height)};
-    if (sampled)
-        read = {origin_x + sampled->left, origin_y + sampled->top, origin_x + sampled->right,
-                origin_y + sampled->bottom};
-    const bool inside = read.left >= 0 && read.top >= 0 && read.right <= static_cast<int>(source->stride) &&
-                        read.bottom <= static_cast<int>(source->height);
+    if (!inside) {
+        // A declared 512-row texture often samples only the rendered 272/296
+        // rows. Do not read its unused padding and synchronize other targets.
+        // If a later draw reaches outside the prefix, refresh only those rows,
+        // even when the rendered prefix's version has not changed.
+        const UINT64 rows = static_cast<UINT64>(std::max(read.bottom, 0)) +
+            (read.right > static_cast<int>(source->stride)
+                ? (static_cast<UINT64>(read.right - source->stride) + source->stride - 1u) / source->stride : 0u);
+        const UINT64 limit = scaled ? rows * half / 2u * raster_pitch * 4u : rows * source->stride * 4u;
+        initialize_tail(source->snapshot.buffer, source->bytes(), limit);
+    }
     const bool clean = row_tracking_enabled() && inside && source->snapshot_version != ~0ull &&
                        source->snapshot_clean(read);
     if (source->snapshot_version != source->version && clean) {
         ++snapshot_reuses;
     } else if (source->snapshot_version != source->version) {
-        if (fresh || source->snapshot_guest_epoch != s.fence_value) {
-            initialize_tail(source->snapshot.buffer, source->bytes());
-            source->snapshot_guest_epoch = s.fence_value;
-        }
 #if defined(__ANDROID__)
         const bool was_attached = s.rendering && s.attachment_color == source;
 #else
@@ -2042,6 +2257,7 @@ const Spirv &spirv(std::string_view name) {
         MOTORSTORM_SPIRV(PSFastFeedback),
         MOTORSTORM_SPIRV(PSFastAlphaFeedback),
         MOTORSTORM_SPIRV(PSLoad),
+        MOTORSTORM_SPIRV(PSLoadColor),
         MOTORSTORM_SPIRV(PackColorCS),
         MOTORSTORM_SPIRV(PackDepthCS),
 #endif
@@ -2319,6 +2535,8 @@ void pack_hardware(State &s, Surface &surface) {
     Constants constants{};
     constants.surface = {width, height, width, width};
     constants.mode[0] = surface.format;
+    constants.mode[2] = (s.hw_depth_format == VK_FORMAT_D32_SFLOAT_S8_UINT) ? 2u
+                      : (s.hw_depth_format != VK_FORMAT_D16_UNORM && s.hw_depth_format != VK_FORMAT_D16_UNORM_S8_UINT) ? 1u : 0u;
     constants.render[0] = surface.raster_half;
     const auto cb = allocate(s, sizeof(constants), 256);
     std::memcpy(s.mapped + cb, &constants, sizeof(constants));
@@ -2338,13 +2556,17 @@ void pack_hardware(State &s, Surface &surface) {
                                             image_write(3, &image_info)};
         vkCmdPushDescriptorSetKHR(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.layout, 0, 3, writes);
         vkCmdDispatch(s.cmd, (width + 7) / 8, (height + 7) / 8, 1);
+        ++stats.pack_color_dispatches;
         transition_image(s, surface.hw_color.image, surface.hw_color_layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                          VK_IMAGE_ASPECT_COLOR_BIT);
     }
     if (surface.hw_depth) {
+        const VkImageAspectFlags depth_aspect = s.hw_stencil_ok ?
+            (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_DEPTH_BIT;
         transition_image(s, surface.hw_depth.image, surface.hw_depth_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                         VK_IMAGE_ASPECT_DEPTH_BIT);
-        const UINT64 bytes = static_cast<UINT64>(width) * height * 2u + 4u;
+                         depth_aspect);
+        const UINT depth_bytes = (constants.mode[2] != 0u) ? 4u : 2u;
+        const UINT64 bytes = static_cast<UINT64>(width) * height * depth_bytes + 4u;
         if (!s.hw_depth_staging || s.hw_depth_staging.size < bytes) {
             if (s.hw_depth_staging)
                 s.transient.push_back(std::move(s.hw_depth_staging));
@@ -2371,8 +2593,9 @@ void pack_hardware(State &s, Surface &surface) {
                                             buffer_write(12, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &bits_info)};
         vkCmdPushDescriptorSetKHR(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.layout, 0, 3, writes);
         vkCmdDispatch(s.cmd, (width + 7) / 8, (height + 7) / 8, 1);
+        ++stats.pack_depth_dispatches;
         transition_image(s, surface.hw_depth.image, surface.hw_depth_layout,
-                         VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+                         VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, depth_aspect);
     }
     // The compute writes land in the packed buffers. Make them visible to the
     // snapshot copy and to the next fragment shader without a full queue flush.
@@ -2394,7 +2617,7 @@ void pack_hardware(State &s, Surface &surface) {
 #endif
 }
 #if defined(__ANDROID__)
-VkRenderPass make_hw_pass(State &s, VkAttachmentLoadOp load) {
+VkRenderPass make_hw_pass(State &s, VkAttachmentLoadOp load, bool with_depth = true) {
     VkAttachmentDescription attachments[2]{};
     attachments[0].format = VK_FORMAT_R8G8B8A8_UNORM;
     attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
@@ -2403,12 +2626,12 @@ VkRenderPass make_hw_pass(State &s, VkAttachmentLoadOp load) {
     attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     attachments[0].initialLayout = attachments[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    attachments[1].format = VK_FORMAT_D16_UNORM;
+    attachments[1].format = s.hw_depth_format;
     attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
     attachments[1].loadOp = load;
     attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[1].stencilLoadOp = s.hw_stencil_ok ? load : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[1].stencilStoreOp = s.hw_stencil_ok ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
     attachments[1].initialLayout = attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     const VkAttachmentReference color{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     const VkAttachmentReference depth{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
@@ -2416,7 +2639,7 @@ VkRenderPass make_hw_pass(State &s, VkAttachmentLoadOp load) {
     subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     subpass.colorAttachmentCount = 1;
     subpass.pColorAttachments = &color;
-    subpass.pDepthStencilAttachment = &depth;
+    subpass.pDepthStencilAttachment = with_depth ? &depth : nullptr;
     VkSubpassDependency dependency{};
     dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
     dependency.dstSubpass = 0;
@@ -2431,7 +2654,7 @@ VkRenderPass make_hw_pass(State &s, VkAttachmentLoadOp load) {
                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
     VkRenderPassCreateInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-    info.attachmentCount = 2;
+    info.attachmentCount = with_depth ? 2u : 1u;
     info.pAttachments = attachments;
     info.subpassCount = 1;
     info.pSubpasses = &subpass;
@@ -2444,7 +2667,10 @@ VkRenderPass make_hw_pass(State &s, VkAttachmentLoadOp load) {
 VkPipeline create_hw_pipeline(State &s, std::string_view vs, std::string_view ps, VkPrimitiveTopology topology,
                               bool depth_test, bool depth_write, std::uint8_t depth_compare, bool blend,
                               std::uint8_t blend_op, std::uint8_t src_factor, std::uint8_t dst_factor,
-                              std::uint8_t write_mask, std::uint8_t cull, bool dynamic_state) {
+                              std::uint8_t write_mask, std::uint8_t cull, bool dynamic_state,
+                              bool stencil_test = false, std::uint8_t stencil_fail_op = 0,
+                              std::uint8_t stencil_depth_fail_op = 0, std::uint8_t stencil_pass_op = 0,
+                              std::uint8_t stencil_compare = 7, bool color_only = false) {
     const VkPipelineShaderStageCreateInfo stages[]{stage(s, VK_SHADER_STAGE_VERTEX_BIT, vs),
                                                     stage(s, VK_SHADER_STAGE_FRAGMENT_BIT, ps)};
     const VkVertexInputBindingDescription binding{0, sizeof(GpuVertex),
@@ -2480,6 +2706,17 @@ VkPipeline create_hw_pipeline(State &s, std::string_view vs, std::string_view ps
     depth.depthTestEnable = depth_test ? VK_TRUE : VK_FALSE;
     depth.depthWriteEnable = depth_write ? VK_TRUE : VK_FALSE;
     depth.depthCompareOp = static_cast<VkCompareOp>(depth_compare);
+    if (stencil_test) {
+        depth.stencilTestEnable = VK_TRUE;
+        depth.front.failOp = static_cast<VkStencilOp>(stencil_fail_op);
+        depth.front.depthFailOp = static_cast<VkStencilOp>(stencil_depth_fail_op);
+        depth.front.passOp = static_cast<VkStencilOp>(stencil_pass_op);
+        depth.front.compareOp = static_cast<VkCompareOp>(stencil_compare);
+        depth.front.compareMask = 0xFF;
+        depth.front.writeMask = 0xFF;
+        depth.front.reference = 0;
+        depth.back = depth.front;
+    }
     VkPipelineColorBlendAttachmentState attachment{};
     attachment.blendEnable = blend ? VK_TRUE : VK_FALSE;
     attachment.srcColorBlendFactor = static_cast<VkBlendFactor>(src_factor);
@@ -2493,8 +2730,11 @@ VkPipeline create_hw_pipeline(State &s, std::string_view vs, std::string_view ps
     blending.attachmentCount = 1;
     blending.pAttachments = &attachment;
     VkDynamicState dynamic_states[16]{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                                     VK_DYNAMIC_STATE_BLEND_CONSTANTS};
-    UINT dynamic_count = 3;
+                                     VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+                                     VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+                                     VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+                                     VK_DYNAMIC_STATE_STENCIL_REFERENCE};
+    UINT dynamic_count = 6;
     if (dynamic_state) {
         dynamic_states[dynamic_count++] = VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE;
         dynamic_states[dynamic_count++] = VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE;
@@ -2519,7 +2759,7 @@ VkPipeline create_hw_pipeline(State &s, std::string_view vs, std::string_view ps
     info.pColorBlendState = &blending;
     info.pDynamicState = &dynamic;
     info.layout = s.layout;
-    info.renderPass = s.hw_pass_load;
+    info.renderPass = color_only ? s.hw_color_pass_load : s.hw_pass_load;
     VkPipeline pipeline{};
     check(vkCreateGraphicsPipelines(s.device, s.pipeline_cache, 1, &info, nullptr, &pipeline),
           (std::string("create hardware pipeline ") + std::string(ps)).c_str());
@@ -2549,7 +2789,9 @@ VkPipeline hw_pipeline_for(State &s, const State::HwPipeKey &key) {
                                                              : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     const auto began = perf::now_ns();
     const VkPipeline pipeline = create_hw_pipeline(s, vs, ps, topology, key.depth_test, key.depth_write, key.depth_compare,
-                                                   key.blend, key.blend_op, key.src, key.dst, key.mask, key.cull, dynamic);
+                                                   key.blend, key.blend_op, key.src, key.dst, key.mask, key.cull, dynamic,
+                                                   key.stencil_test, key.stencil_fail_op, key.stencil_depth_fail_op,
+                                                   key.stencil_pass_op, key.stencil_compare, key.color_only != 0);
     const auto elapsed_ns = perf::now_ns() - began;
     ++stats.pipelines_created;
     stats.pipeline_create_ns += elapsed_ns;
@@ -2566,7 +2808,7 @@ VkPipeline hw_pipeline_for(State &s, const State::HwPipeKey &key) {
 // frame from the warm pipeline cache: PSPRECOMP_MOTORSTORM_PIPELINE_CACHE's
 // file plus ".keys". Unknown or malformed files are ignored.
 constexpr std::uint32_t kHwKeysMagic = 0x4B504D53u;  // "SMPK"
-constexpr std::uint32_t kHwKeysVersion = 1u;
+constexpr std::uint32_t kHwKeysVersion = 3u;
 std::filesystem::path hw_keys_file(const State &s) {
     auto path = s.pipeline_cache_file;
     path += ".keys";
@@ -2618,7 +2860,7 @@ void save_hw_keys(State &s) {
     if (!error)
         s.hw_keys_saved = s.hw_pipe_order.size();
 }
-void draw_hw_load(State &s, Surface &color, Surface &depth) {
+void draw_hw_load(State &s, Surface &color, Surface &depth, bool with_depth, bool preserve_depth) {
     Constants constants{};
     constants.surface = {color.raster_stride(), color.raster_height(), color.raster_stride(), depth.raster_stride()};
     constants.mode[0] = color.format;
@@ -2630,9 +2872,16 @@ void draw_hw_load(State &s, Surface &color, Surface &depth) {
     triangle[2].y = static_cast<float>(color.height) * 2.0f;
     const auto vertices = allocate(s, sizeof(triangle), 4);
     std::memcpy(s.mapped + vertices, triangle, sizeof(triangle));
-    if (s.bound_graphics != s.hw_load_pipeline) {
-        vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.hw_load_pipeline);
-        s.bound_graphics = s.hw_load_pipeline;
+    if (preserve_depth && !s.hw_color_restore_pipeline)
+        s.hw_color_restore_pipeline = create_hw_pipeline(s, "VSFast", "PSLoadColor", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+            false, false, 7, false, 0, 1, 0, 15, 0, false);
+    const VkPipeline load_pipeline = preserve_depth ? s.hw_color_restore_pipeline
+        : with_depth ? s.hw_load_pipeline : s.hw_color_load_pipeline;
+    if (preserve_depth) ++stats.color_only_restores;
+    else if (with_depth) ++stats.depth_restores;
+    if (s.bound_graphics != load_pipeline) {
+        vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, load_pipeline);
+        s.bound_graphics = load_pipeline;
     }
     const VkDescriptorBufferInfo buffers[]{{s.upload.buffer, cb, sizeof(Constants)},
                                            {color.image.buffer, 0, VK_WHOLE_SIZE},
@@ -2648,21 +2897,25 @@ void draw_hw_load(State &s, Surface &color, Surface &depth) {
     vkCmdSetScissor(s.cmd, 0, 1, &scissor);
     const float blend[4]{};
     vkCmdSetBlendConstants(s.cmd, blend);
+    vkCmdSetStencilCompareMask(s.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 0xFF);
+    vkCmdSetStencilWriteMask(s.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 0xFF);
+    vkCmdSetStencilReference(s.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
     const VkBuffer buffer = s.upload.buffer;
     const VkDeviceSize offset = vertices;
     vkCmdBindVertexBuffers(s.cmd, 0, 1, &buffer, &offset);
     vkCmdDraw(s.cmd, 3, 1, 0, 0);
     wrote(s);
 }
-void begin_hardware_pass(State &s, Surface &color, Surface &depth) {
+void begin_hardware_pass(State &s, Surface &color, Surface &depth, bool with_depth) {
     // End first. An ordered pass clears hw_matches only when it ends, and the
     // compact images have to be reloaded from that result.
     end_rendering(s);
-    const bool load = !color.hw_matches || !depth.hw_matches;
+    const bool load = !color.hw_matches || (with_depth && !depth.hw_matches);
+    const bool preserve_depth = load && with_depth && depth.hw_matches && !s.hw_stencil_ok && preserve_readonly_depth();
     if (load) {
         if (color.image_newer)
             sync_buffer(s, color);
-        if (depth.address != 0 && depth.image_newer)
+        if (with_depth && depth.address != 0 && depth.image_newer)
             sync_buffer(s, depth);
     }
     if (!color.hw_color) {
@@ -2670,15 +2923,21 @@ void begin_hardware_pass(State &s, Surface &color, Surface &depth) {
                                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
         color.hw_color_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     }
-    if (!depth.hw_depth) {
-        depth.hw_depth = make_depth_image(depth.raster_stride(), depth.raster_height());
+    if (with_depth && !depth.hw_depth) {
+        depth.hw_depth = make_depth_image(depth.raster_stride(), depth.raster_height(), s.hw_depth_format, s.hw_stencil_ok);
         depth.hw_depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     }
+    const VkImageAspectFlags depth_aspect = s.hw_stencil_ok
+        ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+        : VK_IMAGE_ASPECT_DEPTH_BIT;
     transition_image(s, color.hw_color.image, color.hw_color_layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                      VK_IMAGE_ASPECT_COLOR_BIT);
-    transition_image(s, depth.hw_depth.image, depth.hw_depth_layout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                     VK_IMAGE_ASPECT_DEPTH_BIT);
-    const VkImageView views[]{color.hw_color.view, depth.hw_depth.view};
+    if (with_depth)
+        transition_image(s, depth.hw_depth.image, depth.hw_depth_layout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                         depth_aspect);
+    const VkImageView views[]{color.hw_color.view, with_depth ? depth.hw_depth.view : VK_NULL_HANDLE};
+    const VkRenderPass load_pass = with_depth ? s.hw_pass_load : s.hw_color_pass_load;
+    const VkRenderPass clear_pass = with_depth ? s.hw_pass_clear : s.hw_color_pass_clear;
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
     for (const auto &cached : s.hw_framebuffers)
         if (cached.color == views[0] && cached.depth == views[1]) {
@@ -2687,8 +2946,8 @@ void begin_hardware_pass(State &s, Surface &color, Surface &depth) {
         }
     if (!framebuffer) {
         VkFramebufferCreateInfo framebuffer_info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-        framebuffer_info.renderPass = s.hw_pass_load;
-        framebuffer_info.attachmentCount = 2;
+        framebuffer_info.renderPass = load_pass;
+        framebuffer_info.attachmentCount = with_depth ? 2u : 1u;
         framebuffer_info.pAttachments = views;
         framebuffer_info.width = color.raster_stride();
         framebuffer_info.height = color.raster_height();
@@ -2705,23 +2964,25 @@ void begin_hardware_pass(State &s, Surface &color, Surface &depth) {
         s.rendering = true;
         s.rendering_hardware = true;
         s.hw_pass_color = &color;
-        s.hw_pass_depth = &depth;
+        s.hw_pass_depth = with_depth ? &depth : nullptr;
+        s.hw_depth_written = false;
         s.bound_graphics = VK_NULL_HANDLE;
     };
     if (load) {
         // PSLoad writes gl_FragDepth. On a tiler that disables early-Z for the
         // rest of the pass, so the copy gets its own pass and the scene pass
         // only loads the stored depth.
-        begin_pass(s.hw_pass_clear);
-        draw_hw_load(s, color, depth);
+        begin_pass(preserve_depth ? load_pass : clear_pass);
+        draw_hw_load(s, color, depth, with_depth, preserve_depth);
         vkCmdEndRenderPass(s.cmd);
+        ++stats.render_pass_endings;
         s.rendering = false;
         s.rendering_hardware = false;
         s.hw_pass_color = s.hw_pass_depth = nullptr;
         color.hw_matches = true;
-        depth.hw_matches = true;
+        if (with_depth) depth.hw_matches = true;
         color.hw_dirty = false;
-        depth.hw_dirty = false;
+        if (with_depth && !preserve_depth) depth.hw_dirty = false;
         VkImageMemoryBarrier done[2]{};
         done[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         done[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -2736,12 +2997,12 @@ void begin_hardware_pass(State &s, Surface &color, Surface &depth) {
         done[1].oldLayout = done[1].newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         done[1].srcQueueFamilyIndex = done[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         done[1].image = depth.hw_depth.image;
-        done[1].subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        done[1].subresourceRange = {depth_aspect, 0, 1, 0, 1};
         vkCmdPipelineBarrier(s.cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, 0,
-                             0, nullptr, 0, nullptr, 2, done);
+                             0, nullptr, 0, nullptr, with_depth ? 2u : 1u, done);
     }
-    begin_pass(s.hw_pass_load);
+    begin_pass(load_pass);
 }
 #endif
 bool hardware_draws_enabled(const State &s) {
@@ -2754,7 +3015,14 @@ bool hardware_draws_enabled(const State &s) {
     static const bool diagnostics = diag_flag("PSPRECOMP_MOTORSTORM_DIAG_NO_INPUT_READ") ||
                                     diag_flag("PSPRECOMP_MOTORSTORM_DIAG_TRIVIAL_PS") ||
                                     diag_flag("PSPRECOMP_MOTORSTORM_DIAG_NO_SHADE");
-    return s.pixel_path == PixelPath::OrderedAttachment && s.hw_depth_ok && s.raster_half == 2 && !diagnostics;
+    // PSPRECOMP_MOTORSTORM_HW_SCALED=0 keeps raster scales other than native
+    // 1x on the ordered path, as before (every draw ordered at 2x and above).
+    static const bool scaled = [] {
+        const char *text = std::getenv("PSPRECOMP_MOTORSTORM_HW_SCALED");
+        return !(text && std::strcmp(text, "0") == 0);
+    }();
+    return s.pixel_path == PixelPath::OrderedAttachment && s.hw_depth_ok && (s.raster_half == 2 || scaled) &&
+           !diagnostics;
 #endif
 }
 void create_pipelines(State &s) {
@@ -2813,15 +3081,50 @@ void create_pipelines(State &s) {
     pass.attachmentCount = 2; pass.pAttachments = attachments;
     pass.subpassCount = 1; pass.pSubpasses = &subpass;
     check(vkCreateRenderPass(s.device, &pass, nullptr, &s.attachment_pass), "create ordered attachment pass");
-    VkFormatProperties depth_format{};
-    vkGetPhysicalDeviceFormatProperties(s.ctx.physical, VK_FORMAT_D16_UNORM, &depth_format);
-    const VkFormatFeatureFlags depth_features = depth_format.optimalTilingFeatures;
-    s.hw_depth_ok = (depth_features & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0 &&
-                    (depth_features & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) != 0 &&
-                    (depth_features & VK_FORMAT_FEATURE_TRANSFER_DST_BIT) != 0;
-    if (s.hw_depth_ok) {
+    // PSP stencil lives in COLOR alpha, not in the depth buffer. The native
+    // stencil experiment does not restore it in PSLoad or pack it back into
+    // alpha, and cannot represent stencil-fail alpha writes. Keep the exact
+    // ordered route by default until those transitions are implemented.
+    static const bool env_hw_stencil = [] {
+        const char *text = std::getenv("PSPRECOMP_MOTORSTORM_HW_STENCIL");
+        return text && std::strcmp(text, "1") == 0;
+    }();
+    const VkFormat candidate_depth_formats[] = {
+        VK_FORMAT_D24_UNORM_S8_UINT,
+        VK_FORMAT_D32_SFLOAT_S8_UINT,
+        VK_FORMAT_D16_UNORM_S8_UINT,
+        VK_FORMAT_D16_UNORM
+    };
+    s.hw_depth_format = VK_FORMAT_UNDEFINED;
+    for (VkFormat fmt : candidate_depth_formats) {
+        if (!env_hw_stencil && fmt != VK_FORMAT_D16_UNORM)
+            continue;
+        VkFormatProperties props{};
+        vkGetPhysicalDeviceFormatProperties(s.ctx.physical, fmt, &props);
+        const VkFormatFeatureFlags required = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                              VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                              VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        if ((props.optimalTilingFeatures & required) == required) {
+            s.hw_depth_format = fmt;
+            break;
+        }
+    }
+    if (s.hw_depth_format != VK_FORMAT_UNDEFINED) {
+        s.hw_depth_ok = true;
+        s.hw_stencil_ok = (s.hw_depth_format != VK_FORMAT_D16_UNORM);
+        if (!env_hw_stencil) {
+            s.hw_stencil_ok = false;
+            log_line("GE", "PSP stencil uses exact framebuffer-alpha rendering (native stencil experimental)");
+        }
         s.hw_pass_load = make_hw_pass(s, VK_ATTACHMENT_LOAD_OP_LOAD);
         s.hw_pass_clear = make_hw_pass(s, VK_ATTACHMENT_LOAD_OP_DONT_CARE);
+        s.hw_color_pass_load = make_hw_pass(s, VK_ATTACHMENT_LOAD_OP_LOAD, false);
+        s.hw_color_pass_clear = make_hw_pass(s, VK_ATTACHMENT_LOAD_OP_DONT_CARE, false);
+        log_line("GE", std::string("Hardware depth format: ") +
+            (s.hw_depth_format == VK_FORMAT_D24_UNORM_S8_UINT ? "D24_UNORM_S8_UINT" :
+             s.hw_depth_format == VK_FORMAT_D32_SFLOAT_S8_UINT ? "D32_SFLOAT_S8_UINT" :
+             s.hw_depth_format == VK_FORMAT_D16_UNORM_S8_UINT ? "D16_UNORM_S8_UINT" : "D16_UNORM") +
+            (s.hw_stencil_ok ? " (stencil supported)" : " (no stencil)"));
     }
     }
 #endif
@@ -2927,6 +3230,9 @@ void create_pipelines(State &s) {
     if (s.hw_depth_ok && s.pixel_path == PixelPath::OrderedAttachment) {
         s.hw_load_pipeline = create_hw_pipeline(s, "VS", "PSLoad", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, true, true, 7,
                                                 false, 0, 1, 0, 0x0F, 0, false);
+        s.hw_color_load_pipeline = create_hw_pipeline(s, "VS", "PSLoadColor", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                                                      false, false, 7, false, 0, 1, 0, 0x0F, 0, false,
+                                                      false, 0, 0, 0, 7, true);
         s.pack_color_pipeline = create_compute(s, "PackColorCS");
         s.pack_depth_pipeline = create_compute(s, "PackDepthCS");
     }
@@ -3190,8 +3496,10 @@ void create_device(State &s) {
 #else
                 false;
 #endif
+#if defined(__ANDROID__)
             ctx.hw_dynamic_depth = depth_dyn;
             ctx.hw_dynamic_blend = blend_dyn;
+#endif
             chosen_extensions = std::move(device_extensions);
             best_path = path;
         }
@@ -3306,6 +3614,8 @@ void create_device(State &s) {
     features.features.textureCompressionBC = ctx.bc;
     std::vector<const char *> device_extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
 #if defined(__ANDROID__)
+    s.display_timing = has_extension(chosen_extensions, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
+    if (s.display_timing) device_extensions.push_back(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
     if (s.pixel_path == PixelPath::OrderedAttachment)
         device_extensions.push_back(VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME);
     if (ctx.hw_dynamic_depth && has_extension(chosen_extensions, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME))
@@ -3454,10 +3764,12 @@ bool initialize() {
                 s.output_scale = 3;
             else if (choice == "4" || choice == "4x" || choice == "1920x1088")
                 s.output_scale = 4;
+            else if (choice == "5" || choice == "5x" || choice == "2400x1360")
+                s.output_scale = 5;
             else if (choice == "8" || choice == "8x" || choice == "3840x2176")
                 s.output_scale = 8;
             else
-                throw std::runtime_error("MotorStorm resolution must be 1x, 2x, 3x, 4x or 8x");
+                throw std::runtime_error("MotorStorm resolution must be 1x, 2x, 3x, 4x, 5x or 8x");
         }
         if (const char *value = std::getenv("PSPRECOMP_MOTORSTORM_AA")) {
             const std::string choice = value;
@@ -3580,6 +3892,9 @@ bool initialize() {
         setup_post(s);
         state = std::move(native);
         stats.active = true;
+        log_line("GE", std::string("VRAM publication: ") + (lazy_publish_enabled() ? "lazy" : "eager") +
+                       " renderer_build=" __DATE__ " " __TIME__ +
+                       " query_prefetch=" + (query_prefetch_enabled() ? "1" : "0"));
         std::cerr << "[Vulkan] hardware GE adapter=" << stats.adapter << " GPU_transform=1"
                   << " output=" << state->output_scale * 480 << 'x' << state->output_scale * 272
                   << " raster=" << raster_extent(480, state->raster_half) << 'x'
@@ -3607,6 +3922,18 @@ void shutdown(bool reset_report) noexcept {
         try {
             wait(*state);
 #if defined(__ANDROID__)
+            state->stop_presenter();
+            check(vkDeviceWaitIdle(state->device), "drain benchmark GPU timings");
+            for (auto &slot : state->slots) collect_slot_timings(*state, slot);
+            for (auto &frame : state->present_frames) collect_post_timings(*state, frame);
+            if (state->metrics.enabled()) {
+                for (unsigned attempt = 0; attempt < 8; ++attempt) {
+                    collect_display_timings(*state);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                state->metrics.event({}, "session_end");
+                state->metrics.flush();
+            }
             save_hw_keys(*state);
 #endif
         } catch (...) {
@@ -3682,12 +4009,17 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
     bool valid_depth =
         draw.depthbuffer && draw.depth_stride > 0 && draw.depth_stride <= 1024 &&
         memory.contains(draw.depthbuffer, static_cast<std::size_t>(draw.depth_stride) * height * 2);
+    const bool depth_write = (draw.commands[0xD3] & 1) ? (draw.commands[0xD3] & 0x400) != 0
+                                                        : (draw.commands[0x23] & 1) && draw.commands[0xE7] == 0;
+    bool depth_attachment_changed = depth_write;
     if (!lazy_publish_enabled() && !s.recording && s.readback_fence != 0u) {
         PublishReason reason(0);
         publish_readbacks(s, memory);
     }
     if (s.recording && s.used - s.arena_base > kUploadBytes / 2u - 8 * 1024 * 1024)
-        sync(memory);
+        // Arena capacity is a submission boundary, not a guest memory read.
+        // begin() rotates arenas and fences their reuse without publication.
+        finish_list(s);
     if (!s.recording)
         ++s.list_serial;
     begin(s);
@@ -3703,8 +4035,7 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
                              : 1.0f;
     color.aspect_scale = aspect;
     bool full_screen = (draw.commands[0xD3] & 1u) != 0;
-    if (!draw.hardware_transform && !full_screen && aspect > 1.0f &&
-        (vertices.size() == 6 || (texture && texture->feedback_address))) {
+    if (!draw.hardware_transform && !full_screen && aspect > 1.0f && !vertices.empty()) {
         float left = 1e10f, right = -1e10f, top = 1e10f, bottom = -1e10f;
         for (const auto &v : vertices) {
             left = std::min(left, v.x);
@@ -3712,20 +4043,32 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
             top = std::min(top, v.y);
             bottom = std::max(bottom, v.y);
         }
-        full_screen = (vertices.size() == 6 || (texture && texture->feedback_address)) && left <= 0.0f &&
-                      right >= 480.0f && top <= 0.0f && bottom >= 272.0f;
+        // Screen effects can be triangle strips, tiled sprites or cover the
+        // game's 256-row effect region. They are not HUD artwork.
+        full_screen = left <= 0.0f && right >= 480.0f && top <= 0.0f && bottom >= 256.0f;
     }
-    if (!draw.hardware_transform && texture && texture->feedback_address) {
-        if (samples_display_picture(physical(texture->feedback_address), texture->feedback_stride))
-            full_screen = true;
-    }
+    if (!draw.hardware_transform && (!texture || texture->feedback_address))
+        // Framebuffer effects also use offscreen/downsampled targets outside
+        // the display address range, and are often submitted one strip at a
+        // time. Compressing them leaves a dark/blurred 16:9 rectangle in a
+        // widened race. Untextured fades must cover the same scene as well.
+        full_screen = true;
     const bool widen = aspect > 1.0f && !full_screen;
     Surface *depth = &color;
 #if defined(__ANDROID__)
     if (!valid_depth) {
         auto &dummy = s.attachment_dummy_depth;
         if (!dummy.image || dummy.stride != color.stride || dummy.height != color.height || dummy.raster_half != color.raster_half) {
-            if (dummy.image) { sync(memory); begin(s); }
+            if (dummy.image) {
+                // Dummy depth has no guest-visible bytes to publish. Retain
+                // its old resources until the submitted chunk retires.
+                finish_list(s);
+                retire_framebuffers(s);
+                begin(s);
+                s.transient.push_back(std::move(dummy.image));
+                if (dummy.attachment) s.transient_images.push_back(std::move(dummy.attachment));
+                if (dummy.hw_depth) s.transient_images.push_back(std::move(dummy.hw_depth));
+            }
             dummy.stride = color.stride; dummy.height = color.height; dummy.raster_half = color.raster_half;
             dummy.image = make_buffer(dummy.bytes(), Memory::Device);
             dummy.attachment.reset();
@@ -3765,18 +4108,6 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
     UINT64 cb_offset = 0, vertex_offset = 0, index_offset = 0;
     {
         perf::Scope prepare_profile(perf::kGpuPrepare);
-        if (job) {
-            const UINT vertex_bytes = job->decode_count * static_cast<UINT>(sizeof(GpuVertex));
-            vertex_offset = process_vertices(s, memory, *job, vertex_bytes);
-            if (!job->indices.empty()) {
-                index_offset = allocate(s, job->indices.size() * 4u, 4);
-                std::memcpy(s.mapped + index_offset, job->indices.data(), job->indices.size() * 4u);
-            }
-        } else {
-            const UINT vertex_bytes = static_cast<UINT>(vertices.size_bytes());
-            vertex_offset = allocate(s, vertex_bytes, 4);
-            std::memcpy(s.mapped + vertex_offset, vertices.data(), vertex_bytes);
-        }
         Constants constants{draw.commands,
                             draw.model_to_clip,
                             draw.model_to_view_z,
@@ -3804,6 +4135,9 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
                 tag_hud = false;
         }
         std::uint32_t soft_range = 0;
+        // HUD tagging writes the high bits of the ordered depth attachment
+        // even when the PSP depth-write mask is disabled.
+        depth_attachment_changed = depth_write || (tag_hud && !draw.hardware_transform);
         if (s.racing && s.post.soft_particles_active() && valid_depth && draw.hardware_transform &&
             (draw.commands[0x21] & 1u) && (draw.commands[0x23] & 1u) && draw.commands[0xE7] != 0u &&
             (draw.commands[0xDE] & 7u) >= 4u && !vertices.empty()) {
@@ -3836,14 +4170,68 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
                 // Texels the edges can touch: nearest samples pixel centres
                 // inside [u0, u1); bilinear also reaches half a texel out.
                 const bool linear = ((draw.commands[0xC6] >> 8) & 1u) != 0 || (draw.commands[0xC6] & 1u) != 0;
-                const float pad = linear ? 0.5f : 0.0f;
+                // Integer-aligned, one-to-one screen copies sample raster
+                // centres. Their bilinear footprint stays inside the UV edges;
+                // adding half a native texel invents wrap taps into unrelated
+                // VRAM (often depth), forcing packing and a CPU wait per copy.
+                const float du = vertices.front().u - vertices.front().x;
+                const float dv = vertices.front().v - vertices.front().y;
+                const bool unit_mapping = !widen && s.raster_half % 2u == 0u &&
+                    std::isfinite(du) && std::isfinite(dv) && std::floor(du) == du && std::floor(dv) == dv &&
+                    std::all_of(vertices.begin(), vertices.end(), [&](const auto &v) {
+                        return v.q == 1.0f && std::isfinite(v.x) && std::isfinite(v.y) &&
+                               std::floor(v.x) == v.x && std::floor(v.y) == v.y &&
+                               v.u - v.x == du && v.v - v.y == dv;
+                    });
+                float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+                for (const auto &v : vertices) {
+                    x0 = std::min(x0, v.x); x1 = std::max(x1, v.x);
+                    y0 = std::min(y0, v.y); y1 = std::max(y1, v.y);
+                }
+                const auto &a = vertices.front();
+                const auto far_x = std::max_element(vertices.begin(), vertices.end(),
+                    [&](const auto &lhs, const auto &rhs) { return std::fabs(lhs.x - a.x) < std::fabs(rhs.x - a.x); });
+                const auto far_y = std::max_element(vertices.begin(), vertices.end(),
+                    [&](const auto &lhs, const auto &rhs) { return std::fabs(lhs.y - a.y) < std::fabs(rhs.y - a.y); });
+                const float sx = far_x->x != a.x ? (far_x->u - a.u) / (far_x->x - a.x) : 0.0f;
+                const float sy = far_y->y != a.y ? (far_y->v - a.v) / (far_y->y - a.y) : 0.0f;
+                // MotorStorm's 512x296 -> 480x272 composite is separable and
+                // slightly downsamples. A raster centre is farther inside its
+                // UV edge than the half-texel filter footprint. Keep a margin
+                // for interpolation rounding; other mappings remain conservative.
+                const bool contracted_mapping = !widen && s.raster_half % 2u == 0u &&
+                    std::fabs(sx) >= 1.01f && std::fabs(sy) >= 1.01f &&
+                    x0 < x1 && y0 < y1 &&
+                    std::all_of(vertices.begin(), vertices.end(), [&](const auto &v) {
+                        return v.q == 1.0f && std::isfinite(v.x) && std::isfinite(v.y) &&
+                               std::floor(v.x) == v.x && std::floor(v.y) == v.y &&
+                               std::fabs(v.u - (a.u + (v.x - a.x) * sx)) <= 0.0001f &&
+                               std::fabs(v.v - (a.v + (v.y - a.y) * sy)) <= 0.0001f;
+                    });
+                const float pad = linear && !unit_mapping && !contracted_mapping ? 0.5f : 0.0f;
                 sampled = {static_cast<int>(std::floor(u0 - pad)), static_cast<int>(std::floor(v0 - pad)),
                            static_cast<int>(std::ceil(u1 + pad)), static_cast<int>(std::ceil(v1 + pad))};
                 // UVs outside the texture wrap or clamp to other texels.
                 have_sampled = u0 >= 0.0f && v0 >= 0.0f && u1 <= static_cast<float>(texture->width) &&
                                v1 <= static_cast<float>(texture->height) && std::isfinite(u0) && std::isfinite(v1);
+                if (linear &&
+                    (((draw.commands[0xC7] & 1u) == 0u && (u0 - pad < 0.0f || u1 + pad > texture->width)) ||
+                     ((draw.commands[0xC7] & 256u) == 0u && (v0 - pad < 0.0f || v1 + pad > texture->height))))
+                    have_sampled = false; // Wrapped filter taps can reach the far texture edge.
                 sampled.left = std::max(sampled.left, 0);
                 sampled.top = std::max(sampled.top, 0);
+                if (diag_flag("PSPRECOMP_MOTORSTORM_TRACE_SYNC")) {
+                    static unsigned samples = 0;
+                    if (samples++ < 32u) {
+                        std::ostringstream trace;
+                        trace << "uv=" << u0 << ',' << v0 << '-' << u1 << ',' << v1
+                              << " xy=" << vertices.front().x << ',' << vertices.front().y
+                              << " q=" << vertices.front().q << " unit=" << unit_mapping << " bounded=" << have_sampled
+                              << " filter=" << linear << " wrap=" << draw.commands[0xC7]
+                              << " texture=" << texture->width << 'x' << texture->height;
+                        log_line("FEEDBACK_BOUNDS", trace.str());
+                    }
+                }
             }
             feedback = feedback_snapshot(s, memory, *texture, constants.feedback, have_sampled ? &sampled : nullptr,
                                          &feedback_view, &color);
@@ -3908,14 +4296,52 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
                 return !(text && std::strcmp(text, "0") == 0);
             }();
             facts.hardware_color_test = hardware_color_test;
+            facts.hardware_stencil = s.hw_stencil_ok;
             pixel_route = classify_ge_draw(draw.commands.data(), facts);
-            if (pixel_route.hardware && (color.raster_stride() != depth->raster_stride() ||
-                                         color.raster_height() != depth->raster_height()))
+            static const bool color_only_enabled = !diag_flag("PSPRECOMP_MOTORSTORM_COLOR_ONLY_DISABLE");
+            const bool color_only = color_only_enabled && !pixel_route.state.depth_test &&
+                                    !pixel_route.state.depth_write && !pixel_route.state.stencil_test;
+            pixel_route.color_only = color_only;
+            if (pixel_route.hardware && !color_only && (color.raster_stride() != depth->raster_stride() ||
+                                         color.raster_height() != depth->raster_height())) {
+                static int mismatch_count = 0;
+                if (++mismatch_count <= 20) {
+                    log_line("GE", "TargetSizeMismatch: color s=" + std::to_string(color.stride) +
+                                   " h=" + std::to_string(color.height) +
+                                   " a=" + std::to_string(color.address) +
+                                   " c_match=" + std::to_string(color.hw_matches ? 1 : 0) +
+                                   " depth s=" + std::to_string(depth->stride) +
+                                   " h=" + std::to_string(depth->height) +
+                                   " a=" + std::to_string(depth->address) +
+                                   " d_match=" + std::to_string(depth->hw_matches ? 1 : 0) +
+                                   " dt=" + std::to_string(pixel_route.state.depth_test ? 1 : 0) +
+                                   " dw=" + std::to_string(pixel_route.state.depth_write ? 1 : 0) +
+                                   " blend=" + std::to_string(pixel_route.state.blend ? 1 : 0) +
+                                   " alpha=" + std::to_string(pixel_route.state.alpha_discard ? 1 : 0));
+                }
                 pixel_route.hardware = false;
+                pixel_route.reject_reason = GeRejectReason::TargetSizeMismatch;
+            }
             if (pixel_route.hardware && pixel_route.exact_pixel)
                 constants.render[3] |= 32u;
+            if (pixel_route.hardware && pixel_route.framebuffer_alpha_stencil)
+                constants.render[3] |= 64u;
         }
 #endif
+        // Feedback preparation can publish unsupported guest ranges and reopen
+        // the upload arena. Stage this draw's vertices only after that work so
+        // an arena reset cannot overwrite vertices before their draw is issued.
+        if (job) {
+            const UINT vertex_bytes = job->decode_count * static_cast<UINT>(sizeof(GpuVertex));
+            vertex_offset = process_vertices(s, memory, *job, vertex_bytes);
+            if (!job->indices.empty()) {
+                index_offset = allocate(s, job->indices.size() * 4u, 4);
+                std::memcpy(s.mapped + index_offset, job->indices.data(), job->indices.size() * 4u);
+            }
+        } else {
+            vertex_offset = allocate(s, vertices.size_bytes(), 4);
+            std::memcpy(s.mapped + vertex_offset, vertices.data(), vertices.size_bytes());
+        }
         cb_offset = allocate(s, sizeof(constants), 256);
         std::memcpy(s.mapped + cb_offset, &constants, sizeof(constants));
         static const GpuTexture white{0, 1, 1, {{0xFFFFFFFFu}}};
@@ -3931,29 +4357,52 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
         if (s.pixel_path == PixelPath::OrderedAttachment) {
             if (hardware) {
                 ++stats.hardware_pixel_draws;
-                if (pixel_route.state.alpha_discard)
+                if (pixel_route.state.alpha_discard) {
                     ++stats.hardware_alpha_draws;
+                    ++stats.draws_ps_fast_alpha;
+                } else {
+                    ++stats.draws_ps_fast;
+                }
             } else {
                 ++stats.ordered_pixel_draws;
-                if (texture && texture->feedback_address)
-                    ++stats.reject_feedback;
-                else if ((draw.commands[0x24] & 1u) && (draw.commands[0xD3] & 1u) == 0u)
-                    ++stats.reject_stencil;
-                else if ((draw.commands[0x27] & 1u) && (draw.commands[0xD3] & 1u) == 0u)
-                    ++stats.reject_color;
-                else if ((draw.commands[0x21] & 1u) && (draw.commands[0xD3] & 1u) == 0u) {
-                    ++stats.reject_blend;
-                    // Diagnostics: which blend modes stay ordered (format, then
-                    // the 0xDF factors/equation; FIX colors are not part of it).
+                ++stats.draws_ps_ordered;
+                switch (pixel_route.reject_reason) {
+                    case GeRejectReason::RasterHalfZero: ++stats.reject_raster_half_zero; break;
+                    case GeRejectReason::Feedback: ++stats.reject_feedback; break;
+                    case GeRejectReason::SoftParticles: ++stats.reject_soft_particles; break;
+                    case GeRejectReason::HudTag: ++stats.reject_hud_tag; break;
+                    case GeRejectReason::ExtendedColor: ++stats.reject_extended_color; break;
+                    case GeRejectReason::Stencil:
+                        ++stats.reject_stencil;
+                        ++rejected_stencils[(draw.commands[0xDC] & 0x7u) |
+                                            ((draw.commands[0xDD] & 0x7u) << 4) |
+                                            (((draw.commands[0xDD] >> 8) & 0x7u) << 8) |
+                                            (((draw.commands[0xDD] >> 16) & 0x7u) << 12)];
+                        break;
+                    case GeRejectReason::ColorTest: ++stats.reject_color; break;
+                    case GeRejectReason::WriteMask: ++stats.reject_mask; break;
+                    case GeRejectReason::Blend16Bit: ++stats.reject_blend_16bit; ++stats.reject_blend; break;
+                    case GeRejectReason::BlendNarrow: ++stats.reject_blend_narrow; ++stats.reject_blend; break;
+                    case GeRejectReason::BlendEquation: ++stats.reject_blend_equation; ++stats.reject_blend; break;
+                    case GeRejectReason::BlendDoubleAlpha: ++stats.reject_blend_double_alpha; ++stats.reject_blend; break;
+                    case GeRejectReason::BlendFactorUnknown: ++stats.reject_blend_factor_unknown; ++stats.reject_blend; break;
+                    case GeRejectReason::BlendFixConflict: ++stats.reject_blend_fix_conflict; ++stats.reject_blend; break;
+                    case GeRejectReason::TargetSizeMismatch: ++stats.reject_target_size_mismatch; break;
+                    default: ++stats.reject_other; break;
+                }
+                if ((draw.commands[0x21] & 1u) && (draw.commands[0xD3] & 1u) == 0u) {
                     ++rejected_blends[(draw.format << 12) | (draw.commands[0xDF] & 0x7FFu)];
                 }
-                else if ((draw.commands[0xE8] & 0xFFFFFFu) != 0u || (draw.commands[0xE9] & 0xFFu) != 0u)
-                    ++stats.reject_mask;
-                else
-                    ++stats.reject_other;
             }
             if (s.rendering && s.rendering_hardware != hardware)
                 ++stats.pixel_path_switches;
+            if (s.last_draw_hardware >= 0 && s.last_draw_hardware != (hardware ? 1 : 0)) {
+                if (s.last_draw_hardware == 1)
+                    ++stats.switches_hw_to_ordered;
+                else
+                    ++stats.switches_ordered_to_hw;
+            }
+            s.last_draw_hardware = hardware ? 1 : 0;
         }
 #else
         const bool hardware = false;
@@ -3977,8 +4426,15 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
             key.cull = pixel_route.state.cull_mode;
             key.alpha = pixel_route.state.alpha_discard ? 1 : 0;
             key.feedback = feedback ? 1 : 0;
-            if (!s.rendering_hardware || s.hw_pass_color != &color || s.hw_pass_depth != depth)
-                begin_hardware_pass(s, color, *depth);
+            key.stencil_test = pixel_route.state.stencil_test ? 1 : 0;
+            key.stencil_fail_op = pixel_route.state.stencil_fail_op;
+            key.stencil_depth_fail_op = pixel_route.state.stencil_depth_fail_op;
+            key.stencil_pass_op = pixel_route.state.stencil_pass_op;
+            key.stencil_compare = pixel_route.state.stencil_compare;
+            key.color_only = pixel_route.color_only ? 1u : 0u;
+            if (!s.rendering_hardware || s.hw_pass_color != &color ||
+                s.hw_pass_depth != (key.color_only ? nullptr : depth))
+                begin_hardware_pass(s, color, *depth, key.color_only == 0);
             pipeline = hw_pipeline_for(s, key);
         }
 #endif
@@ -4061,6 +4517,7 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
             pass.renderArea = {{0, 0}, {fb_width, fb_height}};
             vkCmdBeginRenderPass(s.cmd, &pass, VK_SUBPASS_CONTENTS_INLINE);
             s.attachment_color = &color; s.attachment_depth = depth;
+            s.ordered_depth_written = false;
             }
 #else
             VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
@@ -4136,6 +4593,12 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
             const float blend_constants[4]{pixel_route.state.constant_r / 255.0f, pixel_route.state.constant_g / 255.0f,
                                            pixel_route.state.constant_b / 255.0f, 1.0f};
             vkCmdSetBlendConstants(s.cmd, blend_constants);
+            vkCmdSetStencilCompareMask(s.cmd, VK_STENCIL_FACE_FRONT_AND_BACK,
+                                       pixel_route.state.stencil_test ? pixel_route.state.stencil_compare_mask : 0xFF);
+            vkCmdSetStencilWriteMask(s.cmd, VK_STENCIL_FACE_FRONT_AND_BACK,
+                                     pixel_route.state.stencil_test ? pixel_route.state.stencil_write_mask : 0xFF);
+            vkCmdSetStencilReference(s.cmd, VK_STENCIL_FACE_FRONT_AND_BACK,
+                                     pixel_route.state.stencil_test ? pixel_route.state.stencil_reference : 0);
             if (s.ctx.hw_dynamic_depth && s.ctx.hw_dynamic_blend && vkCmdSetDepthTestEnable &&
                 vkCmdSetColorBlendEnableEXT) {
                 vkCmdSetDepthTestEnable(s.cmd, pixel_route.state.depth_test ? VK_TRUE : VK_FALSE);
@@ -4157,6 +4620,12 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
         const VkBuffer vertex_buffer = job ? s.vertex_arena.buffer : s.upload.buffer;
         vkCmdBindVertexBuffers(s.cmd, 0, 1, &vertex_buffer, &vertex_offset);
         static const bool skip_draws = diag_flag("PSPRECOMP_MOTORSTORM_DIAG_SKIP_DRAWS");
+#if defined(__ANDROID__)
+        if (valid_depth && depth_attachment_changed) {
+            if (s.rendering_hardware) s.hw_depth_written = true;
+            else s.ordered_depth_written = true;
+        }
+#endif
         ++draw_calls;
         if (skip_draws) {
         } else if (job && !job->indices.empty()) {
@@ -4197,8 +4666,6 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
         }
     }
     color.touch_rect(written);
-    const bool depth_write = (draw.commands[0xD3] & 1) ? (draw.commands[0xD3] & 0x400) != 0
-                                                        : (draw.commands[0x23] & 1) && draw.commands[0xE7] == 0;
     if (valid_depth && depth_write) {
         depth->dirty = true;
         ++depth->version;
@@ -4206,6 +4673,12 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
     }
     ++stats.draws;
     stats.vertices += vertex_count;
+#if defined(__ANDROID__)
+    if (pixel_route.hardware)
+        stats.hardware_vertices += vertex_count;
+    else
+        stats.ordered_vertices += vertex_count;
+#endif
     if (job)
         ++stats.gpu_vertex_draws;
     if (draw.hardware_transform)
@@ -4214,30 +4687,67 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
         flush_chunk(s);
 }
 namespace {
-// Record the readback of every surface drawn by this list and submit the list.
-void finish_list(State &s) {
-    for (const auto &surface : s.surfaces)
-        if (surface->dirty)
-            resolve_surface(s, *surface);
-    bool copied = false;
-    for (const auto &surface : s.surfaces) {
-        if (surface->dirty) {
-            if (!copied) {
-                outside(s);
-                copied = true;
+// Submit GE work immediately. Only a coherence request needs packed readbacks;
+// normal Android lists leave their newest pixels in the resident attachments.
+void finish_list(State &s, bool materialize, std::uint32_t address, std::size_t length) {
+#if defined(__ANDROID__)
+    materialize = materialize || !deferred_readback || !lazy_publish_enabled();
+    // RAM targets have no VRAM access hook, so keep their eager coherence.
+    materialize = materialize || std::any_of(s.surfaces.begin(), s.surfaces.end(),
+        [](const auto &surface) {
+            return surface->dirty && (surface->address < 0x04000000u || surface->address >= 0x04200000u);
+        });
+#else
+    materialize = true;
+#endif
+    end_rendering(s);
+    std::vector<Surface *> copied_surfaces;
+    const auto prefetch = [&](const Surface &surface) {
+        return !materialize && query_prefetch_enabled() && surface.cpu_queried &&
+            s.list_serial >= surface.last_cpu_query_list && s.list_serial - surface.last_cpu_query_list <= 2u &&
+            surface.native_bytes() <= 512u * 1024u && surface.address >= 0x04000000u && surface.address < 0x04200000u;
+    };
+    const auto copy_needed = [&](const Surface &surface) {
+        return surface.dirty && ((materialize && (!length || vram_ranges_overlap(address, length,
+                    surface.address, surface.guest_bytes()))) || prefetch(surface));
+    };
+    if (materialize || query_prefetch_enabled()) {
+        for (const auto &surface : s.surfaces)
+            if (copy_needed(*surface))
+                resolve_surface(s, *surface);
+        bool copied = false;
+        for (const auto &surface : s.surfaces) {
+            if (copy_needed(*surface)) {
+                if (!copied) {
+                    outside(s);
+                    copied = true;
+                }
+                if (surface->raster_half == 2)
+                    sync_buffer(s, *surface);
+                copy_buffer(s, surface->readback.buffer, 0,
+                            surface->raster_half == 2 ? surface->image.buffer : surface->native.buffer, 0,
+                            surface->native_bytes());
+                if (prefetch(*surface)) {
+                    ++stats.query_prefetches;
+                    stats.query_prefetch_bytes += surface->native_bytes();
+                }
+                copied_surfaces.push_back(surface.get());
+                surface->dirty = false;
+                surface->readback_pending = true;
             }
-            if (surface->raster_half == 2)
-                sync_buffer(s, *surface);
-            copy_buffer(s, surface->readback.buffer, 0,
-                        surface->raster_half == 2 ? surface->image.buffer : surface->native.buffer, 0,
-                        surface->native_bytes());
-            surface->dirty = false;
-            surface->readback_pending = true;
+            if (surface->dirty)
+                surface->readback_pending = true;
+            surface->loaded = false;
         }
-        surface->loaded = false;
+        if (copied)
+            wrote(s);
+    } else {
+        for (const auto &surface : s.surfaces) {
+            if (surface->dirty)
+                surface->readback_pending = true;
+            surface->loaded = false;
+        }
     }
-    if (copied)
-        wrote(s);
     if (s.has_commands) {
         submit_chunk(s);
     } else {
@@ -4246,22 +4756,57 @@ void finish_list(State &s) {
         s.recording = false;
     }
     s.readback_fence = std::max(s.readback_fence, s.frame_fence);
+    for (auto *surface : copied_surfaces)
+        surface->readback_fence = s.frame_fence;
     s.frame_fence = 0u;
     s.replacement_uploaded_in_list = 0u;
     s.replacement_count_in_list = 0u;
 }
 // Wait for submitted GE work and copy its pixels into guest memory. Bytes the
 // CPU changed after the list ended keep the CPU's value.
-void publish_readbacks(State &s, psprecomp::GuestMemory &memory) {
+void publish_readbacks(State &s, psprecomp::GuestMemory &memory, std::uint32_t address, std::size_t length) {
     memory.arm_vram_hook(false);
-    if (s.readback_fence == 0u)
+    const bool resume_recording = s.recording;
+    const auto selected = [&](const Surface &surface) {
+        return !length || vram_ranges_overlap(address, length, surface.address, surface.guest_bytes());
+    };
+    if (publish_reason == 3 && length && length <= 16u)
+        for (const auto &surface : s.surfaces)
+            if (selected(*surface) && (surface->dirty || surface->readback_pending)) {
+                surface->cpu_queried = true;
+                surface->last_cpu_query_list = s.list_serial;
+            }
+    const bool transfer_hit = std::any_of(s.pending_transfers.begin(), s.pending_transfers.end(),
+        [&](const auto &transfer) { return !length || vram_ranges_overlap(address, length, transfer.start(), transfer.bytes()); });
+    const bool needs_readback = std::any_of(s.surfaces.begin(), s.surfaces.end(),
+        [&](const auto &surface) {
+            return surface->dirty && (!length || vram_ranges_overlap(address, length, surface->address, surface->guest_bytes()));
+        });
+    if (needs_readback || (s.recording && (!length || transfer_hit))) {
+        if (!s.recording)
+            begin(s);
+        finish_list(s, true, address, length);
+    }
+    UINT64 requested_fence = s.readback_fence;
+    if (length && !transfer_hit) {
+        requested_fence = 0u;
+        for (const auto &surface : s.surfaces)
+            if (surface->readback_pending && selected(*surface))
+                requested_fence = std::max(requested_fence, surface->readback_fence);
+    }
+    if (requested_fence == 0u) {
+        memory.arm_vram_hook(!s.pending_transfers.empty() || std::any_of(s.surfaces.begin(), s.surfaces.end(),
+            [](const auto &surface) { return surface->dirty || surface->readback_pending; }));
+        if (resume_recording)
+            begin(s);
         return;
+    }
     {
         perf::Scope fence_profile(perf::kGpuFence);
         ++stats.publishes[publish_reason];
-        if (completed_value(s) < s.readback_fence) {
+        if (completed_value(s) < requested_fence) {
             const auto begin_ns = perf::now_ns();
-            wait_value(s, s.readback_fence, kWaitPublish);
+            wait_value(s, requested_fence, kWaitPublish);
             ++stats.publish_waits[publish_reason];
             stats.publish_wait_ns[publish_reason] += perf::now_ns() - begin_ns;
         }
@@ -4273,6 +4818,8 @@ void publish_readbacks(State &s, psprecomp::GuestMemory &memory) {
         s.transfer_ring.invalidate();
         std::vector<std::uint8_t> row;
         for (const auto &transfer : s.pending_transfers) {
+            if (length && !vram_ranges_overlap(address, length, transfer.start(), transfer.bytes()))
+                continue;
             const auto *pixels = s.transfer_ring.mapped + transfer.offset;
             row.resize(static_cast<std::size_t>(transfer.width) * transfer.bpp);
             for (std::uint32_t y = 0; y < transfer.height; ++y, pixels += transfer.width * 4u) {
@@ -4288,12 +4835,16 @@ void publish_readbacks(State &s, psprecomp::GuestMemory &memory) {
                     memory.copy_in(address, row);
             }
         }
-        s.pending_transfers.clear();
-        s.transfer_used = 0u;
+        std::erase_if(s.pending_transfers, [&](const auto &transfer) {
+            return !length || vram_ranges_overlap(address, length, transfer.start(), transfer.bytes());
+        });
+        if (s.pending_transfers.empty())
+            s.transfer_used = 0u;
     }
     std::vector<std::uint8_t> current;
     for (const auto &surface : s.surfaces) {
-        if (!surface->readback_pending)
+        if (!surface->readback_pending ||
+            (length && !vram_ranges_overlap(address, length, surface->address, surface->guest_bytes())))
             continue;
         surface->readback.invalidate();
         const auto *pixels = reinterpret_cast<const std::uint32_t *>(surface->readback.mapped);
@@ -4318,16 +4869,45 @@ void publish_readbacks(State &s, psprecomp::GuestMemory &memory) {
         }
         surface->guest_shadow = std::move(published);
         surface->readback_pending = false;
+        surface->readback_fence = 0u;
+        surface->loaded = false;
     }
+    const bool unpublished = !s.pending_transfers.empty() ||
+        std::any_of(s.surfaces.begin(), s.surfaces.end(), [](const auto &surface) {
+            return surface->dirty || surface->readback_pending;
+        });
+    if (unpublished)
+        s.readback_fence = s.fence_value;
+    memory.arm_vram_hook(unpublished);
     // A publish can run while a list is recording (VRAM hook); that list may
     // still reference transient resources and cached textures.
+    if (resume_recording) {
+        begin(s);
+        return;
+    }
+    retire_completed_resources(s);
+}
+void retire_completed_resources(State &s) {
     if (s.recording)
         return;
     // Presentation snapshots are submitted after the list's readback fence;
-    // retired buffers go only once every submitted GE command has completed.
+    // retired resources go once every command submitted so far has completed.
+    // Batching them by that fence frees them even when the GPU never idles.
+    if (!s.retired_surfaces.empty())
+        retire_framebuffers(s);
+    if (!s.transient.empty() || !s.transient_images.empty() || !s.retired_surfaces.empty() || !s.transient_framebuffers.empty()) {
+        State::RetiredBatch batch;
+        batch.device = s.device;
+        batch.fence = s.fence_value;
+        batch.framebuffers.swap(s.transient_framebuffers);
+        batch.buffers.swap(s.transient);
+        batch.images.swap(s.transient_images);
+        batch.surfaces.swap(s.retired_surfaces);
+        s.retired.push_back(std::move(batch));
+    }
+    for (const auto completed = completed_value(s); !s.retired.empty() && s.retired.front().fence <= completed;)
+        s.retired.pop_front();
     if (completed_value(s) >= s.fence_value) {
-        s.transient.clear();
-        s.transient_images.clear();
 #if defined(__ANDROID__)
         for (auto framebuffer : s.attachment_framebuffers) vkDestroyFramebuffer(s.device, framebuffer, nullptr);
         s.attachment_framebuffers.clear();
@@ -4348,6 +4928,8 @@ void publish_readbacks(State &s, psprecomp::GuestMemory &memory) {
                 break;
             const auto found = s.replacements.find(hash);
             s.replacement_bytes -= found->second.bytes;
+            // Submitted chunks may still sample it: destroy once they retire.
+            s.transient_images.push_back(std::move(found->second.image));
             s.replacements.erase(found);
             ++stats.replacements_evicted;
         }
@@ -4362,11 +4944,27 @@ void publish_readbacks(State &s, psprecomp::GuestMemory &memory) {
                 break;
             const auto found = s.textures.find(key);
             s.texture_bytes -= found->second.bytes;
+            // Submitted chunks may still sample it: destroy once they retire.
+            s.transient_images.push_back(std::move(found->second.image));
             s.textures.erase(found);
         }
     }
 }
-void gpu_sync_impl(psprecomp::GuestMemory &memory) { sync(memory); }
+void retire_framebuffers(State &s) {
+#if defined(__ANDROID__)
+    // A destroyed view's handle can be reused for a different extent. Keeping
+    // its old framebuffer in these caches can select an obsolete render area.
+    s.transient_framebuffers.insert(s.transient_framebuffers.end(),
+        s.attachment_framebuffers.begin(), s.attachment_framebuffers.end());
+    s.attachment_framebuffers.clear();
+    s.ordered_framebuffers.clear();
+    for (const auto &framebuffer : s.hw_framebuffers)
+        s.transient_framebuffers.push_back(framebuffer.framebuffer);
+    s.hw_framebuffers.clear();
+#else
+    (void)s;
+#endif
+}
 } // namespace
 void sync(psprecomp::GuestMemory &memory) {
     if (!state)
@@ -4388,18 +4986,47 @@ void end_list(psprecomp::GuestMemory &memory) {
     if (!state || !state->recording)
         return;
     perf::Scope sync_profile(perf::kGpuSync);
-    {
-        PublishReason reason(2);
-        publish_readbacks(*state, memory);
-    }
     finish_list(*state);
-    memory.set_vram_access_hook(
-        [](void *context) {
+    retire_completed_resources(*state);
+    memory.set_vram_range_access_hook(
+        [](void *context, std::uint32_t address, std::size_t length) {
             if (publish_guard)
                 publish_guard();
             if (state) {
+                auto &guest = *static_cast<psprecomp::GuestMemory *>(context);
+                const bool surface_hit = std::any_of(state->surfaces.begin(), state->surfaces.end(),
+                    [&](const auto &surface) {
+                        return (surface->dirty || surface->readback_pending) &&
+                            vram_ranges_overlap(address, length, surface->address, surface->guest_bytes());
+                    });
+                const bool transfer_hit = std::any_of(state->pending_transfers.begin(), state->pending_transfers.end(),
+                    [&](const auto &transfer) {
+                        return vram_ranges_overlap(address, length, transfer.start(), transfer.bytes());
+                    });
+                if (!surface_hit && !transfer_hit) {
+                    ++stats.unrelated_vram_accesses;
+                    guest.arm_vram_hook(state->readback_fence != 0u || state->recording);
+                    return;
+                }
+                static const bool trace_vram = diag_flag("PSPRECOMP_MOTORSTORM_TRACE_VRAM");
+                stats.cpu_vram_address = address;
+                stats.cpu_vram_bytes = length;
+                if (trace_vram) {
+                    static unsigned samples = 0;
+                    if (samples++ < 48u) {
+                        std::ostringstream trace;
+                        trace << "CPU VRAM access=" << std::hex << address << std::dec << " bytes=" << length;
+                        for (const auto &surface : state->surfaces)
+                            if ((surface->dirty || surface->readback_pending) &&
+                                vram_ranges_overlap(address, length, surface->address, surface->guest_bytes()))
+                                trace << " target=" << std::hex << surface->address << std::dec
+                                      << "/" << surface->stride << "x" << surface->height
+                                      << " dirty=" << surface->dirty;
+                        log_line("VRAM_TRACE", trace.str());
+                    }
+                }
                 PublishReason reason(3);
-                publish_readbacks(*state, *static_cast<psprecomp::GuestMemory *>(context));
+                publish_readbacks(*state, guest, address, length);
             }
         },
         &memory);
@@ -4407,28 +5034,56 @@ void end_list(psprecomp::GuestMemory &memory) {
 }
 void settle(psprecomp::GuestMemory &memory) {
     if (state) {
+        if (deferred_readback && lazy_publish_enabled()) {
+            retire_completed_resources(*state);
+            return;
+        }
         PublishReason reason(4);
         publish_readbacks(*state, memory);
     }
 }
 void set_deferred_readback(bool enabled) noexcept { deferred_readback = enabled; }
+void set_lazy_publish(bool enabled) noexcept { lazy_publish_setting = enabled; }
+bool lazy_publish() noexcept { return lazy_publish_setting; }
 void set_publish_guard(void (*guard)()) noexcept { publish_guard = guard; }
 bool sync_texture(psprecomp::GuestMemory &memory, std::uint32_t address, std::uint32_t bytes) {
-    if (!state)
+    if (!state || bytes == 0u)
         return false;
     address = physical(address);
+    // RAM targets have no VRAM hook and keep the eager synchronization path.
+    const bool vram = address >= 0x04000000u && address < 0x04200000u;
+    const auto overlaps = [&](std::uint32_t target, UINT64 size) {
+        return vram ? vram_ranges_overlap(address, bytes, target, size)
+                    : address < static_cast<UINT64>(target) + size && target < static_cast<UINT64>(address) + bytes;
+    };
+    const auto trace_sync = [&](std::uint32_t target, UINT bpp) {
+        stats.texture_sync_address = address;
+        stats.texture_sync_bytes = bytes;
+        stats.texture_sync_target = target;
+        stats.texture_sync_bpp = bpp;
+        if (!diag_flag("PSPRECOMP_MOTORSTORM_TRACE_SYNC")) return;
+        static unsigned samples = 0;
+        if (samples++ >= 64u) return;
+        std::ostringstream trace;
+        trace << "texture address=" << std::hex << address << " target=" << target << std::dec
+              << " bytes=" << bytes << " bpp=" << bpp;
+        log_line("VRAM_SYNC", trace.str());
+    };
     for (const auto &pending : state->pending_transfers)
-        if (address < static_cast<UINT64>(pending.start()) + pending.bytes() &&
-            pending.start() < static_cast<UINT64>(address) + bytes) {
+        if (overlaps(pending.start(), pending.bytes())) {
+            trace_sync(pending.start(), pending.bpp);
             ++stats.feedback_syncs;
-            sync(memory);
+            PublishReason reason(1);
+            publish_readbacks(*state, memory, address, vram ? bytes : 0u);
             return true;
         }
     for (const auto &target : state->surfaces)
-        if (target->dirty && address < static_cast<UINT64>(target->address) + target->guest_bytes() &&
-            target->address < static_cast<UINT64>(address) + bytes) {
+        if ((target->dirty || target->readback_pending) &&
+            overlaps(target->address, target->guest_bytes())) {
+            trace_sync(target->address, target->bpp);
             ++stats.feedback_syncs;
-            sync(memory);
+            PublishReason reason(1);
+            publish_readbacks(*state, memory, address, vram ? bytes : 0u);
             return true;
         }
     return false;
@@ -4446,7 +5101,7 @@ bool transfer_from_target(std::uint32_t source, std::uint32_t source_stride, std
     const UINT64 end = start + static_cast<UINT64>((height - 1u) * source_stride + width) * bpp;
     Surface *target = nullptr;
     for (const auto &surface : s.surfaces)
-        if (surface->dirty && surface->stride == source_stride && surface->bpp == bpp &&
+        if ((surface->dirty || surface->readback_pending) && surface->stride == source_stride && surface->bpp == bpp &&
             start >= surface->address && end <= surface->address + surface->guest_bytes() &&
             (start - surface->address) % bpp == 0u) {
             target = surface.get();
@@ -4480,7 +5135,7 @@ bool transfer_from_target(std::uint32_t source, std::uint32_t source_stride, std
     return true;
 }
 bool source_in_target(std::uint32_t address, std::uint32_t bytes, bool palette, std::uint64_t &version) noexcept {
-    if (!state || !state->recording || bytes == 0u || (palette && bytes % 4u != 0u))
+    if (!state || bytes == 0u || (palette && bytes % 4u != 0u))
         return false;
     const auto start = physical(address);
     for (const auto &pending : state->pending_transfers)
@@ -4493,7 +5148,7 @@ bool source_in_target(std::uint32_t address, std::uint32_t bytes, bool palette, 
     return true;
 }
 bool overlay_targets(std::uint32_t address, std::uint32_t bytes, std::uint64_t &version) noexcept {
-    if (!state || !state->recording || bytes == 0u)
+    if (!state || bytes == 0u)
         return false;
     const UINT64 begin_address = physical(address), end = begin_address + bytes;
     for (const auto &pending : state->pending_transfers)
@@ -4502,7 +5157,7 @@ bool overlay_targets(std::uint32_t address, std::uint32_t bytes, std::uint64_t &
     bool any = false;
     version = 0u;
     for (const auto &surface : state->surfaces) {
-        if (!surface->dirty || begin_address >= surface->address + surface->guest_bytes() || surface->address >= end)
+        if ((!surface->dirty && !surface->readback_pending) || begin_address >= surface->address + surface->guest_bytes() || surface->address >= end)
             continue;
         if (surface->bpp != 4u)
             return false;
@@ -4532,12 +5187,26 @@ bool feedback_available(std::uint32_t address, std::uint32_t stride, std::uint32
     address = physical(address);
     const auto bpp = format == 3 ? 4u : 2u;
     for (const auto &target : state->surfaces)
-        if (target->loaded && target->stride == stride && target->bpp == bpp && address >= target->address &&
+        if ((target->loaded || target->dirty || target->readback_pending) &&
+            target->stride == stride && target->bpp == bpp && address >= target->address &&
             address < static_cast<UINT64>(target->address) + target->guest_bytes())
             return true;
     return false;
 }
-GpuReport report() { return stats; }
+GpuReport report() {
+    auto value = stats;
+    if (state) {
+        value.racing = state->racing;
+        value.display_timing_supported = state->display_timing && vkGetPastPresentationTimingGOOGLE;
+        value.present_requests = state->metrics.requests();
+        value.displayed_frames = state->metrics.displays();
+        value.direct_image_presents = state->metrics.direct_images();
+        value.snapshot_image_bytes = state->metrics.image_bytes();
+        value.snapshot_buffer_bytes = state->metrics.buffer_bytes();
+        value.present_convert_dispatches = state->metrics.conversions();
+    }
+    return value;
+}
 std::uint64_t memory_epoch() noexcept { return gpu_publish_epoch; }
 namespace {
 Surface *find_surface(State &s, std::uint32_t framebuffer, std::uint32_t stride, std::uint32_t format,
@@ -4787,7 +5456,8 @@ bool create_swapchain(State &s) {
         info.imageExtent = extent;
     }
     log_line("GE", "Android swapchain " + std::to_string(extent.width) + "x" + std::to_string(extent.height) +
-        " pre_transform=" + std::to_string(info.preTransform));
+        " pre_transform=" + std::to_string(info.preTransform) +
+        " format=" + std::to_string(chosen.format) + " color_space=" + std::to_string(chosen.colorSpace));
 #endif
     info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     info.presentMode = s.present_mode;
@@ -4922,12 +5592,24 @@ void update_present_target(State &s) {
 }
 std::atomic<std::uint64_t> present_gpu_ns{}, present_gpu_frames{};
 std::atomic<std::uint64_t> present_scale_gpu_ns{}, present_scale_gpu_frames{};
+void collect_display_timings(State &s) {
+    if (!s.metrics.enabled() || !s.display_timing || !vkGetPastPresentationTimingGOOGLE || !s.swapchain) return;
+    std::uint32_t count = 0;
+    if (vkGetPastPresentationTimingGOOGLE(s.device, s.swapchain, &count, nullptr) != VK_SUCCESS || !count) return;
+    std::vector<VkPastPresentationTimingGOOGLE> past(count);
+    const auto query = vkGetPastPresentationTimingGOOGLE(s.device, s.swapchain, &count, past.data());
+    if (query == VK_SUCCESS || query == VK_INCOMPLETE)
+        for (std::uint32_t i = 0; i < count; ++i)
+            s.metrics.displayed(past[i].presentID, past[i].actualPresentTime);
+}
 void collect_post_timings(State &s, State::PresentFrame &frame) {
     if (frame.timed_present) {
         UINT64 stamps[2]{};
         if (vkGetQueryPoolResults(s.device, frame.queries, 0, 2, sizeof(stamps), stamps, sizeof(UINT64),
                                   VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && stamps[1] > stamps[0]) {
             const auto elapsed = static_cast<UINT64>((stamps[1] - stamps[0]) * s.timestamp_period);
+            s.metrics.event(frame.origin, "present_gpu", static_cast<UINT64>(stamps[0] * s.timestamp_period),
+                            static_cast<UINT64>(stamps[1] * s.timestamp_period));
             present_gpu_ns += elapsed;
             ++present_gpu_frames;
             present_scale_gpu_ns += elapsed;
@@ -4944,6 +5626,9 @@ void collect_post_timings(State &s, State::PresentFrame &frame) {
         for (UINT i = 0; i < 3; ++i) {
             const auto ns = static_cast<UINT64>((timestamps[i + 1] - timestamps[i]) * s.timestamp_period);
             stats.post_gpu_ns[i] += ns;
+            s.metrics.event(frame.origin, i == 0 ? "post_resolve" : i == 1 ? "post_deband" : "post_color",
+                            static_cast<UINT64>(timestamps[i] * s.timestamp_period),
+                            static_cast<UINT64>(timestamps[i + 1] * s.timestamp_period));
             total += ns;
         }
         present_scale_gpu_ns += total;
@@ -5009,14 +5694,19 @@ void record_present_texture(State &s, State::PresentFrame &frame, View constants
         // The frame's previous present completed before it was reused.
         frame.rgba.reset();
         frame.rgba = make_image(width, height, 1, VK_FORMAT_R8G8B8A8_UNORM);
+        frame.rgba_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         frame.rgba_words = make_buffer(static_cast<UINT64>(width) * height * 4, Memory::Device);
         frame.rgba_width = width;
         frame.rgba_height = height;
     }
+    const UINT64 rgba_bytes = static_cast<UINT64>(width) * height * 4u;
+    if (!frame.rgba_words || frame.rgba_words.size < rgba_bytes)
+        frame.rgba_words = make_buffer(rgba_bytes, Memory::Device);
     VkCommandBuffer cmd = frame.cmd;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.present_convert_pipeline);
     push_compute(s, cmd, constants, {frame.image.buffer, 0}, {frame.rgba_words.buffer, 0});
     vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+    s.metrics.converted();
     VkMemoryBarrier written{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     written.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     written.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -5042,6 +5732,46 @@ void record_present_texture(State &s, State::PresentFrame &frame, View constants
     to_sample.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
                          nullptr, 1, &to_sample);
+    frame.rgba_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+// The GE snapshots the compact color image into a frame-owned image. The
+// presenter cannot observe it until copy_fence signals, and slot reuse waits
+// for its previous presentation fence. No packed-buffer conversion is needed.
+bool record_direct_present_copy(State &s, Surface &color, State::PresentFrame &frame, UINT width, UINT height) {
+    static const bool enabled = !diag_flag("PSPRECOMP_MOTORSTORM_DIRECT_PRESENT_DISABLE");
+    if (!enabled || !present_texture_enabled() || s.antialiasing != 0 || s.post.active() ||
+        select_upscaler(s.scale_settings) != Upscaler::None || color.format != 3u ||
+        !color.hw_color || !color.hw_matches || color.image_newer)
+        return false;
+    const UINT copy_width = raster_extent(width, color.raster_half);
+    const UINT copy_height = raster_extent(height, color.raster_half);
+    if (copy_width > color.raster_stride() || copy_height > color.raster_height()) return false;
+    outside(s);
+    if (!frame.rgba || frame.rgba_width != copy_width || frame.rgba_height != copy_height) {
+        // Superseded snapshots may still have a GE copy in flight.
+        if (frame.rgba) s.transient_images.push_back(std::move(frame.rgba));
+        frame.rgba = make_image(copy_width, copy_height, 1, VK_FORMAT_R8G8B8A8_UNORM);
+        frame.rgba_width = copy_width; frame.rgba_height = copy_height;
+        frame.rgba_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+    transition_image(s, color.hw_color.image, color.hw_color_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                     VK_IMAGE_ASPECT_COLOR_BIT);
+    transition_image(s, frame.rgba.image, frame.rgba_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     VK_IMAGE_ASPECT_COLOR_BIT);
+    VkImageCopy copy{};
+    copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.extent = {copy_width, copy_height, 1};
+    vkCmdCopyImage(s.cmd, color.hw_color.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   frame.rgba.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    transition_image(s, frame.rgba.image, frame.rgba_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_IMAGE_ASPECT_COLOR_BIT);
+    transition_image(s, color.hw_color.image, color.hw_color_layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                     VK_IMAGE_ASPECT_COLOR_BIT);
+    s.metrics.snapshot(true, static_cast<UINT64>(copy_width) * copy_height * 4u);
+    if (frame.image) s.transient.push_back(std::move(frame.image));
+    frame.bytes = 0;
+    wrote(s);
+    return true;
 }
 #endif
 UINT64 present_snapshot(State &s, State::PresentFrame &frame) {
@@ -5105,7 +5835,7 @@ UINT64 present_snapshot(State &s, State::PresentFrame &frame) {
     }
 #if defined(__ANDROID__)
     const bool texture_present = !post && present_texture_enabled();
-    if (texture_present)
+    if (texture_present && !frame.direct_rgba)
         record_present_texture(s, frame, constant_view);
 #endif
     VkImageMemoryBarrier to_target{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -5160,6 +5890,9 @@ UINT64 present_snapshot(State &s, State::PresentFrame &frame) {
         const auto top = s.swap_extent.height - fitted.left - fitted.width;
         fitted.left = fitted.top; fitted.top = top; std::swap(fitted.width, fitted.height);
     }
+    // Use swapchain coordinates after accounting for surface rotation.
+    // Race geometry retains its wider camera; menu art fills the display.
+    fitted = {0, 0, s.swap_extent.width, s.swap_extent.height};
 #endif
     const VkViewport viewport{static_cast<float>(fitted.left), static_cast<float>(fitted.top),
                               static_cast<float>(std::max(1u, fitted.width)),
@@ -5170,7 +5903,8 @@ UINT64 present_snapshot(State &s, State::PresentFrame &frame) {
     vkCmdSetScissor(cmd, 0, 1, &rect);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, post ? s.post_present_pipeline : s.present_pipeline);
     const VkDescriptorBufferInfo buffers[]{{frame.constants.buffer, 0, sizeof(Constants)},
-                                           {post ? frame.post_color.buffer : frame.image.buffer, 0, VK_WHOLE_SIZE}};
+                                           {post ? frame.post_color.buffer : frame.direct_rgba ? s.upload.buffer : frame.image.buffer,
+                                            0, VK_WHOLE_SIZE}};
     const VkWriteDescriptorSet writes[]{buffer_write(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, &buffers[0]),
                                         buffer_write(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &buffers[1])};
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.layout, 0, 2, writes);
@@ -5181,7 +5915,7 @@ UINT64 present_snapshot(State &s, State::PresentFrame &frame) {
         vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.layout, 0, 1, &image_write_set);
     }
     if (!post) {
-        const VkDescriptorBufferInfo depth_info{frame.has_depth ? frame.depth_image.buffer : frame.image.buffer, 0,
+        const VkDescriptorBufferInfo depth_info{frame.has_depth ? frame.depth_image.buffer : frame.direct_rgba ? s.upload.buffer : frame.image.buffer, 0,
                                                 VK_WHOLE_SIZE};
         const VkWriteDescriptorSet depth_write = buffer_write(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &depth_info);
         vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.layout, 0, 1, &depth_write);
@@ -5236,10 +5970,18 @@ UINT64 present_snapshot(State &s, State::PresentFrame &frame) {
     present.swapchainCount = 1;
     present.pSwapchains = &s.swapchain;
     present.pImageIndices = &image;
+    const VkPresentTimeGOOGLE desired{++s.display_present_id, 0};
+    VkPresentTimesInfoGOOGLE timing{VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE};
+    timing.swapchainCount = 1;
+    timing.pTimes = &desired;
+    if (s.display_timing && vkGetPastPresentationTimingGOOGLE) present.pNext = &timing;
     {
         auto lock = queue_lock(s);
         check(vkQueueSubmit(s.present_queue, 1, &submit, VK_NULL_HANDLE), "submit presentation");
         result = vkQueuePresentKHR(s.present_queue, &present);
+        if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)
+            s.metrics.request(desired.presentID, frame.origin);
+        collect_display_timings(s);
     }
     s.acquire_value[slot] = value;
     if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)
@@ -5485,12 +6227,40 @@ void capture_post_frame(State &s, psprecomp::GuestMemory &memory, std::uint32_t 
                        " (depth=" + std::to_string(has_depth) + ")");
 }
 } // namespace
+#if defined(__ANDROID__)
+struct FrameBoundary {
+    State &s;
+    FrameMetrics::Metadata origin;
+    explicit FrameBoundary(State &value) : s(value), origin{value.game_frame_id, guest_time_us(), value.raster_half, value.racing} {}
+    ~FrameBoundary() {
+        if (s.metrics.enabled()) {
+            const auto now = perf::now_ns();
+            s.metrics.event(origin, "frame", s.previous_frame_ns, now);
+            s.previous_frame_ns = now;
+            timespec clock{}; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &clock);
+            const UINT64 guest_cpu = static_cast<UINT64>(clock.tv_sec) * 1000000000ull + clock.tv_nsec;
+            const UINT64 ge_cpu = ge_worker_cpu_time_ns();
+            s.metrics.event(origin, "cpu_guest", 0, guest_cpu - s.previous_guest_cpu_ns);
+            s.metrics.event(origin, "cpu_ge", 0, ge_cpu - s.previous_ge_cpu_ns);
+            const auto &timers = perf::ticks();
+            s.metrics.event(origin, "prepare_wall", 0, timers[perf::kGpuPrepare] - s.previous_prepare_ns);
+            s.metrics.event(origin, "record_wall", 0, timers[perf::kGpuRecord] - s.previous_record_ns);
+            s.previous_guest_cpu_ns = guest_cpu; s.previous_ge_cpu_ns = ge_cpu;
+            s.previous_prepare_ns = timers[perf::kGpuPrepare]; s.previous_record_ns = timers[perf::kGpuRecord];
+        }
+        ++s.game_frame_id;
+    }
+};
+#endif
 bool present(psprecomp::GuestMemory &memory, void *window, std::uint32_t framebuffer, std::uint32_t stride,
              std::uint32_t format, std::uint32_t width, std::uint32_t height) {
     if (!state || !window || !width || !height)
         return false;
     perf::Scope present_profile(perf::kPresent);
     auto &s = *state;
+#if defined(__ANDROID__)
+    FrameBoundary frame_boundary(s);
+#endif
     Surface *color = find_surface(s, framebuffer, stride, format, height);
 #if defined(__ANDROID__)
     // Movies/software display frames can use a framebuffer never drawn by GE.
@@ -5561,10 +6331,29 @@ bool present(psprecomp::GuestMemory &memory, void *window, std::uint32_t framebu
         s.present_frames[index].state = State::FrameState::Writing;
     }
     State::PresentFrame &frame = s.present_frames[index];
-    begin(s, kPresentSlot);
+    // PSPRECOMP_MOTORSTORM_PRESENT_SLOTS=1 keeps the single present slot.
+    static const UINT present_slots = [] {
+        const char *text = std::getenv("PSPRECOMP_MOTORSTORM_PRESENT_SLOTS");
+        const unsigned long parsed = text ? std::strtoul(text, nullptr, 0) : kPresentSlots;
+        return static_cast<UINT>(std::clamp<unsigned long>(parsed, 1ul, kPresentSlots));
+    }();
+    begin(s, kPresentSlot + s.present_rotation++ % present_slots);
     if (!current_on_gpu)
         load_surface(s, *color, memory);
     const UINT64 bytes = color->bytes();
+#if defined(__ANDROID__)
+    frame.direct_rgba = record_direct_present_copy(s, *color, frame, width, height);
+    if (!frame.direct_rgba) {
+        // A superseded direct image may still be receiving its previous GE
+        // copy. Retire it on this queue before the fallback presenter resizes.
+        const UINT rgba_width = raster_extent(width, color->raster_half);
+        const UINT rgba_height = raster_extent(height, color->raster_half);
+        if (frame.rgba && (frame.rgba_width != rgba_width || frame.rgba_height != rgba_height)) {
+            s.transient_images.push_back(std::move(frame.rgba));
+            frame.rgba_width = frame.rgba_height = 0;
+            frame.rgba_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        }
+#endif
     if (!frame.image || frame.bytes < bytes) {
         // A superseded snapshot copy into the old buffer may still be queued:
         // retire it with the GE fence instead of destroying it now.
@@ -5576,9 +6365,18 @@ bool present(psprecomp::GuestMemory &memory, void *window, std::uint32_t framebu
     sync_buffer(s, *color);
     outside(s);
     copy_buffer(s, frame.image.buffer, 0, color->image.buffer, 0, bytes);
+    s.metrics.snapshot(false, bytes);
     wrote(s);
+#if defined(__ANDROID__)
+    }
+#endif
     frame.has_depth = false;
-    const bool sgsr_needs_depth = select_upscaler(s.scale_settings) == Upscaler::Sgsr1Spatial && s.antialiasing != 1;
+    const bool sgsr_needs_depth =
+#if defined(__ANDROID__)
+        select_upscaler(s.scale_settings) == Upscaler::Sgsr1Spatial && s.antialiasing != 1;
+#else
+        false;
+#endif
     if (s.racing && (s.post.needs_depth() || sgsr_needs_depth))
         if (Surface *depth = find_depth_surface(s, *color)) {
             const UINT64 depth_bytes = static_cast<UINT64>(width) * s.output_scale * height * s.output_scale * 4;
@@ -5601,6 +6399,10 @@ bool present(psprecomp::GuestMemory &memory, void *window, std::uint32_t framebu
     frame.racing = s.racing;
     frame.aspect_scale = color->aspect_scale;
     frame.raster_half = color->raster_half;
+#if defined(__ANDROID__)
+    frame.origin = frame_boundary.origin;
+    frame.origin.raster_half = color->raster_half;
+#endif
     {
         std::lock_guard lock(s.present_mutex);
         if (s.ready_frame >= 0 && s.ready_frame != index) {
@@ -5649,8 +6451,13 @@ bool present(psprecomp::GuestMemory &memory, void *window, std::uint32_t framebu
         }
         // Full resolution outside gameplay (menus, pause, loading, movies);
         // GPU-time driven resolution only while racing.
+        static std::uint64_t previous_present_ns{};
+        const auto present_ns = perf::now_ns();
+        const double frame_ms =
+            previous_present_ns ? static_cast<double>(present_ns - previous_present_ns) / 1.0e6 : -1.0;
+        previous_present_ns = present_ns;
         const UINT next = s.dynamic_resolution.update(s.base_raster_half, s.raster_half, s.racing, frame_gpu_ms,
-                                                      s.scale_settings, s.thermal_status);
+                                                      s.scale_settings, s.thermal_status, frame_ms);
         if (next != s.raster_half) {
             log_line("GE", "render scale " + std::to_string(s.raster_half) + "/" + std::to_string(s.base_raster_half) +
                                " -> " + std::to_string(next) + "/" + std::to_string(s.base_raster_half) +
@@ -5677,6 +6484,22 @@ bool present(psprecomp::GuestMemory &memory, void *window, std::uint32_t framebu
         line += " passes=" + std::to_string(pass_begins) + " loads=" + std::to_string(attachment_loads) +
                 " syncs=" + std::to_string(buffer_syncs) + " draws=" + std::to_string(draw_calls) +
                 " snap_copy=" + std::to_string(snapshot_copies) + " snap_reuse=" + std::to_string(snapshot_reuses);
+#if defined(__ANDROID__)
+        static GpuReport prev_periodic_stats{};
+        const auto d_fast = stats.draws_ps_fast - prev_periodic_stats.draws_ps_fast;
+        const auto d_fast_a = stats.draws_ps_fast_alpha - prev_periodic_stats.draws_ps_fast_alpha;
+        const auto d_ord = stats.draws_ps_ordered - prev_periodic_stats.draws_ps_ordered;
+        const auto d_h2o = stats.switches_hw_to_ordered - prev_periodic_stats.switches_hw_to_ordered;
+        const auto d_o2h = stats.switches_ordered_to_hw - prev_periodic_stats.switches_ordered_to_hw;
+        const auto d_ends = stats.render_pass_endings - prev_periodic_stats.render_pass_endings;
+        const auto d_pk_c = stats.pack_color_dispatches - prev_periodic_stats.pack_color_dispatches;
+        const auto d_pk_d = stats.pack_depth_dispatches - prev_periodic_stats.pack_depth_dispatches;
+        prev_periodic_stats = stats;
+        line += " fast=" + std::to_string(d_fast) + " fast_a=" + std::to_string(d_fast_a) +
+                " ord=" + std::to_string(d_ord) + " h2o=" + std::to_string(d_h2o) +
+                " o2h=" + std::to_string(d_o2h) + " ends=" + std::to_string(d_ends) +
+                " pk_c=" + std::to_string(d_pk_c) + " pk_d=" + std::to_string(d_pk_d);
+#endif
         snapshot_copies = snapshot_reuses = 0;
         pass_begins = attachment_loads = buffer_syncs = draw_calls = 0;
         line += " prepass_ms/f=" + std::to_string(prepass_gpu_ms / 150.0);
@@ -5692,6 +6515,19 @@ bool present(psprecomp::GuestMemory &memory, void *window, std::uint32_t framebu
                       << ((top[i].second >> 4) & 0xFu) << "/eq" << ((top[i].second >> 8) & 7u) << "=" << top[i].first;
             log_line("GE", "ordered blends/150f:" + modes.str());
             rejected_blends.clear();
+        }
+        if (!rejected_stencils.empty()) {
+            std::vector<std::pair<std::uint64_t, std::uint32_t>> top;
+            for (const auto &[mode, count] : rejected_stencils)
+                top.emplace_back(count, mode);
+            std::sort(top.rbegin(), top.rend());
+            std::ostringstream stencils;
+            for (std::size_t i = 0; i < std::min<std::size_t>(top.size(), 6); ++i)
+                stencils << " fn" << (top[i].second & 7u) << "/sf" << ((top[i].second >> 4) & 7u)
+                         << "/zf" << ((top[i].second >> 8) & 7u) << "/zp" << ((top[i].second >> 12) & 7u)
+                         << "=" << top[i].first;
+            log_line("GE", "ordered stencils/150f:" + stencils.str());
+            rejected_stencils.clear();
         }
         if (pass_stats_enabled() && pass_end_pairs) {
             std::vector<std::pair<std::uint64_t, std::uintptr_t>> top;
