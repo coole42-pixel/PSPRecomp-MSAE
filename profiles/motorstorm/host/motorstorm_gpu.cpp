@@ -1825,7 +1825,8 @@ void gpu_submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<c
         }
         // Full-frame overlays/feedback cover the widened scene too.
         full_screen = (vertices.size() == 6 || (texture && texture->feedback_address)) &&
-                      left <= 0.0f && right >= 480.0f && top <= 0.0f && bottom >= 272.0f;
+                      ((left <= 0.0f && right >= 480.0f && top <= 0.0f && bottom >= 272.0f) ||
+                       is_full_height_strip(left, right, top, bottom));
     }
     // The game copies one display buffer onto the other in 32-pixel strips, as
     // through-mode draws that sample the framebuffer. Those copy picture to

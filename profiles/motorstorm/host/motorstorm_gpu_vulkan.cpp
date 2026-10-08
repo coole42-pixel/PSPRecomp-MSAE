@@ -4115,7 +4115,8 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
         }
         // Screen effects can be triangle strips, tiled sprites or cover the
         // game's 256-row effect region. They are not HUD artwork.
-        full_screen = left <= 0.0f && right >= 480.0f && top <= 0.0f && bottom >= 256.0f;
+        full_screen = (left <= 0.0f && right >= 480.0f && top <= 0.0f && bottom >= 256.0f) ||
+                      is_full_height_strip(left, right, top, bottom);
     }
     if (!draw.hardware_transform && (!texture || texture->feedback_address))
         // Framebuffer effects also use offscreen/downsampled targets outside

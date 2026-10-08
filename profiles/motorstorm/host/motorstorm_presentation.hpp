@@ -22,6 +22,14 @@ inline bool samples_display_picture(std::uint32_t physical_address, std::uint32_
     return physical_address >= 0x04000000u && physical_address < 0x04200000u && stride >= 480u;
 }
 
+// The game also builds full-screen effects out of narrow, picture-tall sprites
+// (32-pixel strips across the 512-pixel row, each 0..296 rows). No single strip
+// spans the picture, but together they do, so a strip must not be squeezed
+// like HUD artwork or the effect only covers the central 16:9 region.
+inline bool is_full_height_strip(float left, float right, float top, float bottom) {
+    return top <= 0.0f && bottom >= 256.0f && left >= 0.0f && right <= 512.0f && right - left >= 16.0f;
+}
+
 // Presentation reverses this compression to retain a centred HUD safe area.
 inline float widescreen_hud_x(float x, float scale) {
     return 240.0f + (x - 240.0f) / scale;
