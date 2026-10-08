@@ -17,6 +17,8 @@ Legend: **VERIFIED** = exercised by an automated test or a real run in this sess
 | **Cross-instance race state** (joiner drives -> its rank flips to 1/2 and the idle host's to 2/2) | **VERIFIED** (one scripted observation) |
 | **PC host <-> OnePlus 12 (Android build, real Wi-Fi) through lobby, vehicle select, waiting room, race start** | **VERIFIED** (one scripted run) |
 | Android launcher UI (Multiplayer dialog, invite generate/copy/share, INTERNET permission) | built, installed and exercised through the same code path; **UI not clicked through by a person** |
+| Windows launcher (`profiles/motorstorm/launcher/windows`, WPF): host/join with one join code shared with Android | built; codec/parser **VERIFIED** (3027 checks, 0 differences vs the Java parser on 2788 inputs); launching through its `GameSession` **VERIFIED** for a host + joiner on one PC (encrypted connect, `peer joined` / `joined group` with nicknames, no menus driven); **UI not clicked through by a person** |
+| Android "Paste join code" / "Share join code" | compiles (javac against android.jar); **APK not rebuilt or run** |
 | Synchronisation correctness over a full race (desync, lap times, collisions, finish) | **UNKNOWN** - only the first minute of a race was observed |
 | Hole punching / relay on real NATs | **UNVERIFIED** (simulated NATs + loopback only) |
 

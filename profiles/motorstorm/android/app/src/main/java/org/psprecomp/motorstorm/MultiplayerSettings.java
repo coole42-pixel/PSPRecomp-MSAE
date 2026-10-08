@@ -61,6 +61,26 @@ final class MultiplayerSettings {
         return null;
     }
 
+    /**
+     * What a host sends to players: the invite plus where to reach this device (the room server if
+     * one is set, else this device's Wi-Fi address and the host port). Same format as the Windows
+     * launcher, so either side can paste the other's code.
+     */
+    static String hostJoinCode(String invite, String server) {
+        String code = normalizeInvite(invite);
+        if (code == null) return null;
+        if (server != null && validAddress(server.trim())) return new JoinCode(code, server.trim(), true).toString();
+        String lan = lanAddress();
+        return new JoinCode(code, lan == null ? null : lan + ":" + DEFAULT_PORT, false).toString();
+    }
+
+    static String inviteMessage(String joinCode) {
+        return "Race me in MotorStorm: Arctic Edge!\nJoin code: " + joinCode + "\n\n"
+            + "Windows: open the launcher > Join a race > paste this message.\n"
+            + "Android: Multiplayer > Paste join code.\n"
+            + "Then in the game: Wreckreation > Multiplayer > Ad-hoc > Join Game.";
+    }
+
     // ------------------------------------------------------------------------------ launch
     /** Null when the saved settings are usable, otherwise a message for the user. */
     static String validate(Context c) {

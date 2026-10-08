@@ -58,6 +58,8 @@ if ! adb pull "$files/$report" "$(host_path "$out/race-benchmark.txt")" > "$out/
 for suffix in frame-times.csv gpu-frame-times.csv; do
     adb pull "$files/${report%.txt}-$suffix" "$(host_path "$out/$suffix")" >/dev/null 2>&1 || true
 done
+# Optional bounded recovery diagnostics; absent during normal performance runs.
+adb pull "$files/$report-draw-state.csv" "$(host_path "$out/draw-state.csv")" >/dev/null 2>&1 || true
 for f in MotorStormAndroid.log audio-capture.wav; do
     adb pull "$files/$f" "$(host_path "$out/$f")" >/dev/null 2>&1 || true
 done

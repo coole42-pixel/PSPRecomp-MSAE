@@ -48,6 +48,15 @@ class BenchmarkAcceptance(unittest.TestCase):
         self.report["name"] = "race-benchmark-old-session"
         self.assertFalse(self.result()["passed"])
 
+    def test_tiny_query_work_is_included(self):
+        for index in range(60):
+            gpu = 1000000000000 + index * 16667000
+            self.rows.append([index + 1, 115000000 + index * 16667, "tiny_query",
+                              gpu + 7000000, gpu + 7500000, 10, 1])
+        result = self.result()
+        self.assertTrue(result["passed"], result)
+        self.assertAlmostEqual(result["gpu_work_ms"]["mean"], 10.5)
+
     def test_scaled_down_frame(self):
         next(row for row in self.rows if row[2] == "frame")[5] = 8
         self.assertFalse(self.result()["passed"])

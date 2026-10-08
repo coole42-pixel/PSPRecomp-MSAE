@@ -124,33 +124,46 @@ public final class LauncherActivity extends Activity {
         LinearLayout options=new LinearLayout(this);options.setOrientation(LinearLayout.VERTICAL);options.setPadding(28,12,28,12);
         ScrollView scroll=new ScrollView(this);scroll.addView(options);
         TextView info=new TextView(this);
-        info.setText("Race friends over the internet or your Wi-Fi in the game's own Ad-hoc mode. One player hosts and shares the invite code; everyone else joins with it. "
+        info.setText("Race friends over the internet or your Wi-Fi in the game's own Ad-hoc mode. One player hosts and taps Share join code; everyone else copies it and taps Paste join code (works with codes from the Windows launcher too). "
             +"Traffic is encrypted with the code, so keep it private. After pressing Play, open Wreckreation > Multiplayer > Adhoc, then Create Game (host) or Join Game.");
         options.addView(info);
+        Button paste=new Button(this);paste.setText("Paste join code");options.addView(paste);
         String[] modeLabels={"Off (single player)","Host a room","Join a room"};
         Spinner mode=settingChoice(options,"Role",modeLabels,java.util.Arrays.asList(MultiplayerSettings.MODES).indexOf(MultiplayerSettings.mode(this)));
         EditText invite=multiplayerField(options,"Invite code","XXXX-XXXX-XXXX-XXXX-XXXX-XX",prefs.getString(MultiplayerSettings.INVITE,""));
         LinearLayout inviteButtons=new LinearLayout(this);inviteButtons.setOrientation(LinearLayout.HORIZONTAL);options.addView(inviteButtons);
         Button fresh=new Button(this);fresh.setText("New code");inviteButtons.addView(fresh);
-        Button copy=new Button(this);copy.setText("Copy");inviteButtons.addView(copy);
-        Button share=new Button(this);share.setText("Share");inviteButtons.addView(share);
-        fresh.setOnClickListener(v -> invite.setText(MultiplayerSettings.generateInvite()));
-        copy.setOnClickListener(v -> {
-            String code=MultiplayerSettings.normalizeInvite(invite.getText().toString());
-            if(code==null){Toast.makeText(this,"Not a valid invite code",Toast.LENGTH_SHORT).show();return;}
-            ((android.content.ClipboardManager)getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(android.content.ClipData.newPlainText("MotorStorm invite",code));
-            Toast.makeText(this,"Invite code copied",Toast.LENGTH_SHORT).show();
-        });
-        share.setOnClickListener(v -> {
-            String code=MultiplayerSettings.normalizeInvite(invite.getText().toString());
-            if(code==null){Toast.makeText(this,"Not a valid invite code",Toast.LENGTH_SHORT).show();return;}
-            Intent send=new Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT,"Join my MotorStorm room: "+code);
-            startActivity(Intent.createChooser(send,"Share invite code"));
-        });
+        Button copy=new Button(this);copy.setText("Copy join code");inviteButtons.addView(copy);
+        Button share=new Button(this);share.setText("Share join code");inviteButtons.addView(share);
         EditText server=multiplayerField(options,"Room server (optional, host:port) - lets players find the host by code and handles NAT",
             "example.com:3478",prefs.getString(MultiplayerSettings.SERVER,""));
         EditText peer=multiplayerField(options,"Host address when joining without a server (ip:port)",
             "192.168.1.20:"+MultiplayerSettings.DEFAULT_PORT,prefs.getString(MultiplayerSettings.PEER,""));
+        // Join codes ("INVITE@ip:port", also made by the Windows launcher) carry everything a joiner needs.
+        paste.setOnClickListener(v -> {
+            android.content.ClipboardManager clip=(android.content.ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
+            CharSequence text=clip.hasPrimaryClip()&&clip.getPrimaryClip().getItemCount()>0?clip.getPrimaryClip().getItemAt(0).coerceToText(this):null;
+            JoinCode code=JoinCode.parse(text==null?null:text.toString());
+            if(code==null){Toast.makeText(this,"No join code on the clipboard",Toast.LENGTH_LONG).show();return;}
+            mode.setSelection(java.util.Arrays.asList(MultiplayerSettings.MODES).indexOf("join"));
+            invite.setText(code.invite);
+            if(code.address!=null&&code.viaRoomServer){server.setText(code.address);}
+            else if(code.address!=null){server.setText("");peer.setText(code.address);}
+            Toast.makeText(this,code.address==null?"Room code pasted - enter the host's address":"Join code pasted - tap Save, then Play",Toast.LENGTH_LONG).show();
+        });
+        fresh.setOnClickListener(v -> invite.setText(MultiplayerSettings.generateInvite()));
+        copy.setOnClickListener(v -> {
+            String code=MultiplayerSettings.hostJoinCode(invite.getText().toString(),server.getText().toString());
+            if(code==null){Toast.makeText(this,"Not a valid invite code",Toast.LENGTH_SHORT).show();return;}
+            ((android.content.ClipboardManager)getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(android.content.ClipData.newPlainText("MotorStorm join code",code));
+            Toast.makeText(this,"Join code copied",Toast.LENGTH_SHORT).show();
+        });
+        share.setOnClickListener(v -> {
+            String code=MultiplayerSettings.hostJoinCode(invite.getText().toString(),server.getText().toString());
+            if(code==null){Toast.makeText(this,"Not a valid invite code",Toast.LENGTH_SHORT).show();return;}
+            Intent send=new Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT,MultiplayerSettings.inviteMessage(code));
+            startActivity(Intent.createChooser(send,"Share join code"));
+        });
         EditText nick=multiplayerField(options,"Your name in the room","Player",prefs.getString(MultiplayerSettings.NICK,""));
         TextView lan=new TextView(this);
         String lanAddress=MultiplayerSettings.lanAddress();

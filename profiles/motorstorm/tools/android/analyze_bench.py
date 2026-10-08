@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import statistics
 
-GPU_EVENTS = {"ge", "vertex", "present_gpu", "post_resolve", "post_deband", "post_color"}
+GPU_EVENTS = {"ge", "vertex", "present_gpu", "post_resolve", "post_deband", "post_color", "tiny_query"}
 
 
 def percentiles(values):
