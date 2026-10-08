@@ -106,6 +106,16 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
                     invalid("must be low, normal, high, ultra, max or a multiplier from 0.5 to 8");
                 config.render_distance = choice;
             }
+            else if (key == "frame_generation") {
+                if (choice != "off" && choice != "zero" && choice != "reallyzero")
+                    invalid("must be off, zero or reallyzero");
+                config.frame_generation = choice;
+            }
+            else if (key == "frame_generation_width") {
+                const auto width = number(1280u, 1920u);
+                if (width != 1280u && width != 1600u && width != 1920u) invalid("must be 1280, 1600 or 1920");
+                config.frame_generation_width = static_cast<std::uint32_t>(width);
+            }
             else if (key == "fps") {
                 if (choice == "original") config.fps = 0u;
                 else if (const auto fps = number(0u, kMaxUnlockedFps); fps != 0u && fps < kMinUnlockedFps)
@@ -218,7 +228,8 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
             {"logging", {"log_file", "trace_imports", "trace_filesystem", "verbose"}},
             {"runtime", {"max_dispatches"}},
             {"graphics", {"resolution", "renderer", "antialiasing", "fps", "dynamic_fps", "vsync",
-                          "texture_filtering", "widescreen", "less_pop_in", "render_distance"}},
+                          "texture_filtering", "widescreen", "less_pop_in", "render_distance",
+                          "frame_generation", "frame_generation_width"}},
             {"window", {"enabled", "fullscreen", "scale", "fullscreen_mode", "fullscreen_refresh"}},
             {"audio", {"enabled", "api"}},
             {"textures", {"dump", "replace", "dump_dir", "replace_dir", "budget_mb"}},
@@ -311,6 +322,8 @@ void apply_native_config(const NativeConfig &config) {
     set_default("PSPRECOMP_MOTORSTORM_WIDESCREEN", config.widescreen);
     set_default("PSPRECOMP_MOTORSTORM_LESS_POP_IN", config.less_pop_in ? "1" : "0");
     set_default("PSPRECOMP_MOTORSTORM_RENDER_DISTANCE", config.render_distance);
+    set_default("PSPRECOMP_MOTORSTORM_FRAMEGEN", config.frame_generation);
+    set_default("PSPRECOMP_MOTORSTORM_FRAMEGEN_WIDTH", std::to_string(config.frame_generation_width));
     set_default("PSPRECOMP_MOTORSTORM_FULLSCREEN_MODE", config.fullscreen_mode);
     set_default("PSPRECOMP_MOTORSTORM_FULLSCREEN_REFRESH", std::to_string(config.fullscreen_refresh));
     set_default("PSPRECOMP_MOTORSTORM_AUDIO_API", config.audio_api);

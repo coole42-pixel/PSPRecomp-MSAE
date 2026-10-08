@@ -25,6 +25,10 @@ struct NativeConfig {
     // (normal = the game's distances; see motorstorm_draw_distance.hpp).
     bool less_pop_in{true};
     std::string render_distance{"normal"};
+    // Android only: ZeroFG frame generation in races (off, zero or reallyzero)
+    // and the width of the picture it works on (1280, 1600 or 1920).
+    std::string frame_generation{"off"};
+    std::uint32_t frame_generation_width{1280};
     std::string fullscreen_mode{"borderless"}, audio_api{"wasapi"};
     std::uint32_t fullscreen_refresh{};  // exclusive fullscreen refresh in Hz, 0 = desktop
     // Texture packs; directories are absolute (relative INI values resolve

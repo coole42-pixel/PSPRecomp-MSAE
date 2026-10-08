@@ -54,6 +54,7 @@ namespace psprecomp { std::uint32_t runtime_watch_register(std::uint32_t index) 
 #include <SDL3/SDL.h>
 #include <adrenotools/driver.h>
 #include <dlfcn.h>
+#include "zerofg/zerofg.h"
 using HMODULE = void *;
 using HWND = SDL_Window *;
 using LONG = int;
@@ -623,6 +624,8 @@ struct Context {
             vkDestroyInstance(instance, nullptr);
         if (library)
             FreeLibrary(library);
+    // ZeroFG needs synchronization2 and extended storage image formats enabled.
+    bool framegen_features{};
     }
 };
 
@@ -641,6 +644,41 @@ struct State {
     UINT64 game_frame_id{1}, previous_prepare_ns{}, previous_record_ns{}, previous_guest_cpu_ns{}, previous_ge_cpu_ns{}, previous_frame_ns{};
     bool display_timing{};
     std::uint32_t display_present_id{};
+#if defined(__ANDROID__)
+// ZeroFG frame generation (see docs/FRAME_GENERATION.md). Race frames are drawn
+// by the present pass into small offscreen "real" images; ZeroFG makes the frame
+// halfway between two of them; the presenter shows R(n-1), then S(n-1, n) half a
+// game frame later, then R(n). Every field is touched by the presenter thread only.
+struct FrameGen {
+    static constexpr UINT kReal = 3, kGenerated = 2, kContexts = 3, kDisplays = 2;
+    std::unique_ptr<zerofg::Interpolator> engine;
+    zerofg::Mode mode{zerofg::Mode::kZero};
+    bool failed{};  // creation or resizing was refused: stay on the normal path
+    bool warned{};
+    UINT width{}, height{};
+    UINT requested_width{1280};
+    Image real[kReal], generated[kGenerated];
+    std::uint64_t real_sequence[kReal]{};
+    UINT64 real_busy[kReal]{}, generated_busy[kGenerated]{}, context_busy[kContexts]{};
+    VkCommandPool display_pool[kDisplays]{};
+    VkCommandBuffer display_cmd[kDisplays]{};
+    Buffer display_constants[kDisplays];
+    UINT64 display_busy[kDisplays]{};
+    UINT next_real{}, next_generated{}, next_context{};
+    // The frame shown next as R(n-1), and the generated frame S(n-1, n) pending.
+    bool have_previous{};
+    UINT previous_real{};
+    std::uint64_t sequence{};
+    bool pending{};
+    UINT pending_generated{};
+    UINT64 pending_ready{};  // present-timeline value after which S may be shown
+    std::chrono::steady_clock::time_point last_arrival{}, pending_deadline{};
+    double interval_ms{33.3};
+    UINT64 real_shown{}, generated_shown{}, generated_skipped{}, generated_late{};
+    std::chrono::steady_clock::time_point report{};
+};
+#endif
+
     VkDevice device{};
     VkQueue queue{}, present_queue{};
     // A family with a single queue shares it between the GE and presenter threads.
@@ -909,6 +947,11 @@ struct State {
         std::vector<char> data(size);
         if (vkGetPipelineCacheData(device, pipeline_cache, &size, data.data()) != VK_SUCCESS)
             return;
+#if defined(__ANDROID__)
+    // Declared after the frames and the context so it is destroyed before them.
+    std::unique_ptr<FrameGen> framegen;
+    UINT framegen_width{1280};
+#endif
         auto temporary = pipeline_cache_file;
         temporary += ".tmp";
         std::FILE *file = std::fopen(temporary.string().c_str(), "wb");
@@ -973,6 +1016,13 @@ struct State {
         if (attachment_pass) vkDestroyRenderPass(device, attachment_pass, nullptr);
         if (hw_pass_load) vkDestroyRenderPass(device, hw_pass_load, nullptr);
         if (hw_pass_clear) vkDestroyRenderPass(device, hw_pass_clear, nullptr);
+#if defined(__ANDROID__)
+        if (framegen) {
+            for (auto pool : framegen->display_pool)
+                if (pool) vkDestroyCommandPool(device, pool, nullptr);
+            framegen->engine.reset();
+        }
+#endif
         if (hw_color_pass_load) vkDestroyRenderPass(device, hw_color_pass_load, nullptr);
         if (hw_color_pass_clear) vkDestroyRenderPass(device, hw_color_pass_clear, nullptr);
         if (programmable_pass) vkDestroyRenderPass(device, programmable_pass, nullptr);
@@ -3667,6 +3717,8 @@ void create_device(State &s) {
         interlock.pNext = &dyn_enable;
         if (ctx.hw_dynamic_blend) {
             dyn3_enable.pNext = &dyn_enable;
+            ctx.framegen_features = core13 && v13.synchronization2 == VK_TRUE &&
+                                    features.features.shaderStorageImageExtendedFormats == VK_TRUE;
             interlock.pNext = &dyn3_enable;
         }
     }
@@ -3741,6 +3793,9 @@ void create_device(State &s) {
     allocator.physicalDevice = ctx.physical;
     allocator.device = ctx.device;
     allocator.instance = ctx.instance;
+#if defined(__ANDROID__)
+    v13.synchronization2 = ctx.framegen_features ? VK_TRUE : VK_FALSE;
+#endif
     allocator.pVulkanFunctions = &functions;
     check(vmaCreateAllocator(&allocator, &ctx.allocator), "create memory allocator");
     g_allocator = ctx.allocator;
@@ -3776,6 +3831,8 @@ std::vector<GpuDecodedTexture> take_decoded() {
             invalidated = true;
         }
         GpuDecodedTexture decoded{copy.key, copy.width, copy.height, {}};
+#else
+    features.features.shaderStorageImageExtendedFormats = ctx.framegen_features ? VK_TRUE : VK_FALSE;
         decoded.rgba.resize(static_cast<std::size_t>(copy.width) * copy.height);
         const auto *source = s.identify_ring.mapped + copy.start % kIdentifyRingBytes;
         for (UINT y = 0; y < copy.height; ++y)
@@ -6290,6 +6347,25 @@ void record_post(State &s, State::PresentFrame &frame, View constants) {
 // buffer (every display pixel decodes buffer words; slow on Adreno).
 bool present_texture_enabled() {
     static const bool value = [] {
+    if (!s.framegen) {
+        // [graphics] frame_generation = off | zero | reallyzero (see docs/FRAME_GENERATION.md).
+        const char *requested = std::getenv("PSPRECOMP_MOTORSTORM_FRAMEGEN");
+        const std::string_view choice = requested ? requested : "off";
+        if (choice == "zero" || choice == "reallyzero") {
+            if (!s.ctx.framegen_features || !s.dynamic_rendering) {
+                log_line("FRAMEGEN", "unavailable: the device lacks synchronization2 or extended storage image formats");
+            } else {
+                s.framegen = std::make_unique<FrameGen>();
+                s.framegen->mode = choice == "zero" ? zerofg::Mode::kZero : zerofg::Mode::kReallyZero;
+                if (const char *width = std::getenv("PSPRECOMP_MOTORSTORM_FRAMEGEN_WIDTH"))
+                    s.framegen_width = static_cast<UINT>(std::clamp<long>(std::strtol(width, nullptr, 10), 1280, 1920));
+                log_line("FRAMEGEN", std::string("requested: ") + std::string(choice) + ", picture " +
+                                         std::to_string(s.framegen_width) + " px wide");
+            }
+        } else if (choice != "off") {
+            log_line("FRAMEGEN", "ignored unknown frame_generation value '" + std::string(choice) + "'");
+        }
+    }
         const char *text = std::getenv("PSPRECOMP_MOTORSTORM_PRESENT_TEXTURE");
         return !(text && std::strcmp(text, "0") == 0);
     }();
@@ -6384,42 +6460,27 @@ bool record_direct_present_copy(State &s, Surface &color, State::PresentFrame &f
     return true;
 }
 #endif
-UINT64 present_snapshot(State &s, State::PresentFrame &frame) {
-    if (!s.swapchain)
-        return 0;
-    const UINT slot = s.acquire_index;
-    s.acquire_index = (slot + 1u) % State::kAcquireSlots;
-    if (s.acquire_value[slot])
-        wait_semaphore(s.device, s.present_timeline, s.acquire_value[slot], "acquire semaphore reuse");
-    UINT image = 0;
-    VkResult result = vkAcquireNextImageKHR(s.device, s.swapchain, 1'000'000'000ull, s.acquire[slot], VK_NULL_HANDLE,
-                                            &image);
-    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
-        s.present_width = s.present_height = 0;  // recreate before the next frame
-        return 0;
-    }
-    if (result == VK_TIMEOUT || result == VK_NOT_READY)
-        return 0;
-#if defined(__ANDROID__)
-    // Android destroys the window surface when the app leaves the screen. The
-    // GE thread rebuilds presentation for the new surface on its next frame.
-    if (result == VK_ERROR_SURFACE_LOST_KHR) {
-        s.surface_lost = true;
-        return 0;
-    }
-#endif
-    check(result, "acquire swapchain image");
-    check(vkResetCommandPool(s.device, frame.pool, 0), "reset present pool");
-    VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    check(vkBeginCommandBuffer(frame.cmd, &begin_info), "begin present commands");
+// Where the present pass draws: a swapchain image, or an offscreen image that
+// shaders read afterwards (frame generation).
+struct PresentTarget {
+    VkImage image{};
+    VkImageView view{};
+    VkExtent2D extent{};
+    VkImageLayout final_layout{VK_IMAGE_LAYOUT_PRESENT_SRC_KHR};
+    UINT transform{};  // surface pre-transform applied by the shader
+    bool swapchain{true};
+    VkFramebuffer framebuffer{};  // render-pass path only
+};
+// Records the post chain and the full-screen present draw of a frame snapshot
+// into frame.cmd (already begun); the caller ends and submits it.
+void record_present_pass(State &s, State::PresentFrame &frame, const PresentTarget &target) {
     VkCommandBuffer cmd = frame.cmd;
     bind_sets(s, cmd);
     Constants constants{};
     constants.surface = {frame.width, frame.height, raster_extent(frame.stride, frame.raster_half), 0};
     constants.mode[0] = frame.format;
 #if defined(__ANDROID__)
-    constants.mode[1] = s.presentation_transform;
+    constants.mode[1] = target.transform;
     const bool sgsr = select_upscaler(s.scale_settings) == Upscaler::Sgsr1Spatial && s.antialiasing != 1;
     constants.mode[2] = sgsr ? 1u : 0u;
     constants.mode[3] = frame.has_depth ? 1u : 0u;
@@ -6454,18 +6515,18 @@ UINT64 present_snapshot(State &s, State::PresentFrame &frame) {
     to_target.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     to_target.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     to_target.srcQueueFamilyIndex = to_target.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_target.image = s.swap_images[image];
+    to_target.image = target.image;
     to_target.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_target);
     VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    attachment.imageView = s.swap_views[image];
+    attachment.imageView = target.view;
     attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     attachment.clearValue.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
     VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
-    rendering.renderArea = {{0, 0}, s.swap_extent};
+    rendering.renderArea = {{0, 0}, target.extent};
     rendering.layerCount = 1;
     rendering.colorAttachmentCount = 1;
     rendering.pColorAttachments = &attachment;
@@ -6475,8 +6536,8 @@ UINT64 present_snapshot(State &s, State::PresentFrame &frame) {
         clear.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
         VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         pass.renderPass = s.swapchain_pass;
-        pass.framebuffer = s.swap_framebuffers[image];
-        pass.renderArea = {{0, 0}, s.swap_extent};
+        pass.framebuffer = target.framebuffer;
+        pass.renderArea = {{0, 0}, target.extent};
         pass.clearValueCount = 1;
         pass.pClearValues = &clear;
         vkCmdBeginRenderPass(cmd, &pass, VK_SUBPASS_CONTENTS_INLINE);
@@ -6485,24 +6546,24 @@ UINT64 present_snapshot(State &s, State::PresentFrame &frame) {
     vkCmdBeginRendering(cmd, &rendering);
     auto fitted = fit_game_presentation(
 #if defined(__ANDROID__)
-        (s.presentation_transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR || s.presentation_transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) ? s.swap_extent.height : s.swap_extent.width,
-        (s.presentation_transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR || s.presentation_transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) ? s.swap_extent.width : s.swap_extent.height,
+        (target.transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR || target.transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) ? target.extent.height : target.extent.width,
+        (target.transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR || target.transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) ? target.extent.width : target.extent.height,
 #else
-        s.swap_extent.width, s.swap_extent.height,
+        target.extent.width, target.extent.height,
 #endif
         frame.width, frame.height,
                                               frame.aspect_scale);
 #if defined(__ANDROID__)
-    if (s.presentation_transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR) {
-        const auto left = s.swap_extent.width - fitted.top - fitted.height;
+    if (target.transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR) {
+        const auto left = target.extent.width - fitted.top - fitted.height;
         fitted.top = fitted.left; fitted.left = left; std::swap(fitted.width, fitted.height);
-    } else if (s.presentation_transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) {
-        const auto top = s.swap_extent.height - fitted.left - fitted.width;
+    } else if (target.transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) {
+        const auto top = target.extent.height - fitted.left - fitted.width;
         fitted.left = fitted.top; fitted.top = top; std::swap(fitted.width, fitted.height);
     }
     // Use swapchain coordinates after accounting for surface rotation.
     // Race geometry retains its wider camera; menu art fills the display.
-    fitted = {0, 0, s.swap_extent.width, s.swap_extent.height};
+    fitted = {0, 0, target.extent.width, target.extent.height};
 #endif
     const VkViewport viewport{static_cast<float>(fitted.left), static_cast<float>(fitted.top),
                               static_cast<float>(std::max(1u, fitted.width)),
@@ -6542,16 +6603,473 @@ UINT64 present_snapshot(State &s, State::PresentFrame &frame) {
     vkCmdEndRendering(cmd);
     VkImageMemoryBarrier to_present = to_target;
     to_present.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    to_present.dstAccessMask = 0;
+    to_present.dstAccessMask = target.swapchain ? 0 : VK_ACCESS_SHADER_READ_BIT;
     to_present.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
-                         0, nullptr, 0, nullptr, 1, &to_present);
+    to_present.newLayout = target.final_layout;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         target.swapchain ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
+                                          : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &to_present);
     if (!post && frame.queries) {
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, frame.queries, 1);
         frame.timed_present = true;
     }
-    check(vkEndCommandBuffer(cmd), "close presentation commands");
+}
+#if defined(__ANDROID__)
+// ---- ZeroFG frame generation -------------------------------------------------
+// Size of the frame generation picture: ZeroFG lays 64 cells across the long
+// side and a multiple of four rows of the same square cells, so the window's
+// aspect picks the row count and the setting picks the cell size (20, 25, 30).
+VkExtent2D framegen_extent(const State &s) {
+    UINT width = s.swap_extent.width, height = s.swap_extent.height;
+    if (s.presentation_transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
+        s.presentation_transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR)
+        std::swap(width, height);
+    const UINT cell = std::clamp(s.framegen_width / 64u, 20u, 30u);
+    const double aspect = height ? static_cast<double>(width) / height : 16.0 / 9.0;
+    UINT rows = (static_cast<UINT>(std::lround(64.0 / aspect)) + 2u) / 4u * 4u;
+    rows = std::clamp(rows, 8u, 64u);
+    return {64u * cell, rows * cell};
+}
+void framegen_release_images(FrameGen &fg) {
+    for (auto &image : fg.real) image.reset();
+    for (auto &image : fg.generated) image.reset();
+    std::fill(std::begin(fg.real_busy), std::end(fg.real_busy), 0);
+    std::fill(std::begin(fg.generated_busy), std::end(fg.generated_busy), 0);
+    std::fill(std::begin(fg.context_busy), std::end(fg.context_busy), 0);
+    fg.have_previous = false;
+    fg.pending = false;
+}
+// Creates the engine and the images for the current window. False: frame
+// generation is not available (the log says why) and the normal path is used.
+bool framegen_prepare(State &s) {
+    FrameGen &fg = *s.framegen;
+    if (fg.failed)
+        return false;
+    const VkExtent2D extent = framegen_extent(s);
+    if (fg.engine && fg.width == extent.width && fg.height == extent.height)
+        return true;
+    wait_present_idle(s);
+    framegen_release_images(fg);
+    const auto fail = [&](const std::string &why) {
+        log_line("FRAMEGEN", "disabled: " + why);
+        fg.engine.reset();
+        framegen_release_images(fg);
+        fg.failed = true;
+        return false;
+    };
+    if (!fg.engine) {
+        zerofg::CreateInfo info;
+        info.vulkan.instance = s.ctx.instance;
+        info.vulkan.physical_device = s.ctx.physical;
+        info.vulkan.device = s.device;
+        info.vulkan.get_instance_proc_addr = vkGetInstanceProcAddr;
+        info.mode = fg.mode;
+        info.backend = zerofg::Backend::kAuto;
+        info.frame_context_count = FrameGen::kContexts;
+        info.capabilities.effective_api_version = s.ctx.properties.apiVersion;
+        info.capabilities.synchronization2_enabled = true;
+        info.capabilities.shader_storage_image_extended_formats_enabled = true;
+        zerofg::Status status = zerofg::Status::kSuccess;
+        fg.engine = zerofg::Interpolator::Create(info, &status);
+        if (!fg.engine)
+            return fail("ZeroFG cannot run on this device (status " + std::to_string(static_cast<int>(status)) + ")");
+    }
+    const auto resized = fg.engine->Resize(extent.width, extent.height, VK_FORMAT_R8G8B8A8_UNORM,
+                                           VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+    if (resized != zerofg::Status::kSuccess)
+        return fail("ZeroFG refused a " + std::to_string(extent.width) + "x" + std::to_string(extent.height) +
+                    " picture (status " + std::to_string(static_cast<int>(resized)) + ")");
+    for (auto &image : fg.real)
+        image = make_image(extent.width, extent.height, 1, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    for (auto &image : fg.generated)
+        image = make_image(extent.width, extent.height, 1, VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_IMAGE_USAGE_STORAGE_BIT);
+    if (!fg.display_pool[0]) {
+        for (UINT i = 0; i < FrameGen::kDisplays; ++i) {
+            VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+            pool.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+            pool.queueFamilyIndex = s.ctx.queue_family;
+            check(vkCreateCommandPool(s.device, &pool, nullptr, &fg.display_pool[i]), "create frame generation pool");
+            VkCommandBufferAllocateInfo allocate_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            allocate_info.commandPool = fg.display_pool[i];
+            allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            allocate_info.commandBufferCount = 1;
+            check(vkAllocateCommandBuffers(s.device, &allocate_info, &fg.display_cmd[i]), "allocate frame generation commands");
+            fg.display_constants[i] = make_buffer(kPresentConstantBytes, Memory::Upload);
+        }
+    }
+    // ZeroFG declares the output as already readable: put the images there once.
+    check(vkResetCommandPool(s.device, fg.display_pool[0], 0), "reset frame generation pool");
+    VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    check(vkBeginCommandBuffer(fg.display_cmd[0], &begin_info), "begin frame generation setup");
+    for (auto &image : fg.generated) {
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = image.image;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(fg.display_cmd[0], VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+                             nullptr, 1, &barrier);
+    }
+    check(vkEndCommandBuffer(fg.display_cmd[0]), "end frame generation setup");
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &fg.display_cmd[0];
+    {
+        auto lock = queue_lock(s);
+        check(vkQueueSubmit(s.present_queue, 1, &submit, VK_NULL_HANDLE), "submit frame generation setup");
+    }
+    wait_present_idle(s);
+    fg.width = extent.width;
+    fg.height = extent.height;
+    log_line("FRAMEGEN", std::string("ready: ") + (fg.mode == zerofg::Mode::kZero ? "Zero" : "ReallyZero") + " at " +
+                             std::to_string(fg.width) + "x" + std::to_string(fg.height));
+    return true;
+}
+// Draws one frame generation image (a real frame or a generated one) over the
+// whole next swapchain image and presents it. Never blocks on the display.
+void framegen_display(State &s, FrameGen &fg, UINT which, VkImageView view, UINT64 ready_value,
+                      const FrameMetrics::Metadata *origin) {
+    if (!s.swapchain)
+        return;
+    const UINT slot = s.acquire_index;
+    s.acquire_index = (slot + 1u) % State::kAcquireSlots;
+    if (s.acquire_value[slot])
+        wait_semaphore(s.device, s.present_timeline, s.acquire_value[slot], "acquire semaphore reuse");
+    UINT image = 0;
+    VkResult result = vkAcquireNextImageKHR(s.device, s.swapchain, 1'000'000'000ull, s.acquire[slot], VK_NULL_HANDLE, &image);
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+        s.present_width = s.present_height = 0;
+        return;
+    }
+    if (result == VK_TIMEOUT || result == VK_NOT_READY)
+        return;
+    if (result == VK_ERROR_SURFACE_LOST_KHR) {
+        s.surface_lost = true;
+        return;
+    }
+    check(result, "acquire swapchain image");
+    if (fg.display_busy[which])
+        wait_semaphore(s.device, s.present_timeline, fg.display_busy[which], "frame generation display reuse");
+    VkCommandBuffer cmd = fg.display_cmd[which];
+    check(vkResetCommandPool(s.device, fg.display_pool[which], 0), "reset frame generation pool");
+    VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    check(vkBeginCommandBuffer(cmd, &begin_info), "begin frame generation display");
+    bind_sets(s, cmd);
+    // The present shader reads the image like a snapshot texture: no sharpening,
+    // no HUD tags, the picture fills the (pre-rotated) swapchain image.
+    Constants constants{};
+    constants.surface = {fg.width, fg.height, fg.width, 0};
+    constants.mode[1] = s.presentation_transform;
+    constants.render = {2u, 1u, 0u, 16u};
+    std::memcpy(fg.display_constants[which].mapped, &constants, sizeof(constants));
+    fg.display_constants[which].flush(sizeof(constants));
+    VkImageMemoryBarrier to_target{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    to_target.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    to_target.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    to_target.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    to_target.srcQueueFamilyIndex = to_target.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_target.image = s.swap_images[image];
+    to_target.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+                         0, nullptr, 0, nullptr, 1, &to_target);
+    VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    attachment.imageView = s.swap_views[image];
+    attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    rendering.renderArea = {{0, 0}, s.swap_extent};
+    rendering.layerCount = 1;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments = &attachment;
+    vkCmdBeginRendering(cmd, &rendering);
+    const VkViewport viewport{0, 0, static_cast<float>(s.swap_extent.width), static_cast<float>(s.swap_extent.height), 0, 1};
+    const VkRect2D rect{{0, 0}, s.swap_extent};
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    vkCmdSetScissor(cmd, 0, 1, &rect);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.present_pipeline);
+    const VkDescriptorBufferInfo buffers[]{{fg.display_constants[which].buffer, 0, sizeof(Constants)},
+                                           {s.upload.buffer, 0, VK_WHOLE_SIZE}};
+    const VkWriteDescriptorSet writes[]{buffer_write(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, &buffers[0]),
+                                        buffer_write(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &buffers[1])};
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.layout, 0, 2, writes);
+    const VkDescriptorImageInfo image_info{VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    const VkWriteDescriptorSet image_write_set = image_write(3, &image_info);
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.layout, 0, 1, &image_write_set);
+    const VkWriteDescriptorSet depth_write = buffer_write(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &buffers[1]);
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.layout, 0, 1, &depth_write);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdEndRendering(cmd);
+    VkImageMemoryBarrier to_present = to_target;
+    to_present.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    to_present.dstAccessMask = 0;
+    to_present.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
+                         nullptr, 0, nullptr, 1, &to_present);
+    check(vkEndCommandBuffer(cmd), "end frame generation display");
+    const VkSemaphore waits[]{s.acquire[slot], s.present_timeline};
+    const UINT64 wait_values[]{0, ready_value};
+    const VkPipelineStageFlags stages[]{VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT};
+    const UINT64 value = ++s.present_value;
+    const VkSemaphore signals[]{s.render_done[image], s.present_timeline};
+    const UINT64 signal_values[]{0, value};
+    VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    timeline.waitSemaphoreValueCount = 2;
+    timeline.pWaitSemaphoreValues = wait_values;
+    timeline.signalSemaphoreValueCount = 2;
+    timeline.pSignalSemaphoreValues = signal_values;
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.pNext = &timeline;
+    submit.waitSemaphoreCount = 2;
+    submit.pWaitSemaphores = waits;
+    submit.pWaitDstStageMask = stages;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    submit.signalSemaphoreCount = 2;
+    submit.pSignalSemaphores = signals;
+    VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    present.waitSemaphoreCount = 1;
+    present.pWaitSemaphores = &s.render_done[image];
+    present.swapchainCount = 1;
+    present.pSwapchains = &s.swapchain;
+    present.pImageIndices = &image;
+    const VkPresentTimeGOOGLE desired{++s.display_present_id, 0};
+    VkPresentTimesInfoGOOGLE timing{VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE};
+    timing.swapchainCount = 1;
+    timing.pTimes = &desired;
+    if (s.display_timing && vkGetPastPresentationTimingGOOGLE) present.pNext = &timing;
+    {
+        auto lock = queue_lock(s);
+        check(vkQueueSubmit(s.present_queue, 1, &submit, VK_NULL_HANDLE), "submit frame generation display");
+        result = vkQueuePresentKHR(s.present_queue, &present);
+        if (origin && (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR))
+            s.metrics.request(desired.presentID, *origin);
+        collect_display_timings(s);
+    }
+    s.acquire_value[slot] = value;
+    fg.display_busy[which] = value;
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)
+        s.present_width = s.present_height = 0;
+    else if (result == VK_ERROR_SURFACE_LOST_KHR)
+        s.surface_lost = true;
+    else
+        check(result, "present");
+}
+void framegen_wait(State &s, UINT64 value) {
+    if (value)
+        wait_semaphore(s.device, s.present_timeline, value, "frame generation image reuse");
+}
+// A race frame with frame generation: show the previous real frame now, draw this
+// one offscreen and generate the frame between the two. The generated frame is
+// shown by presenter_main half a game frame later (framegen_show_generated).
+UINT64 present_snapshot_fg(State &s, State::PresentFrame &frame) {
+    FrameGen &fg = *s.framegen;
+    const auto arrival = std::chrono::steady_clock::now();
+    if (fg.last_arrival.time_since_epoch().count() != 0) {
+        const double elapsed = std::chrono::duration<double, std::milli>(arrival - fg.last_arrival).count();
+        if (elapsed > 4.0 && elapsed < 250.0)
+            fg.interval_ms = fg.interval_ms * 0.8 + elapsed * 0.2;
+    }
+    fg.last_arrival = arrival;
+    fg.pending = false;
+    if (fg.have_previous) {
+        framegen_display(s, fg, 0, fg.real[fg.previous_real].view, fg.real_busy[fg.previous_real], &frame.origin);
+        ++fg.real_shown;
+        // The generated frame sits halfway to the next real frame.
+        fg.pending_deadline = std::chrono::steady_clock::now() +
+                              std::chrono::microseconds(static_cast<long long>(std::max(0.0, fg.interval_ms * 0.5 - 1.0) * 1000.0));
+    }
+    const UINT current = fg.next_real;
+    fg.next_real = (current + 1u) % FrameGen::kReal;
+    const UINT generated = fg.next_generated;
+    const UINT context = fg.next_context;
+    framegen_wait(s, fg.real_busy[current]);
+    framegen_wait(s, fg.generated_busy[generated]);
+    framegen_wait(s, fg.context_busy[context]);
+    check(vkResetCommandPool(s.device, frame.pool, 0), "reset present pool");
+    VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    check(vkBeginCommandBuffer(frame.cmd, &begin_info), "begin present commands");
+    PresentTarget target;
+    target.image = fg.real[current].image;
+    target.view = fg.real[current].view;
+    target.extent = {fg.width, fg.height};
+    target.final_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    target.transform = 0;
+    target.swapchain = false;
+    record_present_pass(s, frame, target);
+    const std::uint64_t sequence = ++fg.sequence;
+    fg.real_sequence[current] = sequence;
+    bool generate = fg.have_previous;
+    if (generate) {
+        const auto wrap = [&](const Image &image, VkFormat format, VkImageUsageFlags usage, std::uint64_t id) {
+            zerofg::Image result;
+            result.image = image.image;
+            result.view = image.view;
+            result.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            result.format = format;
+            result.width = fg.width;
+            result.height = fg.height;
+            result.usage = usage;
+            result.sequence = id;
+            return result;
+        };
+        const VkImageUsageFlags real_usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        const VkImageUsageFlags generated_usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+        const auto status = fg.engine->Interpolate(
+            frame.cmd, context, wrap(fg.real[fg.previous_real], VK_FORMAT_R8G8B8A8_UNORM, real_usage, fg.real_sequence[fg.previous_real]),
+            wrap(fg.real[current], VK_FORMAT_R8G8B8A8_UNORM, real_usage, sequence), 0.5f,
+            wrap(fg.generated[generated], VK_FORMAT_A2B10G10R10_UNORM_PACK32, generated_usage, 0));
+        if (status != zerofg::Status::kSuccess) {
+            if (!fg.warned) {
+                log_line("FRAMEGEN", "Interpolate failed with status " + std::to_string(static_cast<int>(status)) +
+                                         "; showing real frames only");
+                fg.warned = true;
+            }
+            generate = false;
+        } else {
+            VkMemoryBarrier visible{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            visible.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            visible.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(frame.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1,
+                                 &visible, 0, nullptr, 0, nullptr);
+        }
+    }
+    check(vkEndCommandBuffer(frame.cmd), "close presentation commands");
+    const VkSemaphore waits[]{s.timeline};
+    const UINT64 wait_values[]{frame.copy_fence};
+    const VkPipelineStageFlags stages[]{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
+    const UINT64 value = ++s.present_value;
+    const VkSemaphore signals[]{s.present_timeline};
+    VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    timeline.waitSemaphoreValueCount = 1;
+    timeline.pWaitSemaphoreValues = wait_values;
+    timeline.signalSemaphoreValueCount = 1;
+    timeline.pSignalSemaphoreValues = &value;
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.pNext = &timeline;
+    submit.waitSemaphoreCount = 1;
+    submit.pWaitSemaphores = waits;
+    submit.pWaitDstStageMask = stages;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &frame.cmd;
+    submit.signalSemaphoreCount = 1;
+    submit.pSignalSemaphores = signals;
+    {
+        auto lock = queue_lock(s);
+        check(vkQueueSubmit(s.present_queue, 1, &submit, VK_NULL_HANDLE), "submit frame generation");
+    }
+    fg.real_busy[current] = value;
+    if (generate) {
+        fg.generated_busy[generated] = value;
+        fg.context_busy[context] = value;
+        fg.next_generated = (generated + 1u) % FrameGen::kGenerated;
+        fg.next_context = (context + 1u) % FrameGen::kContexts;
+        fg.pending = true;
+        fg.pending_generated = generated;
+        fg.pending_ready = value;
+    }
+    fg.previous_real = current;
+    fg.have_previous = true;
+    return value;
+}
+// Shows the generated frame when its time comes, unless the next real frame is
+// already waiting or the GPU has not finished it: a real frame is never delayed
+// for a generated one.
+void framegen_show_generated(State &s, std::unique_lock<std::mutex> &lock) {
+    FrameGen &fg = *s.framegen;
+    if (!fg.pending)
+        return;
+    fg.pending = false;
+    const bool interrupted = s.present_cv.wait_until(lock, fg.pending_deadline,
+                                                     [&] { return s.ready_frame >= 0 || s.presenter_stop; });
+    if (interrupted) {
+        ++fg.generated_skipped;
+        return;
+    }
+    UINT64 completed = 0;
+    check(vkGetSemaphoreCounterValue(s.device, s.present_timeline, &completed), "read present timeline");
+    if (completed < fg.pending_ready) {
+        ++fg.generated_late;
+        return;
+    }
+    lock.unlock();
+    try {
+        framegen_display(s, fg, 1, fg.generated[fg.pending_generated].view, fg.pending_ready, nullptr);
+        ++fg.generated_shown;
+    } catch (...) {
+        lock.lock();
+        throw;
+    }
+    lock.lock();
+    const auto now = std::chrono::steady_clock::now();
+    if (fg.report.time_since_epoch().count() == 0) fg.report = now;
+    if (now - fg.report >= std::chrono::seconds(5)) {
+        log_line("FRAMEGEN", "real=" + std::to_string(fg.real_shown) + " generated=" + std::to_string(fg.generated_shown) +
+                                 " skipped=" + std::to_string(fg.generated_skipped) + " late=" + std::to_string(fg.generated_late) +
+                                 " interval_ms=" + std::to_string(fg.interval_ms));
+        fg.report = now;
+    }
+}
+#endif
+UINT64 present_snapshot(State &s, State::PresentFrame &frame) {
+    if (!s.swapchain)
+        return 0;
+#if defined(__ANDROID__)
+    if (s.framegen) {
+        if (frame.racing && s.dynamic_rendering && framegen_prepare(s))
+            return present_snapshot_fg(s, frame);
+        // Menus, pause and loading show every frame as it comes.
+        s.framegen->have_previous = false;
+        s.framegen->pending = false;
+    }
+#endif
+    const UINT slot = s.acquire_index;
+    s.acquire_index = (slot + 1u) % State::kAcquireSlots;
+    if (s.acquire_value[slot])
+        wait_semaphore(s.device, s.present_timeline, s.acquire_value[slot], "acquire semaphore reuse");
+    UINT image = 0;
+    VkResult result = vkAcquireNextImageKHR(s.device, s.swapchain, 1'000'000'000ull, s.acquire[slot], VK_NULL_HANDLE,
+                                            &image);
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+        s.present_width = s.present_height = 0;  // recreate before the next frame
+        return 0;
+    }
+    if (result == VK_TIMEOUT || result == VK_NOT_READY)
+        return 0;
+#if defined(__ANDROID__)
+    // Android destroys the window surface when the app leaves the screen. The
+    // GE thread rebuilds presentation for the new surface on its next frame.
+    if (result == VK_ERROR_SURFACE_LOST_KHR) {
+        s.surface_lost = true;
+        return 0;
+    }
+#endif
+    check(result, "acquire swapchain image");
+    check(vkResetCommandPool(s.device, frame.pool, 0), "reset present pool");
+    VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    check(vkBeginCommandBuffer(frame.cmd, &begin_info), "begin present commands");
+    PresentTarget target;
+    target.image = s.swap_images[image];
+    target.view = s.swap_views[image];
+    target.extent = s.swap_extent;
+#if defined(__ANDROID__)
+    target.transform = s.presentation_transform;
+    if (!s.dynamic_rendering)
+        target.framebuffer = s.swap_framebuffers[image];
+#endif
+    record_present_pass(s, frame, target);
+    check(vkEndCommandBuffer(frame.cmd), "close presentation commands");
     // GPU-side waits: the swapchain image and the snapshot copy on the GE queue.
     const VkSemaphore waits[]{s.acquire[slot], s.timeline};
     const UINT64 wait_values[]{0, frame.copy_fence};
@@ -6571,7 +7089,7 @@ UINT64 present_snapshot(State &s, State::PresentFrame &frame) {
     submit.pWaitSemaphores = waits;
     submit.pWaitDstStageMask = stages;
     submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &cmd;
+    submit.pCommandBuffers = &frame.cmd;
     submit.signalSemaphoreCount = 2;
     submit.pSignalSemaphores = signals;
     VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
@@ -6804,10 +7322,27 @@ void capture_post_frame(State &s, psprecomp::GuestMemory &memory, std::uint32_t 
             for (const char *p = text; *p;) {
                 char *end = nullptr;
                 const unsigned long value = std::strtoul(p, &end, 10);
+#if defined(__ANDROID__)
+        if (s.framegen && s.framegen->pending) {
+            try {
+                framegen_show_generated(s, lock);
+            } catch (const std::exception &error) {
+                s.present_failed = true;
+                s.present_error = error.what();
+                log_line("GE", std::string("presenter: ") + error.what());
+            }
+        }
+#endif
                 if (end == p)
                     break;
                 list.push_back(static_cast<unsigned>(value));
                 p = *end == ',' ? end + 1 : end;
+#if defined(__ANDROID__)
+    if (s.framegen) {
+        s.framegen->have_previous = false;
+        s.framegen->pending = false;
+    }
+#endif
             }
         if (list.empty())
             list.push_back(300u);

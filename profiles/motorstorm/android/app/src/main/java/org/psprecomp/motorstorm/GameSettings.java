@@ -29,6 +29,7 @@ final class GameSettings {
             .putString("sgsr_sharpness","2.0").putString("fps","original")
             .putBoolean("dynamic_fps",false).putBoolean("enhanced_filtering",false)
             .putString("render_distance","low").putBoolean("less_pop_in",false)
+            .putString("frame_generation","off").putString("frame_generation_width","1280")
             .putBoolean("effects",false).putBoolean("sharpening",false)
             .putBoolean("color_correction",false).putBoolean("soft_particles",false)
             .putBoolean("rumble",false).putString(LOGGING_MODE,"standard")
@@ -66,7 +67,9 @@ final class GameSettings {
             (benchmark?(benchmarkFps==0?"original":Integer.toString(benchmarkFps)):choice(c,"fps","original",new String[]{"original","60"}))+"\n"+
             "dynamic_fps = "+(!benchmark&&prefs(c).getBoolean("dynamic_fps",false))+"\nvsync = true\nwidescreen = auto\nrender_distance = "+
             (benchmark?"low":choice(c,"render_distance","low",new String[]{"low","normal","high","ultra"}))+
-            "\nless_pop_in = "+(!benchmark&&prefs(c).getBoolean("less_pop_in",false))+"\n"+
+            "\nless_pop_in = "+(!benchmark&&prefs(c).getBoolean("less_pop_in",false))+
+            "\nframe_generation = "+(benchmark?"off":choice(c,"frame_generation","off",new String[]{"off","zero","reallyzero"}))+
+            "\nframe_generation_width = "+choice(c,"frame_generation_width","1280",new String[]{"1280","1600","1920"})+"\n"+
             "[enhancements]\nenabled = "+(!benchmark&&prefs(c).getBoolean("effects",false))+
             "\ncolor_depth = 16\ncolor_correction = "+prefs(c).getBoolean("color_correction",false)+
             "\nsharpening = "+prefs(c).getBoolean("sharpening",false)+

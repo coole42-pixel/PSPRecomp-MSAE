@@ -123,6 +123,10 @@ public final class LauncherActivity extends Activity {
         String[] distanceValues={"low","normal","high","ultra"};
         Spinner distance=settingChoice(options,"Draw distance",new String[]{"Low (default)","Normal","High","Ultra"},settingIndex("render_distance","low",distanceValues));
         CheckBox popIn=settingToggle(options,"Fade distant objects to reduce pop-in","less_pop_in",false);
+        String[] frameGenValues={"off","zero","reallyzero"};
+        Spinner frameGen=settingChoice(options,"Frame generation in races (ZeroFG)",new String[]{"Off (default)","Zero (best image, doubles the frame rate shown)","ReallyZero (faster, for weaker GPUs)"},settingIndex("frame_generation","off",frameGenValues));
+        String[] frameGenWidths={"1280","1600","1920"};
+        Spinner frameGenWidth=settingChoice(options,"Frame generation picture size",new String[]{"1280 px wide (fast, default)","1600 px wide","1920 px wide (sharpest, slowest)"},settingIndex("frame_generation_width","1280",frameGenWidths));
         String[] modeValues={"off","fixed","dynamic"};
         Spinner mode=settingChoice(options,"Render scale",new String[]{"Off (stable resolution, default)","Fixed scale","Dynamic during gameplay"},settingIndex("scale_mode","off",modeValues));
         Spinner fixed=settingChoice(options,"Fixed render scale",new String[]{"50%","60%","70%","75%","80%","90%","100%"},settingIndex("scale","0.75",GameSettings.FIXED_SCALES));
@@ -152,6 +156,8 @@ public final class LauncherActivity extends Activity {
                     .putString("fps",fpsValues[fps.getSelectedItemPosition()]).putBoolean("dynamic_fps",dynamicFps.isChecked())
                     .putBoolean("fxaa",fxaa.isChecked()).putBoolean("enhanced_filtering",filtering.isChecked())
                     .putString("render_distance",distanceValues[distance.getSelectedItemPosition()]).putBoolean("less_pop_in",popIn.isChecked())
+                    .putString("frame_generation",frameGenValues[frameGen.getSelectedItemPosition()])
+                    .putString("frame_generation_width",frameGenWidths[frameGenWidth.getSelectedItemPosition()])
                     .putString("scale_mode",modeValues[mode.getSelectedItemPosition()]).putString("scale",GameSettings.FIXED_SCALES[fixed.getSelectedItemPosition()])
                     .putString("scale_min",minimum).putString("scale_max",maximum).putString("sgsr_sharpness",sharpValues[sharp.getSelectedItemPosition()])
                     .putBoolean("effects",effects.isChecked()).putBoolean("color_correction",color.isChecked())

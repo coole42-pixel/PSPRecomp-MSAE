@@ -68,9 +68,13 @@ Controls: any game controller works and can be plugged in at any time. This incl
 
 `[graphics] less_pop_in = true` (default) makes race props (signs, banners, rocks, fences) fade in and out with distance instead of popping into view. `render_distance` (default `normal`, the game's own distances; `low`, `high`, `ultra`, `max` or a multiplier from 0.5 to 8) sets how far they are drawn. `run.ps1 -RenderDistance max -LessPopIn on` overrides both. See [less pop-in, render distance and 8x resolution](docs/DRAW_DISTANCE.md) for the reverse-engineered mechanism and measurements.
 
+**Android frame generation:** `[graphics] frame_generation = off | zero | reallyzero` (and `frame_generation_width = 1280 | 1600 | 1920`) adds a ZeroFG-generated frame between real race frames, showing 30 fps as 60. It is also in the Android settings panel. Usage, latency and troubleshooting: [frame generation](docs/FRAME_GENERATION.md). Windows ignores it.
+
 The vehicle-selection preview is repaired in both renderers. See [preview fix and resolution validation](docs/PREVIEW_RESOLUTION.md).
 
 The race HUD/camera dropout caused by truncated large GE lists is repaired in both renderers. See [the fix and recorded-drive verification](docs/HUD_CAMERA_FIX.md).
+
+The Android crash-recovery pulse uses the compact Vulkan color attachment directly, avoiding repeated full-image conversions between vehicle meshes while preserving the translucent effect. See [the recovery rendering fix and replay checks](docs/RECOVERY_ATTACHMENT_FIX.md).
 
 Zero-byte file reads at soundtrack boundaries no longer reuse a stale byte count and crash. See [the lap-2 crash investigation and 4x sustained-run validation](docs/STREAM_READ_FIX.md).
 
