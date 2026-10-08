@@ -80,6 +80,14 @@ keep up: use `reallyzero`, a smaller picture, or a lower game resolution.
 Code: `FrameGen`, `present_snapshot_fg`, `framegen_display` and
 `framegen_show_generated` in `host/motorstorm_gpu_vulkan.cpp`.
 
+## Needs GPU headroom
+
+Frame generation only helps when the GPU has time to spare. On the Redmi Pad Pro
+(Adreno 710) the game already uses all of it, so generated frames are almost never
+ready in time (0 of 79 at 2x). After a few seconds the presenter logs
+`[FRAMEGEN] disabled: ...` and shows real frames only. On an Adreno 750 phone it
+generated about 98 % of frames. See [frame skipping and audio](FRAME_SKIP_AUDIO.md).
+
 ## Not done yet
 
 - On-device timing comparison with and without it (GPU cost per frame).

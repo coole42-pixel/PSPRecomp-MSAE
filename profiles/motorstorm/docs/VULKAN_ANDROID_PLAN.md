@@ -1,5 +1,10 @@
 # MotorStorm: Vulkan renderer (Windows) and Android build — plan
 
+Android follow-up (2026-10-05): use [the Android runtime and launcher plan](ANDROID_LAUNCHER_PLAN.md)
+for the Redmi Pad Pro target, touch/controllers, ISO import, settings launcher,
+mobile capability gates and corrected implementation details. Historical proposals
+below do not describe the final Windows shader lowering or confirmed Android capabilities.
+
 Status (2026-10-05): phases 2 and 3 are done for Windows. See [the Vulkan
 renderer](VULKAN_RENDERER.md). Its pixel path is tier A (fragment shader interlock),
 and it matches or beats D3D12 on the race benchmark. The renderer was added as a
