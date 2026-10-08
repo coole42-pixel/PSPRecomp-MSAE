@@ -366,7 +366,10 @@ L_08A7B804:
     goto L_08A7B814;
 L_08A7B814:
     { const std::uint32_t dividend = 0u; ctx.lo = 0xFFFFFFFFu; ctx.hi = dividend; }
-    rt.unsupported(0x08A7B818u, 0x0000001Cu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(0u)) * static_cast<std::int64_t>(static_cast<std::int32_t>(0u))); const std::uint64_t result = accumulator + product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
+    // nop
+    // nop
+    goto L_08A7B824;
 L_08A7B824:
     // nop
     // nop

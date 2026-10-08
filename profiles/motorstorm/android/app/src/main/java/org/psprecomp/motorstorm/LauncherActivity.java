@@ -57,6 +57,8 @@ public final class LauncherActivity extends Activity {
         cancel.setOnClickListener(v -> {if(importWorker!=null)importWorker.interrupt();});
         Button settings=new Button(this);settings.setText("Game settings");root.addView(settings);
         settings.setOnClickListener(v -> showSettings());
+        Button multiplayer=new Button(this);multiplayer.setText(multiplayerLabel());root.addView(multiplayer);
+        multiplayer.setOnClickListener(v -> showMultiplayer(multiplayer));
         loggingToggle=new Button(this);
         updateLoggingToggleText(loggingToggle);
         loggingToggle.setOnClickListener(v -> {
@@ -73,6 +75,8 @@ public final class LauncherActivity extends Activity {
         Button play=new Button(this);play.setText("Play");root.addView(play);
         play.setOnClickListener(v -> {
             if(!GameStore.ready(this)){status.setText("Import an ISO and matching decrypted EBOOT first");return;}
+            String multiplayerProblem=MultiplayerSettings.validate(this);
+            if(multiplayerProblem!=null){status.setText(multiplayerProblem);return;}
             startActivity(new Intent(this,GameActivity.class));
         });
         TextView location = new TextView(this);location.setText("Reports: "+new File(getExternalFilesDir(null),"diagnostics"));root.addView(location);
@@ -105,6 +109,72 @@ public final class LauncherActivity extends Activity {
     private CheckBox settingToggle(LinearLayout root,String label,String key,boolean fallback){
         CheckBox box=new CheckBox(this);box.setText(label);box.setChecked(GameSettings.prefs(this).getBoolean(key,fallback));
         root.addView(box);return box;
+    }
+    private String multiplayerLabel(){
+        String mode=MultiplayerSettings.mode(this);
+        return mode.equals("host")?"Multiplayer: hosting a private room":mode.equals("join")?"Multiplayer: joining a private room":"Multiplayer (ad-hoc, private rooms): off";
+    }
+    private EditText multiplayerField(LinearLayout root,String label,String hint,String value){
+        TextView text=new TextView(this);text.setText(label);root.addView(text);
+        EditText field=new EditText(this);field.setHint(hint);field.setText(value);field.setSingleLine(true);root.addView(field);return field;
+    }
+    /** Host or join a private room. In-game, open Wreckreation > Multiplayer > Adhoc, then Create or Join Game. */
+    private void showMultiplayer(Button launcherButton){
+        android.content.SharedPreferences prefs=MultiplayerSettings.prefs(this);
+        LinearLayout options=new LinearLayout(this);options.setOrientation(LinearLayout.VERTICAL);options.setPadding(28,12,28,12);
+        ScrollView scroll=new ScrollView(this);scroll.addView(options);
+        TextView info=new TextView(this);
+        info.setText("Race friends over the internet or your Wi-Fi in the game's own Ad-hoc mode. One player hosts and shares the invite code; everyone else joins with it. "
+            +"Traffic is encrypted with the code, so keep it private. After pressing Play, open Wreckreation > Multiplayer > Adhoc, then Create Game (host) or Join Game.");
+        options.addView(info);
+        String[] modeLabels={"Off (single player)","Host a room","Join a room"};
+        Spinner mode=settingChoice(options,"Role",modeLabels,java.util.Arrays.asList(MultiplayerSettings.MODES).indexOf(MultiplayerSettings.mode(this)));
+        EditText invite=multiplayerField(options,"Invite code","XXXX-XXXX-XXXX-XXXX-XXXX-XX",prefs.getString(MultiplayerSettings.INVITE,""));
+        LinearLayout inviteButtons=new LinearLayout(this);inviteButtons.setOrientation(LinearLayout.HORIZONTAL);options.addView(inviteButtons);
+        Button fresh=new Button(this);fresh.setText("New code");inviteButtons.addView(fresh);
+        Button copy=new Button(this);copy.setText("Copy");inviteButtons.addView(copy);
+        Button share=new Button(this);share.setText("Share");inviteButtons.addView(share);
+        fresh.setOnClickListener(v -> invite.setText(MultiplayerSettings.generateInvite()));
+        copy.setOnClickListener(v -> {
+            String code=MultiplayerSettings.normalizeInvite(invite.getText().toString());
+            if(code==null){Toast.makeText(this,"Not a valid invite code",Toast.LENGTH_SHORT).show();return;}
+            ((android.content.ClipboardManager)getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(android.content.ClipData.newPlainText("MotorStorm invite",code));
+            Toast.makeText(this,"Invite code copied",Toast.LENGTH_SHORT).show();
+        });
+        share.setOnClickListener(v -> {
+            String code=MultiplayerSettings.normalizeInvite(invite.getText().toString());
+            if(code==null){Toast.makeText(this,"Not a valid invite code",Toast.LENGTH_SHORT).show();return;}
+            Intent send=new Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT,"Join my MotorStorm room: "+code);
+            startActivity(Intent.createChooser(send,"Share invite code"));
+        });
+        EditText server=multiplayerField(options,"Room server (optional, host:port) - lets players find the host by code and handles NAT",
+            "example.com:3478",prefs.getString(MultiplayerSettings.SERVER,""));
+        EditText peer=multiplayerField(options,"Host address when joining without a server (ip:port)",
+            "192.168.1.20:"+MultiplayerSettings.DEFAULT_PORT,prefs.getString(MultiplayerSettings.PEER,""));
+        EditText nick=multiplayerField(options,"Your name in the room","Player",prefs.getString(MultiplayerSettings.NICK,""));
+        TextView lan=new TextView(this);
+        String lanAddress=MultiplayerSettings.lanAddress();
+        lan.setText("If you host without a server, tell joiners to use: "+(lanAddress==null?"(no Wi-Fi address found)":lanAddress+":"+MultiplayerSettings.DEFAULT_PORT));
+        options.addView(lan);
+        AlertDialog dialog=new AlertDialog.Builder(this).setTitle("Multiplayer").setView(scroll)
+            .setPositiveButton("Save",null).setNegativeButton("Cancel",null).create();
+        dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+            String selected=MultiplayerSettings.MODES[mode.getSelectedItemPosition()];
+            String code=MultiplayerSettings.normalizeInvite(invite.getText().toString());
+            if(!selected.equals("off")&&code==null&&selected.equals("host")){code=MultiplayerSettings.generateInvite();invite.setText(code);}
+            if(!selected.equals("off")&&code==null){Toast.makeText(this,"Enter the invite code you were given",Toast.LENGTH_LONG).show();return;}
+            String serverText=server.getText().toString().trim(),peerText=peer.getText().toString().trim();
+            if(!serverText.isEmpty()&&!MultiplayerSettings.validAddress(serverText)){Toast.makeText(this,"Room server must look like host:port",Toast.LENGTH_LONG).show();return;}
+            if(selected.equals("join")&&serverText.isEmpty()&&!MultiplayerSettings.validAddress(peerText)){
+                Toast.makeText(this,"Enter a room server or the host's address (ip:port)",Toast.LENGTH_LONG).show();return;
+            }
+            prefs.edit().putString(MultiplayerSettings.MODE,selected).putString(MultiplayerSettings.INVITE,code==null?"":code)
+                .putString(MultiplayerSettings.SERVER,serverText).putString(MultiplayerSettings.PEER,peerText)
+                .putString(MultiplayerSettings.NICK,nick.getText().toString()).apply();
+            launcherButton.setText(multiplayerLabel());
+            dialog.dismiss();
+        }));
+        dialog.show();
     }
     private int settingIndex(String key,String fallback,String[] values){
         return java.util.Arrays.asList(values).indexOf(GameSettings.choice(this,key,fallback,values));

@@ -389,7 +389,8 @@ L_08A5F180:
 L_08A5F198:
     rt.unsupported(0x08A5F198u, 0x6E6F6349u, "vfpu3 not lowered yet"); return;
 L_08A5F1B4:
-    rt.unsupported(0x08A5F1B4u, 0x0000776Fu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(0u) * static_cast<std::uint64_t>(0u); const std::uint64_t result = accumulator - product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
+    goto L_08A5F1B8;
 L_08A5F1B8:
     rt.unsupported(0x08A5F1B8u, 0x6E6F6349u, "vfpu3 not lowered yet"); return;
 L_08A5F1C8:
@@ -464,7 +465,8 @@ L_08A5F320:
 L_08A5F32C:
     rt.unsupported(0x08A5F32Cu, 0x6E6F6349u, "vfpu3 not lowered yet"); return;
 L_08A5F348:
-    rt.unsupported(0x08A5F348u, 0x0000776Fu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(0u) * static_cast<std::uint64_t>(0u); const std::uint64_t result = accumulator - product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
+    goto L_08A5F34C;
 L_08A5F34C:
     rt.unsupported(0x08A5F34Cu, 0x6E6F6349u, "vfpu3 not lowered yet"); return;
 L_08A5F35C:
@@ -680,15 +682,18 @@ L_08A5F8EC:
 L_08A5F8FC:
     ctx.execute_vfpu_vscl_ct<70u, 114u, 105u, 1u>();
     ctx.execute_vfpu_vscl_ct<110u, 100u, 77u, 1u>();
-    rt.unsupported(0x08A5F904u, 0x0000756Eu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(0u)) * static_cast<std::int64_t>(static_cast<std::int32_t>(0u))); const std::uint64_t result = accumulator - product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
+    goto L_08A5F908;
 L_08A5F908:
     ctx.execute_vfpu_compare3(73u, 103u, 110u, 1u, 6u);
     ctx.execute_vfpu_vscl_ct<114u, 101u, 77u, 1u>();
-    rt.unsupported(0x08A5F910u, 0x0000756Eu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(0u)) * static_cast<std::int64_t>(static_cast<std::int32_t>(0u))); const std::uint64_t result = accumulator - product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
+    goto L_08A5F914;
 L_08A5F914:
     ctx.execute_vfpu_vscl_ct<82u, 101u, 99u, 1u>();
     ctx.execute_vfpu_vscl_ct<110u, 116u, 77u, 1u>();
-    rt.unsupported(0x08A5F91Cu, 0x0000756Eu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(0u)) * static_cast<std::int64_t>(static_cast<std::int32_t>(0u))); const std::uint64_t result = accumulator - product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
+    goto L_08A5F920;
 L_08A5F920:
     { float vfpu_s[4]{}, vfpu_t[4]{}, vfpu_d[4]{};
       ctx.read_vfpu_vector_with_source_prefix_ct<101u, 1u, 0u>(vfpu_s);
@@ -760,7 +765,8 @@ L_08A5FA18:
     rt.unsupported(0x08A5FA18u, 0x436D654Du, "unknown not lowered yet"); return;
 L_08A5FA24:
     ctx.execute_vfpu_vscl_ct<116u, 121u, 77u, 1u>();
-    rt.unsupported(0x08A5FA28u, 0x0000756Eu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(0u)) * static_cast<std::int64_t>(static_cast<std::int32_t>(0u))); const std::uint64_t result = accumulator - product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
+    goto L_08A5FA2C;
 L_08A5FA2C:
     ctx.execute_vfpu_vscl_ct<82u, 117u, 108u, 1u>();
     ctx.execute_vfpu_compare3(73u, 110u, 102u, 1u, 6u);

@@ -423,9 +423,11 @@ L_08A69D08:
 L_08A69D10:
     rt.unsupported(0x08A69D14u, 0x52494452u, "control flow in delay slot"); return;
 L_08A69D18:
-    rt.unsupported(0x08A69D18u, 0x0000002Fu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(0u) * static_cast<std::uint64_t>(0u); const std::uint64_t result = accumulator - product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
+    goto L_08A69D1C;
 L_08A69D1C:
-    rt.unsupported(0x08A69D1Cu, 0x0000005Cu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(0u)) * static_cast<std::int64_t>(static_cast<std::int32_t>(0u))); const std::uint64_t result = accumulator + product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
+    goto L_08A69D20;
 L_08A69D20:
     ctx.execute_vfpu_vscl_ct<77u, 97u, 116u, 1u>();
     ctx.execute_vfpu_vcmp_ct<105u, 97u, 1u, 2u>();

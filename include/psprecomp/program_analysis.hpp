@@ -46,6 +46,9 @@ struct ProgramAnalysis {
                                               const GuestMemory &memory,
                                               std::uint32_t load_base,
                                               std::size_t max_instructions_per_function = 131072u,
-                                              const AnalysisProgress &progress = {});
+                                              const AnalysisProgress &progress = {},
+                                              // Function entries the static analysis cannot find (targets
+                                              // of pointers built at run time); each must be executable code.
+                                              const std::vector<std::uint32_t> &extra_seeds = {});
 
 } // namespace psprecomp

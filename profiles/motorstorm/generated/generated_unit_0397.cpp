@@ -1102,7 +1102,15 @@ L_089915F0:
     }
 L_0899160C:
     ctx.lo = aot_gpr[4];
-    rt.unsupported(0x08991610u, 0x00AA001Cu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(aot_gpr[5])) * static_cast<std::int64_t>(static_cast<std::int32_t>(aot_gpr[10]))); const std::uint64_t result = accumulator + product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
+    aot_gpr[2] = (aot_gpr[4] < aot_gpr[3] ? 1u : 0u);
+    { const bool branch_taken = aot_gpr[2] == 0u;
+    aot_gpr[10] = (ctx.lo);
+      if (branch_taken) {
+          goto L_08991648;
+      }
+      goto L_08991620;
+    }
 L_08991620:
     aot_gpr[10] = (aot_gpr[10] << 4u);
     aot_gpr[3] = (aot_gpr[10] + aot_gpr[13]);
@@ -1536,7 +1544,17 @@ L_089919CC:
       goto L_089919E0;
     }
 L_089919E0:
-    rt.unsupported(0x089919E0u, 0x0104001Cu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(aot_gpr[8])) * static_cast<std::int64_t>(static_cast<std::int32_t>(aot_gpr[4]))); const std::uint64_t result = accumulator + product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
+    aot_gpr[2] = (ctx.lo);
+    aot_gpr[2] = (aot_gpr[2] << 4u);
+    aot_gpr[3] = (aot_gpr[7] + aot_gpr[2]);
+    PSPRECOMP_AOT_STORE32(aot_gpr[6] + static_cast<std::uint32_t>(0), aot_gpr[3]);
+    aot_gpr[2] = (PSPRECOMP_AOT_LOAD32(aot_gpr[3] + static_cast<std::uint32_t>(0)));
+    if (aot_gpr[2] == 0u) {
+    aot_gpr[2] = (PSPRECOMP_AOT_LOAD32(aot_gpr[3] + static_cast<std::uint32_t>(8)));
+        goto L_08991A08;
+    }
+    goto L_08991A00;
 L_08991A00:
     jump_target = aot_gpr[31];
     aot_gpr[2] = (0u + 0u);
@@ -1695,7 +1713,23 @@ L_08991B0C:
     aot_gpr[4] = (2217u << 16u);
     aot_gpr[2] = (PSPRECOMP_AOT_LOAD32(aot_gpr[4] + static_cast<std::uint32_t>(15216)));
     aot_gpr[3] = (2217u << 16u);
-    rt.unsupported(0x08991B18u, 0x0242001Cu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(aot_gpr[18])) * static_cast<std::int64_t>(static_cast<std::int32_t>(aot_gpr[2]))); const std::uint64_t result = accumulator + product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
+    aot_gpr[4] = (PSPRECOMP_AOT_LOAD32(aot_gpr[3] + static_cast<std::uint32_t>(15148)));
+    aot_gpr[3] = (ctx.lo);
+    aot_gpr[3] = (aot_gpr[3] << 2u);
+    aot_gpr[3] = (aot_gpr[3] + aot_gpr[4]);
+    aot_gpr[2] = (PSPRECOMP_AOT_LOAD32(aot_gpr[3] + static_cast<std::uint32_t>(0)));
+    aot_gpr[2] = (aot_gpr[2] + static_cast<std::uint32_t>(1));
+    PSPRECOMP_AOT_STORE32(aot_gpr[3] + static_cast<std::uint32_t>(0), aot_gpr[2]);
+    aot_gpr[4] = (PSPRECOMP_AOT_LOAD32(aot_gpr[29] + static_cast<std::uint32_t>(4)));
+    aot_gpr[2] = (PSPRECOMP_AOT_LOAD32(aot_gpr[4] + static_cast<std::uint32_t>(8)));
+    { const bool branch_taken = aot_gpr[2] != 0u;
+    aot_gpr[16] = (aot_gpr[29] + static_cast<std::uint32_t>(16));
+      if (branch_taken) {
+          goto L_08991CAC;
+      }
+      goto L_08991B48;
+    }
 L_08991B48:
     aot_gpr[4] = (PSPRECOMP_AOT_LOAD32(aot_gpr[22] + static_cast<std::uint32_t>(15176)));
     aot_gpr[5] = (aot_gpr[19] + aot_gpr[20]);

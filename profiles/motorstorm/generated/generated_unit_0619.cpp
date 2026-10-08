@@ -363,7 +363,9 @@ LOCAL_DISPATCH:
     }
     }
 L_08A6F000:
-    rt.unsupported(0x08A6F000u, 0x0000676Eu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(0u)) * static_cast<std::int64_t>(static_cast<std::int32_t>(0u))); const std::uint64_t result = accumulator - product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
+    // nop
+    goto L_08A6F008;
 L_08A6F008:
     aot_gpr[15] = (aot_gpr[17] < static_cast<std::uint32_t>(11822) ? 1u : 0u);
     ctx.execute_vfpu_compare3(46u, 47u, 115u, 1u, 6u);
@@ -1363,7 +1365,8 @@ L_08A6FEC4:
     }
     goto L_08A6FECC;
 L_08A6FECC:
-    rt.unsupported(0x08A6FECCu, 0x006E776Fu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(aot_gpr[3]) * static_cast<std::uint64_t>(aot_gpr[14]); const std::uint64_t result = accumulator - product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
+    goto L_08A6FED0;
 L_08A6FED0:
     if (aot_gpr[2] == aot_gpr[31]) {
     ctx.execute_vfpu_vcmp_ct<68u, 76u, 1u, 1u>();
@@ -1400,7 +1403,8 @@ L_08A6FEF8:
     }
     goto L_08A6FF00;
 L_08A6FF00:
-    rt.unsupported(0x08A6FF00u, 0x006E776Fu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(aot_gpr[3]) * static_cast<std::uint64_t>(aot_gpr[14]); const std::uint64_t result = accumulator - product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
+    goto L_08A6FF04;
 L_08A6FF04:
     rt.unsupported(0x08A6FF08u, 0x585F4441u, "control flow in delay slot"); return;
 L_08A6FF0C:

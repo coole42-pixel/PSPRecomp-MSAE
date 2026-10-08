@@ -1,3 +1,4 @@
+#include "motorstorm_net_hle.hpp"
 #include "motorstorm_env.hpp"
 #include "motorstorm_hle.hpp"
 #include "motorstorm_bootstrap.hpp"
@@ -5077,6 +5078,22 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
             }
             log_line("SAVEDATA", line.str());
         });
+    // Opt-in multiplayer (PSPRECOMP_MOTORSTORM_NET): ad-hoc over the encrypted thin-UDP transport.  When it is
+    // off or unusable only a "network init fails" stub is registered (no threads, no sockets).
+    {
+        NetHleHooks hooks;
+        hooks.register_import = [](Runtime &rt, const char *library, std::uint32_t nid, const char *name,
+                                   Runtime::HleFunction function) {
+            register_import(rt, library, nid, name, std::move(function));
+        };
+        hooks.call_guest = [](Runtime &rt, AllegrexContext &ctx, std::uint32_t entry, std::uint32_t a0,
+                              std::uint32_t a1, std::uint32_t a2, const char *name) {
+            notify_guest_function(rt, ctx, entry, a0, a1, name, "net");
+            ctx.gpr[6] = a2; // third handler argument (the registered user argument)
+        };
+        hooks.log = [](const std::string &message) { log_line("NET", message); };
+        install_net_hle(runtime, hooks);
+    }
     hle_line("HLE installation complete: scheduler, filesystem, display/GE/ctrl, savedata, SAS, AudioOutput2");
 }
 
@@ -5085,6 +5102,7 @@ std::uint64_t ge_worker_cpu_time_ns() { return g_ge_thread.cpu_time_ns(); }
 bool frame_rate_unlocked() { return g_frame_rate.unlocked; }
 
 void report_summary() {
+    net_hle_shutdown();
     try {
         g_ge_thread.stop();
     } catch (const std::exception &error) {

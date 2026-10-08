@@ -233,6 +233,26 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
         out << "    { const std::uint64_t product = static_cast<std::uint64_t>(" << reg(d.rs) << ") * static_cast<std::uint64_t>(" << reg(d.rt) << "); "
             << "ctx.lo = static_cast<std::uint32_t>(product); ctx.hi = static_cast<std::uint32_t>(product >> 32u); }\n";
         break;
+    case psprecomp::OpcodeKind::Madd:
+    case psprecomp::OpcodeKind::Msub: {
+        // HI:LO +/-= signed 32x32 product (64-bit wraparound, like the hardware accumulator).
+        const char *op = d.kind == psprecomp::OpcodeKind::Madd ? " + " : " - ";
+        out << "    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; "
+            << "const std::uint64_t product = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(" << reg(d.rs) << ")) * "
+            << "static_cast<std::int64_t>(static_cast<std::int32_t>(" << reg(d.rt) << "))); "
+            << "const std::uint64_t result = accumulator" << op << "product; "
+            << "ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }\n";
+        break;
+    }
+    case psprecomp::OpcodeKind::Maddu:
+    case psprecomp::OpcodeKind::Msubu: {
+        const char *op = d.kind == psprecomp::OpcodeKind::Maddu ? " + " : " - ";
+        out << "    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; "
+            << "const std::uint64_t product = static_cast<std::uint64_t>(" << reg(d.rs) << ") * static_cast<std::uint64_t>(" << reg(d.rt) << "); "
+            << "const std::uint64_t result = accumulator" << op << "product; "
+            << "ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }\n";
+        break;
+    }
     case psprecomp::OpcodeKind::Div:
         // $zero is emitted as a literal 0u.  If it is also the divisor, do not
         // emit a syntactically present / or % expression at all: MSVC diagnoses
@@ -1660,7 +1680,8 @@ int generate_auto(const std::filesystem::path &elf_path,
                   std::uint32_t load_base,
                   std::uint32_t unit_span_bytes,
                   unsigned requested_jobs = 0u,
-                  bool builtin_accessors = false) {
+                  bool builtin_accessors = false,
+                  const std::vector<std::uint32_t> &extra_seeds = {}) {
     const auto total_start = Clock::now();
     auto stage_start = total_start;
     const unsigned jobs = psprecomp::effective_jobs(requested_jobs, std::thread::hardware_concurrency());
@@ -1712,7 +1733,9 @@ int generate_auto(const std::filesystem::path &elf_path,
                 }
                 std::cout << "\n" << std::flush;
             }
-        });
+        }, extra_seeds);
+    if (!extra_seeds.empty())
+        std::cout << "[AUTO] extra function seeds supplied: " << extra_seeds.size() << "\n" << std::flush;
     finish_analysis_stage();
     const double analysis_seconds = seconds_since(analysis_start) - cfg_seconds;
     stage_start = Clock::now();
@@ -2053,6 +2076,7 @@ int main(int argc, char **argv) {
             unsigned jobs = 0u;
             bool have_jobs = false;
             bool builtin_accessors = false;
+            std::vector<std::uint32_t> extra_seeds;
             unsigned positional = 0u;
             for (int i = 4; i < argc; ++i) {
                 const std::string_view arg(argv[i]);
@@ -2062,6 +2086,19 @@ int main(int argc, char **argv) {
                     have_jobs = true;
                 } else if (arg == "--builtin-accessors") {
                     builtin_accessors = true;
+                } else if (arg == "--extra-seeds") {
+                    // Text file: one guest address per line (hex); '#' starts a comment.
+                    if (i + 1 >= argc) throw psprecomp::Error("--extra-seeds requires a file");
+                    std::ifstream seed_file(argv[++i]);
+                    if (!seed_file) throw psprecomp::Error("Cannot open --extra-seeds file");
+                    std::string line;
+                    while (std::getline(seed_file, line)) {
+                        const auto hash = line.find('#');
+                        if (hash != std::string::npos) line.resize(hash);
+                        std::istringstream words(line);
+                        std::string word;
+                        if (words >> word) extra_seeds.push_back(number(word, "extra seed address"));
+                    }
                 } else if (arg.starts_with("--")) {
                     throw psprecomp::Error("Unknown option: " + std::string(arg));
                 } else if (positional == 0u) {
@@ -2075,7 +2112,7 @@ int main(int argc, char **argv) {
                 }
             }
             if (unit_span == 0u || (unit_span & 3u) != 0u) throw psprecomp::Error("unit_span_bytes must be non-zero and 4-byte aligned");
-            return generate_auto(argv[1], argv[3], load_base, unit_span, jobs, builtin_accessors);
+            return generate_auto(argv[1], argv[3], load_base, unit_span, jobs, builtin_accessors, extra_seeds);
         }
         if (argc == 4) return generate_manual(argv[1], argv[2], argv[3]);
         std::cerr << usage;

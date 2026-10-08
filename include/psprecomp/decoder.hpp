@@ -15,6 +15,7 @@ enum class OpcodeKind {
     Beq, Bne, Beql, Bnel, Blez, Bgtz, Blezl, Bgtzl, Bltz, Bgez, Bltzl, Bgezl, Bltzal, Bgezal, Bltzall, Bgezall, J, Jal, Jr, Jalr,
     Mfhi, Mflo, Mthi, Mtlo,
     Mult, Multu, Div, Divu,
+    Madd, Maddu, Msub, Msubu, // Allegrex multiply-accumulate into HI:LO (SPECIAL 0x1C/0x1D/0x2E/0x2F)
     Mfc1, Mtc1, Cfc1, Ctc1,
     AddS, SubS, MulS, DivS, SqrtS, AbsS, MovS, NegS,
     RoundWS, TruncWS, CeilWS, FloorWS, CvtWS, CvtSW, FpuCompare,

@@ -1672,7 +1672,19 @@ L_08998C18:
     aot_gpr[2] = (ctx.hi);
     aot_gpr[7] = (aot_gpr[2] >> 16u);
     ctx.lo = aot_gpr[5];
-    rt.unsupported(0x08998C3Cu, 0x00E4002Eu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(aot_gpr[7])) * static_cast<std::int64_t>(static_cast<std::int32_t>(aot_gpr[4]))); const std::uint64_t result = accumulator - product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
+    aot_gpr[9] = (37u << 16u);
+    aot_gpr[2] = (aot_gpr[9] | 15755u);
+    aot_gpr[8] = (ctx.lo);
+    aot_gpr[5] = (aot_gpr[8] + aot_gpr[10]);
+    aot_gpr[3] = (aot_gpr[3] < aot_gpr[5] ? 1u : 0u);
+    { const bool branch_taken = aot_gpr[3] != 0u;
+    aot_gpr[4] = (aot_gpr[7] + aot_gpr[2]);
+      if (branch_taken) {
+          goto L_08998CEC;
+      }
+      goto L_08998C5C;
+    }
 L_08998C5C:
     aot_gpr[3] = (PSPRECOMP_AOT_LOAD32(aot_gpr[17] + static_cast<std::uint32_t>(60)));
     aot_gpr[2] = (aot_gpr[4] < aot_gpr[3] ? 1u : 0u);

@@ -430,7 +430,7 @@ L_089C4120:
     aot_gpr[6] = (aot_gpr[29] + 0u);
     aot_gpr[31] = (0x089C4138u);
     PSPRECOMP_AOT_STORE8(aot_gpr[29] + static_cast<std::uint32_t>(0), static_cast<std::uint8_t>(0u));
-    if (rt.invoke_chained_direct<&recomp_unit_0447_entry, 447u, 175u, 0x089C3EA4u>(ctx, &aot_mem) && ctx.pc == 0x089C4138u) goto L_089C4138;
+    if (rt.invoke_chained_direct<&recomp_unit_0447_entry, 447u, 190u, 0x089C3EA4u>(ctx, &aot_mem) && ctx.pc == 0x089C4138u) goto L_089C4138;
     return;
 L_089C4138:
     { const bool branch_taken = aot_gpr[2] != 0u;
@@ -536,7 +536,7 @@ L_089C41F0:
     aot_gpr[5] = (aot_gpr[17] + 0u);
     aot_gpr[31] = (0x089C41FCu);
     aot_gpr[6] = (aot_gpr[29] + 0u);
-    if (rt.invoke_chained_direct<&recomp_unit_0447_entry, 447u, 175u, 0x089C3EA4u>(ctx, &aot_mem) && ctx.pc == 0x089C41FCu) goto L_089C41FC;
+    if (rt.invoke_chained_direct<&recomp_unit_0447_entry, 447u, 190u, 0x089C3EA4u>(ctx, &aot_mem) && ctx.pc == 0x089C41FCu) goto L_089C41FC;
     return;
 L_089C41FC:
     { const bool branch_taken = aot_gpr[2] == 0u;

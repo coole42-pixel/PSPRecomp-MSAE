@@ -79,3 +79,17 @@ libavcodec 57 (legacy decode API), so the shared MIT media decoder contains an
 API compatibility branch. Public distribution still needs a reproducible pinned
 FFmpeg build, notices and the required LGPL relinking materials. No PPSSPP core
 or PRX decryption code is compiled into the game.
+
+## Multiplayer (private rooms)
+
+*Multiplayer* in the launcher races friends in the game's own **Ad-hoc** mode over Wi-Fi or the internet, with
+the traffic encrypted by an invite code. One player chooses **Host a room** (a code is generated; copy or share it),
+the others choose **Join a room** and enter it. Add a *room server* (host:port, run `psp_net_rendezvous` anywhere with
+a public UDP port) so players find each other by code and NAT is handled, or - on one Wi-Fi network - enter the host's
+LAN address shown in the dialog (the host's port is 47900). Press Play, then in the game open
+Wreckreation > Multiplayer > Adhoc and choose Create Game (host) or Join Game.
+
+Notes: keep the code private (it is the room's key). With multiplayer off the Adhoc menu simply declines to connect.
+Some phones (observed on a Xiaomi/HyperOS device) block per-app network access by default; if the log says
+`cannot open UDP socket: Connection refused`, enable network access for the app in the system settings.
+Status and limits: [MULTIPLAYER_PLAN.md](../../../MULTIPLAYER_PLAN.md).

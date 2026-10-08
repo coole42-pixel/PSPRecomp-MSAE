@@ -424,7 +424,7 @@ L_08A700C0:
       for (std::uint32_t i = 0; i < 1u; ++i) vfpu_d[i] = vfpu_s[i] * vfpu_t[i];
       ctx.write_vfpu_vector_with_destination_prefix_ct<105u, 1u>(vfpu_d); }
     if (aot_gpr[3] == aot_gpr[18]) {
-    rt.unsupported(0x08A700C8u, 0x0074736Fu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(aot_gpr[3]) * static_cast<std::uint64_t>(aot_gpr[20]); const std::uint64_t result = accumulator - product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
         ctx.pc = 0x08A8BDE0u; (void)rt.invoke_chained_call(ctx, &aot_mem); return;
     }
     goto L_08A700CC;
@@ -856,7 +856,8 @@ L_08A7089C:
 L_08A708AC:
     rt.unsupported(0x08A708ACu, 0x72656469u, "unknown not lowered yet"); return;
 L_08A708E0:
-    rt.unsupported(0x08A708E0u, 0x00000A5Du, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(0u) * static_cast<std::uint64_t>(0u); const std::uint64_t result = accumulator + product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
+    goto L_08A708E4;
 L_08A708E4:
     rt.unsupported(0x08A708E4u, 0x70747448u, "unknown not lowered yet"); return;
 L_08A708FC:
@@ -1064,7 +1065,7 @@ L_08A70C2C:
     rt.unsupported(0x08A70C34u, 0x786D612Eu, "unknown not lowered yet"); return;
 L_08A70C44:
     if (aot_gpr[2] == aot_gpr[20]) {
-    rt.unsupported(0x08A70C48u, 0x002E312Fu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(aot_gpr[1]) * static_cast<std::uint64_t>(aot_gpr[14]); const std::uint64_t result = accumulator - product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
         ctx.pc = 0x08A85D68u; (void)rt.invoke_chained_call(ctx, &aot_mem); return;
     }
     goto L_08A70C4C;

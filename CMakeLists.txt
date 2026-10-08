@@ -100,6 +100,34 @@ else()
     target_compile_options(psprecomp_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 endif()
 
+# Multiplayer transport: thin reliable-UDP layer + deterministic network simulator.
+# Dependency-free and game-agnostic; profiles link it for network HLE.
+add_library(psprecomp_net STATIC
+    src/net/crypto.cpp
+    src/net/transport.cpp
+    src/net/thin_udp.cpp
+    src/net/rendezvous.cpp
+    src/net/adhoc.cpp
+)
+target_include_directories(psprecomp_net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(psprecomp_net PUBLIC Threads::Threads)
+if(WIN32)
+    target_link_libraries(psprecomp_net PUBLIC ws2_32)
+endif()
+if(MSVC)
+    target_compile_options(psprecomp_net PRIVATE /W4 /permissive- /EHsc)
+    target_compile_definitions(psprecomp_net PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(psprecomp_net PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+endif()
+
+add_executable(psp_net_probe tools/net_probe.cpp)
+target_link_libraries(psp_net_probe PRIVATE psprecomp_net)
+add_executable(psp_net_rendezvous tools/net_rendezvous_server.cpp)
+target_link_libraries(psp_net_rendezvous PRIVATE psprecomp_net)
+add_executable(psp_net_bridge tools/net_udp_tcp_bridge.cpp)
+target_link_libraries(psp_net_bridge PRIVATE psprecomp_net)
+
 add_executable(psp_analyze tools/analyzer_main.cpp)
 target_link_libraries(psp_analyze PRIVATE psprecomp_core)
 
@@ -131,6 +159,11 @@ if(PSPRECOMP_BUILD_TESTS)
     target_link_libraries(psprecomp_codegen_tests PRIVATE psprecomp_core)
     add_test(NAME psprecomp_codegen_tests COMMAND psprecomp_codegen_tests)
     set_tests_properties(psprecomp_tests psprecomp_codegen_tests PROPERTIES TIMEOUT 60)
+    add_executable(psprecomp_net_tests tests/net_tests.cpp)
+    target_include_directories(psprecomp_net_tests PRIVATE tests)
+    target_link_libraries(psprecomp_net_tests PRIVATE psprecomp_net)
+    add_test(NAME psprecomp_net_tests COMMAND psprecomp_net_tests)
+    set_tests_properties(psprecomp_net_tests PROPERTIES TIMEOUT 120)
 endif()
 
 if(NOT PSPRECOMP_PROFILE STREQUAL "")

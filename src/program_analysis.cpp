@@ -460,12 +460,14 @@ ProgramAnalysis analyze_program(const Elf32Image &elf,
                                 const GuestMemory &memory,
                                 std::uint32_t load_base,
                                 std::size_t max_instructions_per_function,
-                                const AnalysisProgress &progress) {
+                                const AnalysisProgress &progress,
+                                const std::vector<std::uint32_t> &extra_seeds) {
     ProgramAnalysis program{};
     if (progress) progress("Executable ranges", 0u, 0u);
     program.executable_ranges = executable_ranges_for(elf, load_base);
     if (progress) progress("Executable ranges", program.executable_ranges.size(), program.executable_ranges.size());
     program.seeds = collect_initial_seeds(elf, memory, load_base, program.executable_ranges, progress);
+    for (const auto address : extra_seeds) add_seed(program.seeds, program.executable_ranges, address, "extra_seed");
     if (progress) progress("Functions discovered", program.seeds.size(), program.seeds.size());
     program.functions.reserve(program.seeds.size());
 

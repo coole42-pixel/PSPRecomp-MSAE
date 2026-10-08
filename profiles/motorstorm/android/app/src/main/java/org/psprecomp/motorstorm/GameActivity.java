@@ -136,6 +136,9 @@ public final class GameActivity extends SDLActivity implements InputManager.Inpu
                 args.addAll(java.util.Arrays.asList("--audio-capture",new java.io.File(getExternalFilesDir(null),"audio-capture.wav").getAbsolutePath()));
             if(getIntent().hasExtra("env")&&(getApplicationInfo().flags&android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE)!=0)
                 args.addAll(java.util.Arrays.asList("--env",getIntent().getStringExtra("env")));
+            // Private-room multiplayer (settings validated by the launcher; only PSPRECOMP_MOTORSTORM_NET* is produced).
+            String multiplayerEnv=MultiplayerSettings.envArgument(this);
+            if(multiplayerEnv!=null)args.addAll(java.util.Arrays.asList("--env",multiplayerEnv));
             if(getIntent().hasExtra("present_mode"))
                 args.addAll(java.util.Arrays.asList("--present-mode",getIntent().getStringExtra("present_mode")));
             return args.toArray(new String[0]);

@@ -1252,7 +1252,7 @@ L_089CE7A8:
     aot_gpr[4] = (aot_gpr[16] + 0u);
     aot_gpr[31] = (0x089CE7B4u);
     aot_gpr[5] = (aot_gpr[17] + 0u);
-    if (rt.invoke_chained_direct<&recomp_unit_0447_entry, 447u, 168u, 0x089C3D70u>(ctx, &aot_mem) && ctx.pc == 0x089CE7B4u) goto L_089CE7B4;
+    if (rt.invoke_chained_direct<&recomp_unit_0447_entry, 447u, 183u, 0x089C3D70u>(ctx, &aot_mem) && ctx.pc == 0x089CE7B4u) goto L_089CE7B4;
     return;
 L_089CE7B4:
     { const bool branch_taken = aot_gpr[2] != 0u;
@@ -2196,7 +2196,7 @@ L_089CEF18:
 L_089CEF2C:
     aot_gpr[31] = (0x089CEF34u);
     // nop
-    if (rt.invoke_chained_direct<&recomp_unit_0447_entry, 447u, 168u, 0x089C3D70u>(ctx, &aot_mem) && ctx.pc == 0x089CEF34u) goto L_089CEF34;
+    if (rt.invoke_chained_direct<&recomp_unit_0447_entry, 447u, 183u, 0x089C3D70u>(ctx, &aot_mem) && ctx.pc == 0x089CEF34u) goto L_089CEF34;
     return;
 L_089CEF34:
     aot_gpr[3] = (aot_gpr[2] + 0u);

@@ -1,0 +1,6 @@
+# Function entry points the static analysis cannot discover (they are reached through
+# pointers built at run time).  Pass to the generator with:
+#   psp_recomp EBOOT_DECRYPTED.BIN --auto profiles/motorstorm/generated 0x08804000 4096 \
+#       --builtin-accessors --extra-seeds profiles/motorstorm/config/extra_function_seeds.txt
+# Each line: address, then evidence for it.
+0x089C3ABC   # ad-hoc host after CREATE GAME: runtime stopped with "invalid internal function entry"; real prologue (addiu sp,sp,-64)

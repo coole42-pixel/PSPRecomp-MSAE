@@ -1699,7 +1699,15 @@ L_08992B84:
     aot_gpr[3] = (aot_gpr[3] - aot_gpr[5]);
     aot_gpr[2] = (aot_gpr[2] | 16960u);
     ctx.lo = aot_gpr[3];
-    rt.unsupported(0x08992BA8u, 0x00E2001Cu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(aot_gpr[7])) * static_cast<std::int64_t>(static_cast<std::int32_t>(aot_gpr[2]))); const std::uint64_t result = accumulator + product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
+    aot_gpr[2] = (0u + 0u);
+    aot_gpr[3] = (ctx.lo);
+    jump_target = aot_gpr[31];
+    PSPRECOMP_AOT_STORE32(aot_gpr[6] + static_cast<std::uint32_t>(0), aot_gpr[3]);
+    local_pc = jump_target;
+    if (++local_transfers < 2048u) { entry_id = 0u; goto LOCAL_DISPATCH; }
+    ctx.pc = jump_target;
+    return;
 L_08992BBC:
     // nop
     goto L_08992E8C;

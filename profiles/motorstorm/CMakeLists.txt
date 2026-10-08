@@ -81,6 +81,7 @@ set(MOTORSTORM_HOST_SOURCES
     host/motorstorm_config.cpp
     host/motorstorm_bootstrap.cpp
     host/motorstorm_hle.cpp
+    host/motorstorm_net_hle.cpp
     host/motorstorm_ge.cpp
     host/motorstorm_window.cpp
     host/motorstorm_controller.cpp
@@ -224,7 +225,7 @@ function(motorstorm_target_common target)
     target_include_directories(${target} PRIVATE
         "${MOTORSTORM_PROFILE_DIR}/../vcs/host"
         "${MOTORSTORM_PROFILE_DIR}/../vcs/third_party/ffmpeg/include")
-    target_link_libraries(${target} PRIVATE psprecomp_core winmm avrt d3d12 dxgi dxguid windowscodecs ole32)
+    target_link_libraries(${target} PRIVATE psprecomp_core psprecomp_net winmm avrt d3d12 dxgi dxguid windowscodecs ole32)
     motorstorm_use_shaders(${target})
     foreach(media_library avcodec avformat avutil swresample swscale)
         target_link_libraries(${target} PRIVATE
@@ -326,6 +327,7 @@ if(PSPRECOMP_BUILD_PROFILE_TESTS)
         host/motorstorm_config.cpp
         host/motorstorm_bootstrap.cpp
         host/motorstorm_hle.cpp
+        host/motorstorm_net_hle.cpp
         host/motorstorm_ge.cpp
         ${MOTORSTORM_GPU_SOURCES}
         host/motorstorm_window.cpp
@@ -353,6 +355,12 @@ if(PSPRECOMP_BUILD_PROFILE_TESTS)
         MOTORSTORM_DEBUG_CONFIG="${MOTORSTORM_PROFILE_DIR}/config/MotorStormFullDebug.ini")
     motorstorm_set_runtime_output(motorstorm_config_tests)
     add_test(NAME motorstorm_config_tests COMMAND motorstorm_config_tests)
+    add_executable(motorstorm_net_hle_tests tests/motorstorm_net_hle_tests.cpp host/motorstorm_net_hle.cpp)
+    target_include_directories(motorstorm_net_hle_tests PRIVATE "${MOTORSTORM_PROFILE_DIR}/host")
+    target_link_libraries(motorstorm_net_hle_tests PRIVATE psprecomp_core psprecomp_net)
+    motorstorm_set_runtime_output(motorstorm_net_hle_tests)
+    add_test(NAME motorstorm_net_hle_tests COMMAND motorstorm_net_hle_tests)
+    set_tests_properties(motorstorm_net_hle_tests PROPERTIES TIMEOUT 60)
     add_executable(motorstorm_texture_tests tests/motorstorm_texture_tests.cpp host/motorstorm_textures.cpp)
     target_include_directories(motorstorm_texture_tests PRIVATE "${MOTORSTORM_PROFILE_DIR}/host")
     target_link_libraries(motorstorm_texture_tests PRIVATE windowscodecs ole32)

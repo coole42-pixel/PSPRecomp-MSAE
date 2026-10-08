@@ -1156,6 +1156,16 @@ int main() {
         require(jr.kind == psprecomp::OpcodeKind::Jr && jr.has_delay_slot(), "JR decode failed");
         require(psprecomp::decode_allegrex(0xA6A200B0u).kind == psprecomp::OpcodeKind::Sh, "SH decode failed");
         require(psprecomp::decode_allegrex(0x88C80003u).kind == psprecomp::OpcodeKind::Lwl, "LWL decode failed");
+        // Allegrex multiply-accumulate (SPECIAL 0x1C/0x1D/0x2E/0x2F): the multiplayer lobby's 64-bit math
+        // (e.g. 0x08A449B0 in MotorStorm) used to stop the run as "special? not lowered yet".
+        {
+            const auto madd = psprecomp::decode_allegrex(0x0083001Cu);
+            require(madd.kind == psprecomp::OpcodeKind::Madd && madd.rs == 4u && madd.rt == 3u, "MADD decode failed");
+            require(psprecomp::decode_allegrex(0x0083001Du).kind == psprecomp::OpcodeKind::Maddu, "MADDU decode failed");
+            require(psprecomp::decode_allegrex(0x0083002Eu).kind == psprecomp::OpcodeKind::Msub, "MSUB decode failed");
+            require(psprecomp::decode_allegrex(0x0083002Fu).kind == psprecomp::OpcodeKind::Msubu, "MSUBU decode failed");
+            require(psprecomp::decode_allegrex(0x00830018u).kind == psprecomp::OpcodeKind::Mult, "MULT decode regressed");
+        }
         require(psprecomp::decode_allegrex(0x98C80001u).kind == psprecomp::OpcodeKind::Lwr, "LWR decode failed");
         require(psprecomp::decode_allegrex(0xA8C80003u).kind == psprecomp::OpcodeKind::Swl, "SWL decode failed");
         require(psprecomp::decode_allegrex(0xB8C80000u).kind == psprecomp::OpcodeKind::Swr, "SWR decode failed");

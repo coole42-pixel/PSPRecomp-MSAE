@@ -363,7 +363,7 @@ L_08A5C0A4:
     rt.unsupported(0x08A5C0A4u, 0x0000004Eu, "special? not lowered yet"); return;
 L_08A5C0A8:
     if (aot_gpr[2] == aot_gpr[19]) {
-    rt.unsupported(0x08A5C0ACu, 0x0000005Cu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(0u)) * static_cast<std::int64_t>(static_cast<std::int32_t>(0u))); const std::uint64_t result = accumulator + product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
         (void)rt.invoke_chained_direct<&recomp_unit_0620_entry, 620u, 48u, 0x08A7021Cu>(ctx, &aot_mem); return;
     }
     goto L_08A5C0B0;
@@ -760,7 +760,7 @@ L_08A5CA44:
     rt.unsupported(0x08A5CA44u, 0x72616843u, "unknown not lowered yet"); return;
 L_08A5CA64:
     if (aot_gpr[27] == aot_gpr[7]) {
-    rt.unsupported(0x08A5CA68u, 0x00776F6Eu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(aot_gpr[3])) * static_cast<std::int64_t>(static_cast<std::int32_t>(aot_gpr[23]))); const std::uint64_t result = accumulator - product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
         (void)rt.invoke_chained_direct<&recomp_unit_0628_entry, 628u, 37u, 0x08A7840Cu>(ctx, &aot_mem); return;
     }
     goto L_08A5CA6C;
@@ -1086,7 +1086,7 @@ L_08A5CFC4:
     goto L_08A5CFCC;
 L_08A5CFCC:
     if (aot_gpr[27] == aot_gpr[20]) {
-    rt.unsupported(0x08A5CFD0u, 0x00776F6Eu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(aot_gpr[3])) * static_cast<std::int64_t>(static_cast<std::int32_t>(aot_gpr[23]))); const std::uint64_t result = accumulator - product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
         (void)rt.invoke_chained_direct<&recomp_unit_0625_entry, 625u, 72u, 0x08A75D54u>(ctx, &aot_mem); return;
     }
     goto L_08A5CFD4;

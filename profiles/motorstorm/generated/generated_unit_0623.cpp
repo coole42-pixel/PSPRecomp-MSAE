@@ -454,7 +454,8 @@ L_08A73254:
 L_08A73260:
     rt.unsupported(0x08A73260u, 0x705F7265u, "unknown not lowered yet"); return;
 L_08A73270:
-    rt.unsupported(0x08A73270u, 0x0000676Eu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(0u)) * static_cast<std::int64_t>(static_cast<std::int32_t>(0u))); const std::uint64_t result = accumulator - product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
+    goto L_08A73274;
 L_08A73274:
     rt.unsupported(0x08A73274u, 0x6E6B6E55u, "vfpu3 not lowered yet"); return;
 L_08A73280:
@@ -525,7 +526,8 @@ L_08A734C4:
 L_08A734F4:
     rt.unsupported(0x08A734F4u, 0x6964654Du, "unknown not lowered yet"); return;
 L_08A73524:
-    rt.unsupported(0x08A73524u, 0x0000676Eu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(0u)) * static_cast<std::int64_t>(static_cast<std::int32_t>(0u))); const std::uint64_t result = accumulator - product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
+    goto L_08A73528;
 L_08A73528:
     rt.unsupported(0x08A73528u, 0x6964654Du, "unknown not lowered yet"); return;
 L_08A73548:

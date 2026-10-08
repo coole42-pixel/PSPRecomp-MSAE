@@ -683,7 +683,8 @@ L_08A7A7B4:
 L_08A7A7C0:
     rt.unsupported(0x08A7A7C4u, 0x08A7A658u, "control flow in delay slot"); return;
 L_08A7A7C8:
-    rt.unsupported(0x08A7A7C8u, 0x0000001Cu, "special? not lowered yet"); return;
+    { const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; const std::uint64_t product = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(0u)) * static_cast<std::int64_t>(static_cast<std::int32_t>(0u))); const std::uint64_t result = accumulator + product; ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }
+    goto L_08A7A7CC;
 L_08A7A7CC:
     rt.unsupported(0x08A7A7D0u, 0x08A7A7F0u, "control flow in delay slot"); return;
 L_08A7A7D8:
