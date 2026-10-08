@@ -1,0 +1,22 @@
+#version 460
+// Crop: copies the active rectangle of a physical source image into a tight internal image whose origin is the rectangle's. The host may hand RC3 Residency
+// images larger than the content (a physical allocation extent); RC3 reads the whole picture from (0, 0), so a padded source is cropped first and the
+// engine then runs on the tight copy, bit for bit what it would have read from a tight image. The copy is exact for an A2B10G10R10 source (10-bit and 2-bit
+// unorm values round-trip through float): other source formats are refused by the context, never approximated.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D source_image;
+layout(rgb10_a2, binding = 1) uniform writeonly image2D tight_image;
+
+layout(push_constant) uniform CropPush {
+  ivec2 origin;
+  ivec2 extent;
+} pc;
+
+void main() {
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(p, pc.extent))) {
+    return;
+  }
+  imageStore(tight_image, p, texelFetch(source_image, pc.origin + p, 0));
+}
