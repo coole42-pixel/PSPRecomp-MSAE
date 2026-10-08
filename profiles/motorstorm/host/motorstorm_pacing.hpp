@@ -41,6 +41,36 @@ private:
     std::uint64_t guest_anchor_{}, wall_anchor_{}, previous_guest_{};
 };
 
+// Keeps the guest at real time when drawing is the bottleneck: audio, game
+// logic and input all run in guest time, so a guest that falls behind the wall
+// clock gives slow motion and an audio device that runs dry. When the guest is
+// behind, the draws of the next frame are skipped (its picture is not shown), so
+// the guest catches up; no more than `max_in_row` frames in a row are skipped.
+class FrameSkipGovernor {
+public:
+    explicit FrameSkipGovernor(unsigned max_in_row = 2u) noexcept : max_in_row_(max_in_row) {}
+    // behind_us: how far guest time trails the wall clock (0 when on time or
+    // ahead); frame_us: the duration of one game frame. Returns whether the next
+    // frame's draws are skipped.
+    [[nodiscard]] bool update(std::uint64_t behind_us, std::uint64_t frame_us) noexcept {
+        const bool behind = behind_us * 4u > frame_us;  // more than a quarter frame late
+        if (behind && in_row_ < max_in_row_) {
+            ++in_row_;
+            ++skipped_;
+            return true;
+        }
+        in_row_ = 0u;  // on time, or a frame is drawn after the longest run
+        return false;
+    }
+    [[nodiscard]] std::uint64_t skipped() const noexcept { return skipped_; }
+    void reset() noexcept { in_row_ = 0u; }
+
+private:
+    unsigned max_in_row_;
+    unsigned in_row_{};
+    std::uint64_t skipped_{};
+};
+
 // Let audio build its reserve before adding frame waits. Hysteresis avoids
 // switching pacing on and off at each audio device wake. A loading stall can
 // consume the reserve; refill it before anchoring the display clock again.

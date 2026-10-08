@@ -67,6 +67,10 @@ struct GeListProgress {
 void software_ge_execute_segment(psprecomp::GuestMemory &memory, std::uint32_t address, std::uint32_t stall,
                                  bool rasterize, std::uint64_t submission, GeListProgress &progress,
                                  bool last);
+// While set, the lists the calling thread executes still run every state
+// command but their PRIM draws only advance the vertex/index pointers (frame
+// skipping). Set by the thread that executes the list, before each segment.
+void software_ge_set_skip_draws(bool skip) noexcept;
 
 // Offline texture-pack extraction. Decodes texture bytes through the same
 // texel path the GPU texture cache uses at runtime, so extracted textures get

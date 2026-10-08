@@ -345,7 +345,7 @@ public:
         std::shared_ptr<GeListProgress> progress;
         std::uint32_t list{}, stall{};
         std::uint64_t submission{};
-        bool rasterize{}, last{};
+        bool rasterize{}, last{}, skip_draws{};
     };
     ~GeThread() { stop(); }
     void submit(Runtime &runtime, Segment segment) {
@@ -402,6 +402,7 @@ private:
                 const auto cpu_begin = perf::enabled() ? thread_cpu_ns() : 0u;
 #endif
                 try {
+                    motorstorm::software_ge_set_skip_draws(segment.skip_draws);
                     motorstorm::software_ge_execute_segment(runtime_->memory(), segment.list, segment.stall,
                                                             segment.rasterize, segment.submission,
                                                             *segment.progress, segment.last);
@@ -439,6 +440,9 @@ bool ge_thread_enabled() {
     }();
     return enabled;
 }
+// Frame skipping (see FrameSkipGovernor): whether the lists queued now belong
+// to a frame whose draws are skipped. Written by the guest thread at each flip.
+bool g_skip_draws_now{};
 // Lists are rasterized once a renderer is active (SOFTGE_START_AFTER delays it).
 bool ge_rasterize() {
     static const std::uint64_t start_after = [] {
@@ -458,7 +462,7 @@ void queue_ge_segment(Runtime &runtime, const GeListRecord &record, bool last) {
     if (!record.progress->started)
         update_racing_scene(runtime);
     g_ge_thread.submit(runtime, GeThread::Segment{record.progress, record.list, record.stall, record.submission,
-                                                  ge_rasterize(), last});
+                                                  ge_rasterize(), last, g_skip_draws_now});
 }
 
 // Read-only, profile-gated scene diagnostics. These addresses are observations
@@ -780,6 +784,7 @@ void update_rumble(const Runtime &runtime, std::uint32_t scene) {
     // }
 }
 
+bool g_race_scene{};
 void update_racing_scene(Runtime &runtime) {
     const auto &memory = runtime.memory();
     const auto scene = memory.contains(0x08A76FDCu, 4u) ? memory.load32(0x08A76FDCu) : 0u;
@@ -791,6 +796,7 @@ void update_racing_scene(Runtime &runtime) {
         previous = racing;
     }
     gpu_set_racing(racing);
+    g_race_scene = racing;
     update_widescreen_camera(runtime, racing);
     update_draw_distance(runtime, racing);
     update_rumble(runtime, scene);
@@ -1609,6 +1615,49 @@ bool loading_activity(double seconds) {
     g_pacer.sample_replacements = gpu.replacement_uploads;
     g_pacer.sample_pack_loads = pack.loaded;
     return busy;
+}
+
+// Frame skipping: PSPRECOMP_MOTORSTORM_FRAMESKIP = auto (the Android default) or off.
+FrameSkipGovernor g_skip_governor;
+FramePacer g_skip_clock;
+std::uint64_t g_skip_frames{}, g_skip_total{}, g_skip_report_us{};
+bool frame_skip_enabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("PSPRECOMP_MOTORSTORM_FRAMESKIP");
+#if defined(__ANDROID__)
+        return !(value && (std::strcmp(value, "off") == 0 || std::strcmp(value, "0") == 0));
+#else
+        return value && (std::strcmp(value, "auto") == 0 || std::strcmp(value, "1") == 0);
+#endif
+    }();
+    return enabled;
+}
+// At each flip, before pacing: decide whether the next frame's draws are
+// skipped. Guest time (game logic, audio) must keep up with the wall clock.
+void decide_frame_skip() {
+    if (!frame_skip_enabled()) return;
+    const auto wall = host_time_us();
+    const auto frame_us = g_active_rate.game_fps > 0.0f ? static_cast<std::uint64_t>(1e6f / g_active_rate.game_fps)
+                                                         : 33'367u;
+    if (!g_race_scene || !window_enabled()) {
+        g_skip_clock.reset();
+        g_skip_governor.reset();
+        g_skip_draws_now = false;
+        return;
+    }
+    const auto deadline = g_skip_clock.deadline(g_virtual_time_us, wall);
+    // Credit for running ahead must not hide a later slowdown.
+    if (deadline > wall + 2u * frame_us) g_skip_clock.reset();
+    const std::uint64_t behind = wall > deadline ? wall - deadline : 0u;
+    g_skip_draws_now = g_skip_governor.update(behind, frame_us);
+    ++g_skip_total;
+    if (g_skip_draws_now) ++g_skip_frames;
+    if (g_skip_report_us == 0u) g_skip_report_us = wall;
+    if (wall - g_skip_report_us >= 5'000'000u) {
+        log_line("FRAMESKIP", "skipped " + std::to_string(g_skip_frames) + " of " + std::to_string(g_skip_total) +
+                                  " race frames (guest behind " + std::to_string(behind / 1000u) + " ms)");
+        g_skip_report_us = wall;
+    }
 }
 
 // Called once per displayed frame.
@@ -4068,6 +4117,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
                     interrupts = std::move(record.progress->interrupts);
                 } else {
                     update_racing_scene(rt);
+                    motorstorm::software_ge_set_skip_draws(g_skip_draws_now);
                     interrupts = motorstorm::software_ge_execute_list(rt.memory(), record.list, record.stall,
                                                                       rasterize, record.submission);
                 }
@@ -4210,12 +4260,17 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
                 if (second_fb != 0u && second_fb != dump_fb)
                     write_ppm(second_fb, second_stride, g_display.format, "_disp");
             }
+            // The frame just finished had its draws skipped when the decision
+            // in force while its lists were queued says so: it is not shown.
+            const bool frame_was_skipped = g_skip_draws_now;
+            decide_frame_skip();
             pace_frame(rt.memory());
             // Publish the frame the guest just displayed to the native window.
-            window_present(rt.memory(), g_display.frame_buf,
-                           g_display.stride != 0u ? g_display.stride : 512u, g_display.format,
-                           g_display.width != 0u ? g_display.width : 480u,
-                           g_display.height != 0u ? g_display.height : 272u);
+            if (!frame_was_skipped)
+                window_present(rt.memory(), g_display.frame_buf,
+                               g_display.stride != 0u ? g_display.stride : 512u, g_display.format,
+                               g_display.width != 0u ? g_display.width : 480u,
+                               g_display.height != 0u ? g_display.height : 272u);
             // Optional race benchmark: close the guest-time window and stop.
             const auto bench_audio = perf::bench_window().enabled ? audio_report() : AudioReport{};
             if (perf::bench_frame(g_virtual_time_us, g_display.set_frame_buf_count,

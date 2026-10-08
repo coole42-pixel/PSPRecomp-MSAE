@@ -123,6 +123,7 @@ public final class LauncherActivity extends Activity {
         String[] distanceValues={"low","normal","high","ultra"};
         Spinner distance=settingChoice(options,"Draw distance",new String[]{"Low (default)","Normal","High","Ultra"},settingIndex("render_distance","low",distanceValues));
         CheckBox popIn=settingToggle(options,"Fade distant objects to reduce pop-in","less_pop_in",false);
+        CheckBox frameSkip=settingToggle(options,"Skip race frames when the game falls behind (keeps speed and sound steady)","frame_skip",true);
         String[] frameGenValues={"off","zero","reallyzero"};
         Spinner frameGen=settingChoice(options,"Frame generation in races (ZeroFG)",new String[]{"Off (default)","Zero (best image, doubles the frame rate shown)","ReallyZero (faster, for weaker GPUs)"},settingIndex("frame_generation","off",frameGenValues));
         String[] frameGenWidths={"1280","1600","1920"};
@@ -156,6 +157,7 @@ public final class LauncherActivity extends Activity {
                     .putString("fps",fpsValues[fps.getSelectedItemPosition()]).putBoolean("dynamic_fps",dynamicFps.isChecked())
                     .putBoolean("fxaa",fxaa.isChecked()).putBoolean("enhanced_filtering",filtering.isChecked())
                     .putString("render_distance",distanceValues[distance.getSelectedItemPosition()]).putBoolean("less_pop_in",popIn.isChecked())
+                    .putBoolean("frame_skip",frameSkip.isChecked())
                     .putString("frame_generation",frameGenValues[frameGen.getSelectedItemPosition()])
                     .putString("frame_generation_width",frameGenWidths[frameGenWidth.getSelectedItemPosition()])
                     .putString("scale_mode",modeValues[mode.getSelectedItemPosition()]).putString("scale",GameSettings.FIXED_SCALES[fixed.getSelectedItemPosition()])

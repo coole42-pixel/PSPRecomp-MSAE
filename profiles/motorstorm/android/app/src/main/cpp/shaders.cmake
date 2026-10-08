@@ -96,4 +96,13 @@ foreach(shader IN ITEMS VSFast:VSFast:vs_6_0:flip PointVSFast:PointVSFast:vs_6_0
         DEPENDS "${MOTORSTORM_PROFILE}/host/motorstorm_gpu.hlsl" VERBATIM)
     list(APPEND SHADER_HEADERS "${header}")
 endforeach()
+set(recovery "${SHADER_DIR}/motorstorm_spirv_PSRecovery.h")
+add_custom_command(OUTPUT "${recovery}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_DIR}"
+    COMMAND "${MOTORSTORM_DXC}" -nologo -spirv -HV 2018 -fspv-target-env=vulkan1.1 -O3
+        -DMOTORSTORM_VK_HARDWARE=1 -DMOTORSTORM_VK_RECOVERY=1 -fvk-use-dx-position-w
+        -T ps_6_0 -E PSRecovery -Vn g_motorstorm_spirv_PSRecovery -Fh "${recovery}"
+        "${MOTORSTORM_PROFILE}/host/motorstorm_gpu.hlsl"
+    DEPENDS "${MOTORSTORM_PROFILE}/host/motorstorm_gpu.hlsl" VERBATIM)
+list(APPEND SHADER_HEADERS "${recovery}")
 add_custom_target(motorstorm_mobile_shaders DEPENDS ${SHADER_HEADERS})

@@ -24,7 +24,15 @@
 #define VK_BIND(slot, group) [[vk::binding(slot, group)]]
 #define VK_COHERENT globallycoherent
 #define PIXEL_TARGET RWStructuredBuffer<uint>
-#if defined(MOTORSTORM_VK_ATOMIC)
+#if defined(MOTORSTORM_VK_RECOVERY)
+[[vk::binding(9, 0)]] [[vk::input_attachment_index(0)]] SubpassInput<float4> recoveryColor;
+static uint currentColor, currentDepth;
+#define COLOR_AT(index) currentColor
+#define DEPTH_AT(index) currentDepth
+#define PS_INTERLOCK_MODE
+#define PS_INTERLOCK_BEGIN
+#define PS_INTERLOCK_END
+#elif defined(MOTORSTORM_VK_ATOMIC)
 #define PS_INTERLOCK_MODE
 #define PS_INTERLOCK_BEGIN lockPixel(pixel)
 #define PS_INTERLOCK_END unlockPixel(pixel)
@@ -60,7 +68,7 @@ struct PixelResult { uint color : SV_Target0; uint depth : SV_Target1; };
 #define PS_INTERLOCK_BEGIN
 #define PS_INTERLOCK_END
 #endif
-#if !defined(MOTORSTORM_VK_ATTACHMENT)
+#if !defined(MOTORSTORM_VK_ATTACHMENT) && !defined(MOTORSTORM_VK_RECOVERY)
 #define COLOR_AT(index) colorTarget[index]
 #define DEPTH_AT(index) depthTarget[index]
 #endif
@@ -452,7 +460,7 @@ void pixelUpdate(uint2 pixel, uint4 s, bool clearing, uint z) {
     uint mask=(C(0xe8)&0xffffff)|alphaMask;
     COLOR_AT(index)=packFrame((pack(s)&~mask)|(oldColor&mask));
 }
-#if defined(MOTORSTORM_VK_HARDWARE) && !defined(MOTORSTORM_VK_ATTACHMENT) && !defined(MOTORSTORM_VK_ATOMIC)
+#if defined(MOTORSTORM_VK_HARDWARE) && !defined(MOTORSTORM_VK_RECOVERY) && !defined(MOTORSTORM_VK_ATTACHMENT) && !defined(MOTORSTORM_VK_ATOMIC)
 // This translation unit exports the fixed-function entries below. The ordered
 // and interlock pixel shaders stay in their own compiles and still call pixelUpdate().
 #else
@@ -467,6 +475,12 @@ PixelResult PS(Varying i, bool front : SV_IsFrontFace) {
     currentColor=attachmentColor.SubpassLoad();
     currentDepth=attachmentDepth.SubpassLoad();
 #endif
+#elif defined(MOTORSTORM_VK_RECOVERY)
+float4 PSRecovery(Varying i, bool front : SV_IsFrontFace) : SV_Target0 {
+    currentColor = pack(uint4(saturate(recoveryColor.SubpassLoad()) * 255.0 + 0.5));
+    currentDepth = 0;
+    // Keep quad helper invocations through shade(): its LOD/filter derivatives
+    // must match the ordered shader even outside the vehicle stencil.
 #elif defined(MOTORSTORM_VK_ATOMIC)
 float PS(Varying i, bool front : SV_IsFrontFace) : SV_Target0 {
 #else
@@ -495,6 +509,8 @@ void PS(Varying i, bool front : SV_IsFrontFace) {
     PS_INTERLOCK_END;
 #if defined(MOTORSTORM_VK_ATTACHMENT)
     PixelResult result; result.color=currentColor; result.depth=currentDepth; return result;
+#elif defined(MOTORSTORM_VK_RECOVERY)
+    return float4(bytes(currentColor)) / 255.0;
 #elif defined(MOTORSTORM_VK_ATOMIC)
     return 0;
 #endif

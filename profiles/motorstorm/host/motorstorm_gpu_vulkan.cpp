@@ -115,6 +115,7 @@ std::atomic<std::uint64_t> output_size{(480ull << 32) | 272u};
 #include "motorstorm_spirv_PSFastAlphaEarly.h"
 #include "motorstorm_spirv_PSFastFeedback.h"
 #include "motorstorm_spirv_PSFastAlphaFeedback.h"
+#include "motorstorm_spirv_PSRecovery.h"
 #include "motorstorm_spirv_PSLoad.h"
 #include "motorstorm_spirv_PSLoadColor.h"
 #include "motorstorm_spirv_PackColorCS.h"
@@ -178,6 +179,16 @@ bool query_prefetch_enabled() {
 bool preserve_readonly_depth() {
     static const bool enabled = [] {
         const char *text = std::getenv("PSPRECOMP_MOTORSTORM_PRESERVE_READONLY_DEPTH");
+        return text && std::strcmp(text, "1") == 0;
+    }();
+    return enabled;
+}
+bool recovery_depth_reuse() {
+    static const bool enabled = [] {
+        const char *text = std::getenv("PSPRECOMP_MOTORSTORM_RECOVERY_DEPTH_REUSE");
+#if defined(__ANDROID__)
+        if (!text || !*text) return true;
+#endif
         return text && std::strcmp(text, "1") == 0;
     }();
     return enabled;
@@ -384,6 +395,7 @@ struct Surface {
     UINT64 last_cpu_query_list{};
     bool cpu_queried{};
     float aspect_scale{1.0f};
+    bool recovery_depth_preserved{};
     std::uint32_t depth_address{}, depth_stride{};
     UINT64 version{}, snapshot_version{~0ull};
     UINT64 writer_draw{}, writer_list{}, generation{};
@@ -563,6 +575,8 @@ bool draw_barriers() {
     }();
     return value;
 }
+constexpr UINT kPulseQueryCount = 1028;
+struct PulseTiming { UINT query; const char *kind; FrameMetrics::Metadata frame; };
 struct CommandSlot {
     VkCommandPool pool{};
     VkCommandBuffer cmd{};
@@ -574,6 +588,7 @@ struct CommandSlot {
     bool timed{};
     bool pre_timed{};
     FrameMetrics::Metadata frame;
+    std::vector<PulseTiming> pulse_timings;
 };
 constexpr UINT kConstantsStride = 1280;
 constexpr UINT kPresentConstantBytes = kConstantsStride;
@@ -609,6 +624,8 @@ struct Context {
     UINT queue_family{};
     bool line_rasterization{}, depth_clamp{}, anisotropy{}, bc{}, host_query_reset{};
     bool hw_dynamic_depth{}, hw_dynamic_blend{};
+    // ZeroFG needs synchronization2 and extended storage image formats enabled.
+    bool framegen_features{};
     ~Context() {
         if (device)
             vkDeviceWaitIdle(device);
@@ -624,26 +641,9 @@ struct Context {
             vkDestroyInstance(instance, nullptr);
         if (library)
             FreeLibrary(library);
-    // ZeroFG needs synchronization2 and extended storage image formats enabled.
-    bool framegen_features{};
     }
 };
 
-struct State {
-    UINT64 next_surface_generation{};
-    VkCommandPool query_pool{};
-    VkCommandBuffer query_cmd{};
-    VkQueryPool query_timestamps{};
-    VkPipeline tiny_query_pipeline{}, tiny_query_image_pipeline{};
-    Context ctx;
-    Buffer query_constants, query_scratch, query_result;
-    Buffer tiny_transfer_scratch;
-    UINT64 pending_query_fence{}, pending_query_generation{}, pending_query_version{}, pending_query_storage_serial{};
-    FrameMetrics::Metadata query_origin;
-    FrameMetrics metrics;
-    UINT64 game_frame_id{1}, previous_prepare_ns{}, previous_record_ns{}, previous_guest_cpu_ns{}, previous_ge_cpu_ns{}, previous_frame_ns{};
-    bool display_timing{};
-    std::uint32_t display_present_id{};
 #if defined(__ANDROID__)
 // ZeroFG frame generation (see docs/FRAME_GENERATION.md). Race frames are drawn
 // by the present pass into small offscreen "real" images; ZeroFG makes the frame
@@ -675,10 +675,32 @@ struct FrameGen {
     std::chrono::steady_clock::time_point last_arrival{}, pending_deadline{};
     double interval_ms{33.3};
     UINT64 real_shown{}, generated_shown{}, generated_skipped{}, generated_late{};
+    UINT64 window_real{}, window_generated{};
+    std::chrono::steady_clock::time_point pending_submit{};
+    double completion_ms_total{};
+    UINT64 completion_count{};
     std::chrono::steady_clock::time_point report{};
 };
 #endif
 
+struct State {
+    UINT64 next_surface_generation{};
+    VkCommandPool query_pool{};
+    VkCommandBuffer query_cmd{};
+    VkQueryPool query_timestamps{};
+    VkPipeline tiny_query_pipeline{}, tiny_query_image_pipeline{};
+    Context ctx;
+    Buffer query_constants, query_scratch, query_result;
+    Buffer tiny_transfer_scratch;
+    UINT64 pending_query_fence{}, pending_query_generation{}, pending_query_version{}, pending_query_storage_serial{};
+    FrameMetrics::Metadata query_origin;
+    FrameMetrics metrics;
+    bool pulse_trace{[] { const char *v = std::getenv("PSPRECOMP_MOTORSTORM_PULSE_TRACE"); return v && std::strcmp(v, "1") == 0; }()};
+    std::ofstream pulse_states;
+    UINT64 pulse_draw{};
+    UINT64 game_frame_id{1}, previous_prepare_ns{}, previous_record_ns{}, previous_guest_cpu_ns{}, previous_ge_cpu_ns{}, previous_frame_ns{};
+    bool display_timing{};
+    std::uint32_t display_present_id{};
     VkDevice device{};
     VkQueue queue{}, present_queue{};
     // A family with a single queue shares it between the GE and presenter threads.
@@ -722,7 +744,7 @@ struct FrameGen {
         std::uint8_t topology{}, depth_test{}, depth_write{}, depth_compare{};
         std::uint8_t blend{}, blend_op{}, src{}, dst{}, mask{}, cull{}, alpha{}, feedback{};
         std::uint8_t stencil_test{}, stencil_fail_op{}, stencil_depth_fail_op{}, stencil_pass_op{}, stencil_compare{};
-        std::uint8_t color_only{};
+        std::uint8_t color_only{}, recovery{}, alpha_stencil{};
         bool operator==(const HwPipeKey &other) const {
             return std::memcmp(this, &other, sizeof(HwPipeKey)) == 0;
         }
@@ -744,7 +766,7 @@ struct FrameGen {
     Buffer hw_depth_staging;
     bool hw_depth_ok{};
     bool rendering_hardware{};
-    bool hw_depth_written{}, ordered_depth_written{};
+    bool hw_depth_written{}, ordered_depth_written{}, ordered_recovery_depth{};
     int last_draw_hardware{-1};
     Surface *hw_pass_color{}, *hw_pass_depth{};
 #endif
@@ -929,6 +951,11 @@ struct FrameGen {
     int ready_frame{-1};
     static constexpr UINT kPresentFrames = 3;
     PresentFrame present_frames[kPresentFrames];
+#if defined(__ANDROID__)
+    // Declared after the frames and the context so it is destroyed before them.
+    std::unique_ptr<FrameGen> framegen;
+    UINT framegen_width{1280};
+#endif
     double timestamp_period{1.0};
     PostSettings post;
     bool widescreen{true};
@@ -947,11 +974,6 @@ struct FrameGen {
         std::vector<char> data(size);
         if (vkGetPipelineCacheData(device, pipeline_cache, &size, data.data()) != VK_SUCCESS)
             return;
-#if defined(__ANDROID__)
-    // Declared after the frames and the context so it is destroyed before them.
-    std::unique_ptr<FrameGen> framegen;
-    UINT framegen_width{1280};
-#endif
         auto temporary = pipeline_cache_file;
         temporary += ".tmp";
         std::FILE *file = std::fopen(temporary.string().c_str(), "wb");
@@ -998,6 +1020,13 @@ struct FrameGen {
         if (!device)
             return;
         vkDeviceWaitIdle(device);
+#if defined(__ANDROID__)
+        if (framegen) {
+            for (auto pool : framegen->display_pool)
+                if (pool) vkDestroyCommandPool(device, pool, nullptr);
+            framegen->engine.reset();
+        }
+#endif
         if (query_pool) vkDestroyCommandPool(device, query_pool, nullptr);
         if (query_timestamps) vkDestroyQueryPool(device, query_timestamps, nullptr);
         if (tiny_query_pipeline) vkDestroyPipeline(device, tiny_query_pipeline, nullptr);
@@ -1016,13 +1045,6 @@ struct FrameGen {
         if (attachment_pass) vkDestroyRenderPass(device, attachment_pass, nullptr);
         if (hw_pass_load) vkDestroyRenderPass(device, hw_pass_load, nullptr);
         if (hw_pass_clear) vkDestroyRenderPass(device, hw_pass_clear, nullptr);
-#if defined(__ANDROID__)
-        if (framegen) {
-            for (auto pool : framegen->display_pool)
-                if (pool) vkDestroyCommandPool(device, pool, nullptr);
-            framegen->engine.reset();
-        }
-#endif
         if (hw_color_pass_load) vkDestroyRenderPass(device, hw_color_pass_load, nullptr);
         if (hw_color_pass_clear) vkDestroyRenderPass(device, hw_color_pass_clear, nullptr);
         if (programmable_pass) vkDestroyRenderPass(device, programmable_pass, nullptr);
@@ -1230,10 +1252,13 @@ MOTORSTORM_NOINLINE void end_rendering(State &s) {
         // brought up to date only when something reads them (sync_buffer).
         Surface *targets[]{s.attachment_color, s.attachment_depth};
         for (auto target : targets) {
-            if (target == s.attachment_depth && preserve_readonly_depth() && !s.hw_stencil_ok && !s.ordered_depth_written) {
+            if (target == s.attachment_depth && (preserve_readonly_depth() || s.ordered_recovery_depth) &&
+                !s.hw_stencil_ok && !s.ordered_depth_written) {
+                target->recovery_depth_preserved = s.ordered_recovery_depth;
                 ++stats.readonly_depth_passes;
                 continue;
             }
+            target->recovery_depth_preserved = false;
             target->image_newer = true;
             ++target->storage_serial;
             target->writer_pending = true;
@@ -1337,7 +1362,51 @@ void bind_sets(State &s, VkCommandBuffer cmd) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.layout, 1, 1, &s.sampler_set, 0, nullptr);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.layout, 1, 1, &s.sampler_set, 0, nullptr);
 }
+FrameMetrics::Metadata pulse_origin(State &s) {
+#if defined(__ANDROID__)
+    return {s.game_frame_id, guest_time_us(), s.raster_half, s.racing};
+#else
+    return {};
+#endif
+}
+UINT pulse_begin(State &s, const char *kind) {
+    if (!s.pulse_trace || !s.recording) return UINT_MAX;
+    auto &slot = s.slots[s.slot_index];
+    const UINT query = 4u + static_cast<UINT>(slot.pulse_timings.size()) * 2u;
+    if (!slot.queries || query + 1u >= kPulseQueryCount) return UINT_MAX;
+    slot.pulse_timings.push_back({query, kind, pulse_origin(s)});
+    vkCmdWriteTimestamp(s.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, slot.queries, query);
+    return query;
+}
+void pulse_end(State &s, UINT query) {
+    if (query != UINT_MAX)
+        vkCmdWriteTimestamp(s.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s.slots[s.slot_index].queries, query + 1u);
+}
+void pulse_draw_state(State &s, const GpuDraw &draw, const DrawPixelRoute &route) {
+    if (!s.pulse_trace || !s.racing || s.pulse_draw >= 4'000'000u) return;
+    if (!s.pulse_states.is_open()) {
+        const char *output = std::getenv("PSPRECOMP_MOTORSTORM_BENCH_OUT");
+        if (!output) return;
+        s.pulse_states.open(std::string(output) + "-draw-state.csv");
+        s.pulse_states << "frame,guest_us,list,draw,hardware,reject,target,depth,stride,format,stencil_enable,stencil_test,stencil_ops,blend_enable,blend_factors,fix_src,fix_dst,depth_test,depth_func,depth_mask,alpha_mask\n";
+    }
+    const auto &c = draw.commands;
+    s.pulse_states << s.game_frame_id << ',' << pulse_origin(s).guest_us << ',' << s.list_serial << ',' << ++s.pulse_draw
+        << ',' << route.hardware << ',' << ge_reject_reason_name(route.reject_reason)
+        << ',' << draw.framebuffer << ',' << draw.depthbuffer << ',' << draw.stride << ',' << draw.format
+        << ',' << c[0x24] << ',' << c[0xDC] << ',' << c[0xDD]
+        << ',' << c[0x21] << ',' << c[0xDF] << ',' << c[0xE0] << ',' << c[0xE1]
+        << ',' << c[0x23] << ',' << c[0xDE] << ',' << c[0xE7] << ',' << c[0xE9] << '\n';
+}
 void collect_slot_timings(State &s, CommandSlot &slot) {
+        for (const auto &timing : slot.pulse_timings) {
+            UINT64 stamps[2]{};
+            if (vkGetQueryPoolResults(s.device, slot.queries, timing.query, 2, sizeof(stamps), stamps,
+                    sizeof(UINT64), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+                s.metrics.event(timing.frame, timing.kind, static_cast<UINT64>(stamps[0] * s.timestamp_period),
+                    static_cast<UINT64>(stamps[1] * s.timestamp_period));
+        }
+        slot.pulse_timings.clear();
         if (slot.timed && slot.queries) {
             UINT64 stamps[2]{};
             if (vkGetQueryPoolResults(s.device, slot.queries, 0, 2, sizeof(stamps), stamps, sizeof(UINT64),
@@ -1414,9 +1483,9 @@ void open_chunk(State &s, UINT index) {
     bind_sets(s, s.cmd);
     if (slot.queries) {
         if (s.ctx.host_query_reset && vkResetQueryPool)
-            vkResetQueryPool(s.device, slot.queries, 0, 4);
+            vkResetQueryPool(s.device, slot.queries, 0, s.pulse_trace ? kPulseQueryCount : 4);
         else if (vkCmdResetQueryPool)
-            vkCmdResetQueryPool(slot.cmd, slot.queries, 0, 4);
+            vkCmdResetQueryPool(slot.cmd, slot.queries, 0, s.pulse_trace ? kPulseQueryCount : 4);
         else
             throw std::runtime_error("Vulkan device cannot reset timestamp queries");
         vkCmdWriteTimestamp(slot.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, slot.queries, 0);
@@ -2369,6 +2438,7 @@ const Spirv &spirv(std::string_view name) {
         MOTORSTORM_SPIRV(PSFastAlphaEarly),
         MOTORSTORM_SPIRV(PSFastFeedback),
         MOTORSTORM_SPIRV(PSFastAlphaFeedback),
+        MOTORSTORM_SPIRV(PSRecovery),
         MOTORSTORM_SPIRV(PSLoad),
         MOTORSTORM_SPIRV(PSLoadColor),
         MOTORSTORM_SPIRV(PackColorCS),
@@ -2644,6 +2714,7 @@ void pack_hardware(State &s, Surface &surface) {
         return;
     const auto pack_began = perf::now_ns();
     end_rendering(s);
+    const auto pulse = pulse_begin(s, surface.hw_color ? "pack_color_gpu" : "pack_depth_gpu");
     const UINT width = surface.raster_stride(), height = surface.raster_height();
     Constants constants{};
     constants.surface = {width, height, width, width};
@@ -2729,9 +2800,19 @@ void pack_hardware(State &s, Surface &surface) {
     s.unflushed = false;
     ++stats.hw_packs;
     stats.hw_pack_ns += perf::now_ns() - pack_began;
+    pulse_end(s, pulse);
+    s.metrics.event(pulse_origin(s), surface.hw_color ? "pack_color_count" : "pack_depth_count", 0, 1);
 #endif
 }
 #if defined(__ANDROID__)
+bool recovery_attachment_enabled() {
+    static const bool enabled = !diag_flag("PSPRECOMP_MOTORSTORM_RECOVERY_ATTACHMENT_DISABLE") &&
+                                !diag_flag("PSPRECOMP_MOTORSTORM_DIAG_NO_ROAA");
+    return enabled;
+}
+VkImageLayout hw_attachment_layout() {
+    return recovery_attachment_enabled() ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+}
 VkRenderPass make_hw_pass(State &s, VkAttachmentLoadOp load, bool with_depth = true) {
     VkAttachmentDescription attachments[2]{};
     attachments[0].format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -2740,7 +2821,7 @@ VkRenderPass make_hw_pass(State &s, VkAttachmentLoadOp load, bool with_depth = t
     attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    attachments[0].initialLayout = attachments[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    attachments[0].initialLayout = attachments[0].finalLayout = hw_attachment_layout();
     attachments[1].format = s.hw_depth_format;
     attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
     attachments[1].loadOp = load;
@@ -2748,13 +2829,18 @@ VkRenderPass make_hw_pass(State &s, VkAttachmentLoadOp load, bool with_depth = t
     attachments[1].stencilLoadOp = s.hw_stencil_ok ? load : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     attachments[1].stencilStoreOp = s.hw_stencil_ok ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
     attachments[1].initialLayout = attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    const VkAttachmentReference color{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    const VkAttachmentReference color{0, hw_attachment_layout()};
     const VkAttachmentReference depth{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     VkSubpassDescription subpass{};
     subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     subpass.colorAttachmentCount = 1;
     subpass.pColorAttachments = &color;
     subpass.pDepthStencilAttachment = with_depth ? &depth : nullptr;
+    if (recovery_attachment_enabled()) {
+        subpass.flags = VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT;
+        subpass.inputAttachmentCount = 1;
+        subpass.pInputAttachments = &color;
+    }
     VkSubpassDependency dependency{};
     dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
     dependency.dstSubpass = 0;
@@ -2767,7 +2853,8 @@ VkRenderPass make_hw_pass(State &s, VkAttachmentLoadOp load, bool with_depth = t
                                VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
     dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-                               VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+                               VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+                               VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
     VkRenderPassCreateInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
     info.attachmentCount = with_depth ? 2u : 1u;
     info.pAttachments = attachments;
@@ -2785,11 +2872,11 @@ VkPipeline create_hw_pipeline(State &s, std::string_view vs, std::string_view ps
                               std::uint8_t write_mask, std::uint8_t cull, bool dynamic_state,
                               bool stencil_test = false, std::uint8_t stencil_fail_op = 0,
                               std::uint8_t stencil_depth_fail_op = 0, std::uint8_t stencil_pass_op = 0,
-                              std::uint8_t stencil_compare = 7, bool color_only = false) {
+                              std::uint8_t stencil_compare = 7, bool color_only = false, bool ordered_color = false) {
     const VkPipelineShaderStageCreateInfo stages[]{stage(s, VK_SHADER_STAGE_VERTEX_BIT, vs),
                                                     stage(s, VK_SHADER_STAGE_FRAGMENT_BIT, ps)};
     const VkVertexInputBindingDescription binding{0, sizeof(GpuVertex),
-        vs == "PointVSFast" ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
+        (vs == "PointVSFast" || vs == "PointVS") ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
     const VkVertexInputAttributeDescription attributes[]{{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},
                                                          {1, 0, VK_FORMAT_R32_UINT, 12},
                                                          {2, 0, VK_FORMAT_R32_UINT, 16},
@@ -2842,6 +2929,10 @@ VkPipeline create_hw_pipeline(State &s, std::string_view vs, std::string_view ps
     attachment.alphaBlendOp = VK_BLEND_OP_ADD;
     attachment.colorWriteMask = write_mask;
     VkPipelineColorBlendStateCreateInfo blending{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    // The stencil writer participates too. On the tested Adreno/Turnip driver,
+    // flagging only the reader changes the translucent recovery pixels.
+    if (ordered_color && recovery_attachment_enabled())
+        blending.flags = VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
     blending.attachmentCount = 1;
     blending.pAttachments = &attachment;
     VkDynamicState dynamic_states[16]{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
@@ -2893,9 +2984,14 @@ VkPipeline hw_pipeline_for(State &s, const State::HwPipeKey &key) {
     }
     if (const auto found = s.hw_pipelines.find(pipe); found != s.hw_pipelines.end())
         return found->second;
-    const char *vs = key.topology == 0 ? "PointVSFast" : "VSFast";
+    // Recovery never consumes depth. Retain the ordered shader's clip-space Z
+    // rather than converting an irrelevant guest window depth to native Z.
+    const char *vs = key.recovery ? (key.topology == 0 ? "PointVS" : "VS")
+                                : key.topology == 0 ? "PointVSFast" : "VSFast";
     const char *ps = "PSFast";
-    if (key.feedback)
+    if (key.recovery)
+        ps = "PSRecovery";
+    else if (key.feedback)
         ps = key.alpha ? "PSFastAlphaFeedback" : "PSFastFeedback";
     else if (key.alpha)
         ps = key.depth_write ? "PSFastAlpha" : "PSFastAlphaEarly";
@@ -2906,7 +3002,8 @@ VkPipeline hw_pipeline_for(State &s, const State::HwPipeKey &key) {
     const VkPipeline pipeline = create_hw_pipeline(s, vs, ps, topology, key.depth_test, key.depth_write, key.depth_compare,
                                                    key.blend, key.blend_op, key.src, key.dst, key.mask, key.cull, dynamic,
                                                    key.stencil_test, key.stencil_fail_op, key.stencil_depth_fail_op,
-                                                   key.stencil_pass_op, key.stencil_compare, key.color_only != 0);
+                                                   key.stencil_pass_op, key.stencil_compare, key.color_only != 0,
+                                                   key.recovery || key.alpha_stencil);
     const auto elapsed_ns = perf::now_ns() - began;
     ++stats.pipelines_created;
     stats.pipeline_create_ns += elapsed_ns;
@@ -2923,7 +3020,7 @@ VkPipeline hw_pipeline_for(State &s, const State::HwPipeKey &key) {
 // frame from the warm pipeline cache: PSPRECOMP_MOTORSTORM_PIPELINE_CACHE's
 // file plus ".keys". Unknown or malformed files are ignored.
 constexpr std::uint32_t kHwKeysMagic = 0x4B504D53u;  // "SMPK"
-constexpr std::uint32_t kHwKeysVersion = 3u;
+constexpr std::uint32_t kHwKeysVersion = 5u;
 std::filesystem::path hw_keys_file(const State &s) {
     auto path = s.pipeline_cache_file;
     path += ".keys";
@@ -2946,7 +3043,7 @@ void prewarm_hw_pipelines(State &s) {
     for (std::size_t index = 0; index < count; ++index) {
         State::HwPipeKey key{};
         std::memcpy(&key, data.data() + sizeof(header) + index * sizeof(key), sizeof(key));
-        if (key.topology > 3u)
+        if (key.topology > 3u || (key.recovery && !recovery_attachment_enabled()))
             continue;
         hw_pipeline_for(s, key);
     }
@@ -3026,7 +3123,8 @@ void begin_hardware_pass(State &s, Surface &color, Surface &depth, bool with_dep
     // compact images have to be reloaded from that result.
     end_rendering(s);
     const bool load = !color.hw_matches || (with_depth && !depth.hw_matches);
-    const bool preserve_depth = load && with_depth && depth.hw_matches && !s.hw_stencil_ok && preserve_readonly_depth();
+    const bool preserve_depth = load && with_depth && depth.hw_matches && !s.hw_stencil_ok &&
+        (preserve_readonly_depth() || depth.recovery_depth_preserved);
     if (load) {
         if (color.image_newer)
             sync_buffer(s, color);
@@ -3035,7 +3133,7 @@ void begin_hardware_pass(State &s, Surface &color, Surface &depth, bool with_dep
     }
     if (!color.hw_color) {
         color.hw_color = make_image(color.raster_stride(), color.raster_height(), 1, VK_FORMAT_R8G8B8A8_UNORM,
-                                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+                                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
         color.hw_color_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     }
     if (with_depth && !depth.hw_depth) {
@@ -3045,7 +3143,7 @@ void begin_hardware_pass(State &s, Surface &color, Surface &depth, bool with_dep
     const VkImageAspectFlags depth_aspect = s.hw_stencil_ok
         ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
         : VK_IMAGE_ASPECT_DEPTH_BIT;
-    transition_image(s, color.hw_color.image, color.hw_color_layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    transition_image(s, color.hw_color.image, color.hw_color_layout, hw_attachment_layout(),
                      VK_IMAGE_ASPECT_COLOR_BIT);
     if (with_depth)
         transition_image(s, depth.hw_depth.image, depth.hw_depth_layout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
@@ -3087,12 +3185,14 @@ void begin_hardware_pass(State &s, Surface &color, Surface &depth, bool with_dep
         // PSLoad writes gl_FragDepth. On a tiler that disables early-Z for the
         // rest of the pass, so the copy gets its own pass and the scene pass
         // only loads the stored depth.
+        const auto pulse = pulse_begin(s, preserve_depth ? "restore_color_gpu" : "restore_color_depth_gpu");
         begin_pass(preserve_depth ? load_pass : clear_pass);
         draw_hw_load(s, color, depth, with_depth, preserve_depth);
         vkCmdEndRenderPass(s.cmd);
         ++stats.render_pass_endings;
         s.rendering = false;
         s.rendering_hardware = false;
+        pulse_end(s, pulse);
         s.hw_pass_color = s.hw_pass_depth = nullptr;
         color.hw_matches = true;
         ++color.storage_serial;
@@ -3105,8 +3205,9 @@ void begin_hardware_pass(State &s, Surface &color, Surface &depth, bool with_dep
         VkImageMemoryBarrier done[2]{};
         done[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         done[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        done[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        done[0].oldLayout = done[0].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        done[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                               VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+        done[0].oldLayout = done[0].newLayout = hw_attachment_layout();
         done[0].srcQueueFamilyIndex = done[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         done[0].image = color.hw_color.image;
         done[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -3118,10 +3219,12 @@ void begin_hardware_pass(State &s, Surface &color, Surface &depth, bool with_dep
         done[1].image = depth.hw_depth.image;
         done[1].subresourceRange = {depth_aspect, 0, 1, 0, 1};
         vkCmdPipelineBarrier(s.cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, 0,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
                              0, nullptr, 0, nullptr, with_depth ? 2u : 1u, done);
     }
     begin_pass(load_pass);
+    if (with_depth) depth.recovery_depth_preserved = false;
 }
 #endif
 bool hardware_draws_enabled(const State &s) {
@@ -3618,6 +3721,8 @@ void create_device(State &s) {
 #if defined(__ANDROID__)
             ctx.hw_dynamic_depth = depth_dyn;
             ctx.hw_dynamic_blend = blend_dyn;
+            ctx.framegen_features = core13 && v13.synchronization2 == VK_TRUE &&
+                                    features.features.shaderStorageImageExtendedFormats == VK_TRUE;
 #endif
             chosen_extensions = std::move(device_extensions);
             best_path = path;
@@ -3692,6 +3797,9 @@ void create_device(State &s) {
     VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     v13.pNext = &interlock;
     v13.dynamicRendering = VK_TRUE;
+#if defined(__ANDROID__)
+    v13.synchronization2 = ctx.framegen_features ? VK_TRUE : VK_FALSE;
+#endif
     VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     v12.pNext = &v13;
     v12.timelineSemaphore = VK_TRUE;
@@ -3717,8 +3825,6 @@ void create_device(State &s) {
         interlock.pNext = &dyn_enable;
         if (ctx.hw_dynamic_blend) {
             dyn3_enable.pNext = &dyn_enable;
-            ctx.framegen_features = core13 && v13.synchronization2 == VK_TRUE &&
-                                    features.features.shaderStorageImageExtendedFormats == VK_TRUE;
             interlock.pNext = &dyn3_enable;
         }
     }
@@ -3729,6 +3835,8 @@ void create_device(State &s) {
     features.features.shaderClipDistance = VK_TRUE;
 #if !defined(__ANDROID__)
     features.features.geometryShader = VK_TRUE;
+#else
+    features.features.shaderStorageImageExtendedFormats = ctx.framegen_features ? VK_TRUE : VK_FALSE;
 #endif
     features.features.depthClamp = ctx.depth_clamp;
     features.features.samplerAnisotropy = ctx.anisotropy;
@@ -3793,9 +3901,6 @@ void create_device(State &s) {
     allocator.physicalDevice = ctx.physical;
     allocator.device = ctx.device;
     allocator.instance = ctx.instance;
-#if defined(__ANDROID__)
-    v13.synchronization2 = ctx.framegen_features ? VK_TRUE : VK_FALSE;
-#endif
     allocator.pVulkanFunctions = &functions;
     check(vmaCreateAllocator(&allocator, &ctx.allocator), "create memory allocator");
     g_allocator = ctx.allocator;
@@ -3831,8 +3936,6 @@ std::vector<GpuDecodedTexture> take_decoded() {
             invalidated = true;
         }
         GpuDecodedTexture decoded{copy.key, copy.width, copy.height, {}};
-#else
-    features.features.shaderStorageImageExtendedFormats = ctx.framegen_features ? VK_TRUE : VK_FALSE;
         decoded.rgba.resize(static_cast<std::size_t>(copy.width) * copy.height);
         const auto *source = s.identify_ring.mapped + copy.start % kIdentifyRingBytes;
         for (UINT y = 0; y < copy.height; ++y)
@@ -4002,7 +4105,7 @@ bool initialize() {
             slot.pre = buffers[1];
             VkQueryPoolCreateInfo queries{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
             queries.queryType = VK_QUERY_TYPE_TIMESTAMP;
-            queries.queryCount = 4;
+            queries.queryCount = s.pulse_trace ? kPulseQueryCount : 4;
             check(vkCreateQueryPool(s.device, &queries, nullptr, &slot.queries), "create chunk timestamps");
         }
         s.upload = make_buffer(kUploadBytes, Memory::Upload);
@@ -4265,7 +4368,7 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
         std::uint32_t soft_range = 0;
         // HUD tagging writes the high bits of the ordered depth attachment
         // even when the PSP depth-write mask is disabled.
-        depth_attachment_changed = depth_write || (tag_hud && !draw.hardware_transform);
+        depth_attachment_changed = ge_depth_attachment_changes(draw.commands.data(), valid_depth, tag_hud, draw.hardware_transform);
         if (s.racing && s.post.soft_particles_active() && valid_depth && draw.hardware_transform &&
             (draw.commands[0x21] & 1u) && (draw.commands[0x23] & 1u) && draw.commands[0xE7] != 0u &&
             (draw.commands[0xDE] & 7u) >= 4u && !vertices.empty()) {
@@ -4425,9 +4528,10 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
             }();
             facts.hardware_color_test = hardware_color_test;
             facts.hardware_stencil = s.hw_stencil_ok;
+            facts.recovery_input_attachment = recovery_attachment_enabled();
             pixel_route = classify_ge_draw(draw.commands.data(), facts);
             static const bool color_only_enabled = !diag_flag("PSPRECOMP_MOTORSTORM_COLOR_ONLY_DISABLE");
-            const bool color_only = color_only_enabled && !pixel_route.state.depth_test &&
+            const bool color_only = color_only_enabled && !pixel_route.recovery_input_attachment && !pixel_route.state.depth_test &&
                                     !pixel_route.state.depth_write && !pixel_route.state.stencil_test;
             pixel_route.color_only = color_only;
             if (pixel_route.hardware && !color_only && (color.raster_stride() != depth->raster_stride() ||
@@ -4482,6 +4586,25 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
         perf::Scope record_profile(perf::kGpuRecord);
 #if defined(__ANDROID__)
         const bool hardware = pixel_route.hardware;
+        // Through-mode HUD writes were folded into depth_attachment_changed
+        // during preparation. A later depth consumer must materialize native
+        // depth even if an earlier color-only ordered pass is still open.
+        const bool ordered_needs_depth = depth_attachment_changed ||
+            ge_ordered_needs_depth(draw.commands.data(), valid_depth, false, draw.hardware_transform);
+        const bool recovery_independent = recovery_depth_reuse() && !depth_attachment_changed &&
+            draw.format == 3u && ge_recovery_depth_independent(draw.commands.data(), valid_depth);
+        if (!hardware && s.rendering && !s.rendering_hardware &&
+            (preserve_readonly_depth() || s.ordered_recovery_depth) &&
+            !s.hw_stencil_ok && ordered_needs_depth && depth->hw_dirty) {
+            if (s.rendering && !s.rendering_hardware) {
+                // End the read-only ordered pass and order its R32 stores
+                // before the later buffer-to-attachment transfer overwrites it.
+                outside(s);
+                s.metrics.event(pulse_origin(s), "depth_consumer_split", 0, 1);
+            }
+            pack_hardware(s, *depth);
+        }
+        pulse_draw_state(s, draw, pixel_route);
         if (s.pixel_path == PixelPath::OrderedAttachment) {
             if (hardware) {
                 ++stats.hardware_pixel_draws;
@@ -4525,6 +4648,7 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
             if (s.rendering && s.rendering_hardware != hardware)
                 ++stats.pixel_path_switches;
             if (s.last_draw_hardware >= 0 && s.last_draw_hardware != (hardware ? 1 : 0)) {
+                s.metrics.event(pulse_origin(s), s.last_draw_hardware == 1 ? "switch_hw_ordered" : "switch_ordered_hw", 0, 1);
                 if (s.last_draw_hardware == 1)
                     ++stats.switches_hw_to_ordered;
                 else
@@ -4560,6 +4684,8 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
             key.stencil_pass_op = pixel_route.state.stencil_pass_op;
             key.stencil_compare = pixel_route.state.stencil_compare;
             key.color_only = pixel_route.color_only ? 1u : 0u;
+            key.recovery = pixel_route.recovery_input_attachment ? 1u : 0u;
+            key.alpha_stencil = pixel_route.framebuffer_alpha_stencil ? 1u : 0u;
             if (!s.rendering_hardware || s.hw_pass_color != &color ||
                 s.hw_pass_depth != (key.color_only ? nullptr : depth))
                 begin_hardware_pass(s, color, *depth, key.color_only == 0);
@@ -4598,7 +4724,8 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
                 vkCmdBeginRenderPass(s.cmd, &pass, VK_SUBPASS_CONTENTS_INLINE);
             } else {
             pack_hardware(s, color);
-            if (depth != &color)
+            if (depth != &color && ((!preserve_readonly_depth() && !recovery_independent) ||
+                                   s.hw_stencil_ok || ordered_needs_depth))
                 pack_hardware(s, *depth);
             bool loaded_attachment = false;
             for (auto target : {&color, depth}) {
@@ -4646,6 +4773,7 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
             vkCmdBeginRenderPass(s.cmd, &pass, VK_SUBPASS_CONTENTS_INLINE);
             s.attachment_color = &color; s.attachment_depth = depth;
             s.ordered_depth_written = false;
+            s.ordered_recovery_depth = recovery_independent && depth->hw_matches && static_cast<bool>(depth->hw_depth);
             }
 #else
             VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
@@ -4674,6 +4802,12 @@ void submit(psprecomp::GuestMemory &memory, const GpuDraw &draw, std::span<const
                                             image_write(7, &images[1])};
         vkCmdPushDescriptorSetKHR(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.layout, 0, 6, writes);
 #if defined(__ANDROID__)
+        if (hardware && pixel_route.recovery_input_attachment) {
+            const VkDescriptorImageInfo image{VK_NULL_HANDLE, color.hw_color.view, hw_attachment_layout()};
+            auto write = image_write(9, &image);
+            write.descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+            vkCmdPushDescriptorSetKHR(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.layout, 0, 1, &write);
+        }
         if (!hardware) {
         if (s.pixel_path == PixelPath::OrderedAttachment) {
             const VkDescriptorImageInfo attachment_images[]{{VK_NULL_HANDLE, color.attachment.view, VK_IMAGE_LAYOUT_GENERAL},
@@ -5125,6 +5259,7 @@ void query_wait(State &s, UINT64 fence) {
     const auto elapsed = perf::now_ns() - started;
     ++stats.tiny_query_gpu_waits;
     stats.tiny_query_wait_ns += elapsed;
+    s.metrics.event(pulse_origin(s), "tiny_query_wait", started, started + elapsed);
     // Keep historical CPU coherence wait totals comparable in the live log.
     ++stats.publish_waits[3];
     stats.publish_wait_ns[3] += elapsed;
@@ -6216,6 +6351,25 @@ void create_presentation(State &s, HWND window, UINT frame_width, UINT frame_hei
     }
     create_present_frames(s, frame_width, frame_height);
 #if defined(__ANDROID__)
+    if (!s.framegen) {
+        // [graphics] frame_generation = off | zero | reallyzero (see docs/FRAME_GENERATION.md).
+        const char *requested = std::getenv("PSPRECOMP_MOTORSTORM_FRAMEGEN");
+        const std::string_view choice = requested ? requested : "off";
+        if (choice == "zero" || choice == "reallyzero") {
+            if (!s.ctx.framegen_features || !s.dynamic_rendering) {
+                log_line("FRAMEGEN", "unavailable: the device lacks synchronization2 or extended storage image formats");
+            } else {
+                s.framegen = std::make_unique<FrameGen>();
+                s.framegen->mode = choice == "zero" ? zerofg::Mode::kZero : zerofg::Mode::kReallyZero;
+                if (const char *width = std::getenv("PSPRECOMP_MOTORSTORM_FRAMEGEN_WIDTH"))
+                    s.framegen_width = static_cast<UINT>(std::clamp<long>(std::strtol(width, nullptr, 10), 768, 1920));
+                log_line("FRAMEGEN", std::string("requested: ") + std::string(choice) + ", picture " +
+                                         std::to_string(s.framegen_width) + " px wide");
+            }
+        } else if (choice != "off") {
+            log_line("FRAMEGEN", "ignored unknown frame_generation value '" + std::string(choice) + "'");
+        }
+    }
     VkAndroidSurfaceCreateInfoKHR info{VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR};
     info.window = static_cast<ANativeWindow *>(SDL_GetPointerProperty(SDL_GetWindowProperties(window),
         SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
@@ -6347,25 +6501,6 @@ void record_post(State &s, State::PresentFrame &frame, View constants) {
 // buffer (every display pixel decodes buffer words; slow on Adreno).
 bool present_texture_enabled() {
     static const bool value = [] {
-    if (!s.framegen) {
-        // [graphics] frame_generation = off | zero | reallyzero (see docs/FRAME_GENERATION.md).
-        const char *requested = std::getenv("PSPRECOMP_MOTORSTORM_FRAMEGEN");
-        const std::string_view choice = requested ? requested : "off";
-        if (choice == "zero" || choice == "reallyzero") {
-            if (!s.ctx.framegen_features || !s.dynamic_rendering) {
-                log_line("FRAMEGEN", "unavailable: the device lacks synchronization2 or extended storage image formats");
-            } else {
-                s.framegen = std::make_unique<FrameGen>();
-                s.framegen->mode = choice == "zero" ? zerofg::Mode::kZero : zerofg::Mode::kReallyZero;
-                if (const char *width = std::getenv("PSPRECOMP_MOTORSTORM_FRAMEGEN_WIDTH"))
-                    s.framegen_width = static_cast<UINT>(std::clamp<long>(std::strtol(width, nullptr, 10), 1280, 1920));
-                log_line("FRAMEGEN", std::string("requested: ") + std::string(choice) + ", picture " +
-                                         std::to_string(s.framegen_width) + " px wide");
-            }
-        } else if (choice != "off") {
-            log_line("FRAMEGEN", "ignored unknown frame_generation value '" + std::string(choice) + "'");
-        }
-    }
         const char *text = std::getenv("PSPRECOMP_MOTORSTORM_PRESENT_TEXTURE");
         return !(text && std::strcmp(text, "0") == 0);
     }();
@@ -6625,7 +6760,7 @@ VkExtent2D framegen_extent(const State &s) {
     if (s.presentation_transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
         s.presentation_transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR)
         std::swap(width, height);
-    const UINT cell = std::clamp(s.framegen_width / 64u, 20u, 30u);
+    const UINT cell = std::clamp(s.framegen_width / 64u, 12u, 30u);
     const double aspect = height ? static_cast<double>(width) / height : 16.0 / 9.0;
     UINT rows = (static_cast<UINT>(std::lround(64.0 / aspect)) + 2u) / 4u * 4u;
     rows = std::clamp(rows, 8u, 64u);
@@ -6977,6 +7112,7 @@ UINT64 present_snapshot_fg(State &s, State::PresentFrame &frame) {
         fg.pending = true;
         fg.pending_generated = generated;
         fg.pending_ready = value;
+        fg.pending_submit = std::chrono::steady_clock::now();
     }
     fg.previous_real = current;
     fg.have_previous = true;
@@ -6987,6 +7123,26 @@ UINT64 present_snapshot_fg(State &s, State::PresentFrame &frame) {
 // for a generated one.
 void framegen_show_generated(State &s, std::unique_lock<std::mutex> &lock) {
     FrameGen &fg = *s.framegen;
+    const auto now = std::chrono::steady_clock::now();
+    if (fg.report.time_since_epoch().count() == 0) fg.report = now;
+    if (now - fg.report >= std::chrono::seconds(5)) {
+        log_line("FRAMEGEN", "real=" + std::to_string(fg.real_shown) + " generated=" + std::to_string(fg.generated_shown) +
+                                 " skipped=" + std::to_string(fg.generated_skipped) + " late=" + std::to_string(fg.generated_late) +
+                                 " interval_ms=" + std::to_string(fg.interval_ms) +
+                                 " submit_to_done_ms=" + std::to_string(fg.completion_count ? fg.completion_ms_total / fg.completion_count : 0.0));
+        // Generated frames that are almost never ready in time mean the GPU has
+        // no headroom: frame generation only costs time then, so stop it.
+        const UINT64 real = fg.real_shown - fg.window_real, shown = fg.generated_shown - fg.window_generated;
+        if (real >= 40u && shown * 5u < real * 4u) {
+            log_line("FRAMEGEN", "disabled: only " + std::to_string(shown) + " of " + std::to_string(real) +
+                                     " generated frames were ready in time (80% needed); the GPU has no headroom for it");
+            fg.failed = true;
+            fg.have_previous = false;
+        }
+        fg.window_real = fg.real_shown;
+        fg.window_generated = fg.generated_shown;
+        fg.report = now;
+    }
     if (!fg.pending)
         return;
     fg.pending = false;
@@ -6996,12 +7152,21 @@ void framegen_show_generated(State &s, std::unique_lock<std::mutex> &lock) {
         ++fg.generated_skipped;
         return;
     }
+    // Late is better than never while the next real frame has not arrived: wait
+    // for the GPU in short steps, and give up when that frame is ready.
     UINT64 completed = 0;
     check(vkGetSemaphoreCounterValue(s.device, s.present_timeline, &completed), "read present timeline");
-    if (completed < fg.pending_ready) {
-        ++fg.generated_late;
-        return;
+    const auto give_up = fg.pending_submit + std::chrono::microseconds(static_cast<long long>(fg.interval_ms * 900.0));
+    while (completed < fg.pending_ready) {
+        if (s.ready_frame >= 0 || s.presenter_stop || std::chrono::steady_clock::now() >= give_up) {
+            ++fg.generated_late;
+            return;
+        }
+        s.present_cv.wait_for(lock, std::chrono::microseconds(500), [&] { return s.ready_frame >= 0 || s.presenter_stop; });
+        check(vkGetSemaphoreCounterValue(s.device, s.present_timeline, &completed), "read present timeline");
     }
+    fg.completion_ms_total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fg.pending_submit).count();
+    ++fg.completion_count;
     lock.unlock();
     try {
         framegen_display(s, fg, 1, fg.generated[fg.pending_generated].view, fg.pending_ready, nullptr);
@@ -7011,14 +7176,6 @@ void framegen_show_generated(State &s, std::unique_lock<std::mutex> &lock) {
         throw;
     }
     lock.lock();
-    const auto now = std::chrono::steady_clock::now();
-    if (fg.report.time_since_epoch().count() == 0) fg.report = now;
-    if (now - fg.report >= std::chrono::seconds(5)) {
-        log_line("FRAMEGEN", "real=" + std::to_string(fg.real_shown) + " generated=" + std::to_string(fg.generated_shown) +
-                                 " skipped=" + std::to_string(fg.generated_skipped) + " late=" + std::to_string(fg.generated_late) +
-                                 " interval_ms=" + std::to_string(fg.interval_ms));
-        fg.report = now;
-    }
 }
 #endif
 UINT64 present_snapshot(State &s, State::PresentFrame &frame) {
@@ -7191,10 +7348,27 @@ void presenter_main(State &s) {
         }
         ++s.displayed;
         s.present_cv.notify_all();
+#if defined(__ANDROID__)
+        if (s.framegen) {
+            try {
+                framegen_show_generated(s, lock);
+            } catch (const std::exception &error) {
+                s.present_failed = true;
+                s.present_error = error.what();
+                log_line("GE", std::string("presenter: ") + error.what());
+            }
+        }
+#endif
     }
 }
 void release_presentation(State &s) {
     s.stop_presenter();
+#if defined(__ANDROID__)
+    if (s.framegen) {
+        s.framegen->have_previous = false;
+        s.framegen->pending = false;
+    }
+#endif
     try {
         wait_present_idle(s);
     } catch (...) {
@@ -7322,27 +7496,10 @@ void capture_post_frame(State &s, psprecomp::GuestMemory &memory, std::uint32_t 
             for (const char *p = text; *p;) {
                 char *end = nullptr;
                 const unsigned long value = std::strtoul(p, &end, 10);
-#if defined(__ANDROID__)
-        if (s.framegen && s.framegen->pending) {
-            try {
-                framegen_show_generated(s, lock);
-            } catch (const std::exception &error) {
-                s.present_failed = true;
-                s.present_error = error.what();
-                log_line("GE", std::string("presenter: ") + error.what());
-            }
-        }
-#endif
                 if (end == p)
                     break;
                 list.push_back(static_cast<unsigned>(value));
                 p = *end == ',' ? end + 1 : end;
-#if defined(__ANDROID__)
-    if (s.framegen) {
-        s.framegen->have_previous = false;
-        s.framegen->pending = false;
-    }
-#endif
             }
         if (list.empty())
             list.push_back(300u);
@@ -7355,8 +7512,7 @@ void capture_post_frame(State &s, psprecomp::GuestMemory &memory, std::uint32_t 
     if (base.rgba.empty())
         return;
     std::vector<std::uint32_t> depth;
-    if (has_depth)
-        depth = debug_depth_words(memory, framebuffer, stride, format, width, height);
+    depth = debug_depth_words(memory, framebuffer, stride, format, width, height);
     const auto post = debug_post(base, s.post, 1.0f, false, depth.empty() ? nullptr : &depth);
     std::filesystem::create_directories(directory);
     const auto save = [&](const GpuImage &image, const char *suffix) {
@@ -7366,6 +7522,17 @@ void capture_post_frame(State &s, psprecomp::GuestMemory &memory, std::uint32_t 
         if (!textures::save_png(file, image.width, image.height, pixels))
             log_line("GE", "post capture could not write " + file.string());
     };
+    if (!depth.empty()) {
+        const auto file = std::filesystem::path(directory) / (std::to_string(race_frames) + "_depth.bin");
+        std::ofstream out(file, std::ios::binary);
+        out.write(reinterpret_cast<const char *>(depth.data()), depth.size() * sizeof(depth[0]));
+    }
+    {
+        const auto file = std::filesystem::path(directory) / (std::to_string(race_frames) + "_frame.txt");
+        std::ofstream out(file);
+        out << "frame=" << s.game_frame_id << "\nguest_us=" << diagnostic_guest_us()
+            << "\nrace_frame=" << race_frames << "\n";
+    }
     save(base, "base");
     save(post, "post");
     log_line("GE", "post capture: race frame " + std::to_string(race_frames) + " written to " + directory +
@@ -7696,7 +7863,7 @@ bool present(psprecomp::GuestMemory &memory, void *window, std::uint32_t framebu
                            " raster_half=" + std::to_string(s.raster_half));
     }
 #endif
-    if (s.racing && s.post.active())
+    if (s.racing)
         capture_post_frame(s, memory, framebuffer, stride, format, width, height, frame.has_depth);
     return true;
 }

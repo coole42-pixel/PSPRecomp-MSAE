@@ -123,6 +123,8 @@ struct GeDrawFacts {
     bool hardware_color_test{true};
     // Experimental native stencil requires an explicit renderer capability.
     bool hardware_stencil{};
+    // Ordered reads of the compact RGBA attachment; stencil remains its alpha.
+    bool recovery_input_attachment{};
 };
 
 struct HardwarePixelState {
@@ -199,6 +201,7 @@ struct DrawPixelRoute {
     bool hardware{};
     bool exact_pixel{};
     bool framebuffer_alpha_stencil{};
+    bool recovery_input_attachment{};
     bool color_only{}; // Backend attachment choice; not a PSP pixel operation.
     HardwarePixelState state{};
     const char *fragment_entry{"PS"};
@@ -209,6 +212,33 @@ struct DrawPixelRoute {
 
 [[nodiscard]] inline const char *compact_color_format_name(CompactColorFormat format) {
     return format == CompactColorFormat::Rgba8Unorm ? "R8G8B8A8_UNORM" : "R32_UINT";
+}
+
+// Conservatively track every shader write to the ordered depth attachment.
+// HUD tags modify its high bits even with ordinary depth writes masked.
+[[nodiscard]] inline bool ge_depth_attachment_changes(const std::uint32_t commands[256], bool valid_depth,
+                                                      bool hud_tag, bool hardware_transform) {
+    if (!valid_depth || !commands) return false;
+    if (commands[0xD3] & 1u) return (commands[0xD3] & 0x400u) != 0u;
+    return ((commands[0x23] & 1u) && commands[0xE7] == 0u) || (hud_tag && !hardware_transform);
+}
+
+// An ordered stencil/color draw with depth testing disabled and no depth/HUD
+// write does not consume depth. Its unchanged attachment output may stay stale
+// while the native depth image remains authoritative.
+[[nodiscard]] inline bool ge_ordered_needs_depth(const std::uint32_t commands[256], bool valid_depth,
+                                                 bool hud_tag, bool hardware_transform) {
+    if (!valid_depth || !commands) return false;
+    return ge_depth_attachment_changes(commands, valid_depth, hud_tag, hardware_transform) ||
+           (!(commands[0xD3] & 1u) && (commands[0x23] & 1u));
+}
+
+// Scope native-depth reuse to the observed MotorStorm recovery screen pass.
+// This pass tests framebuffer-alpha stencil but never consumes depth.
+[[nodiscard]] inline bool ge_recovery_depth_independent(const std::uint32_t c[256], bool valid_depth) {
+    return c && valid_depth && c[0x24] == 1u && c[0xDC] == 0xFF8002u && c[0xDD] == 0x020000u &&
+           c[0x21] == 1u && c[0xDF] == 0x1Au && c[0xE0] == 0xFFFFFFu &&
+           !ge_ordered_needs_depth(c, valid_depth, false, true);
 }
 
 [[nodiscard]] inline DrawPixelRoute classify_ge_draw(const std::uint32_t commands[256], GeDrawFacts facts) {
@@ -237,6 +267,8 @@ struct DrawPixelRoute {
     if (facts.extended_color)
         return reject(GeRejectReason::ExtendedColor);
     const bool stencil_enabled = !clearing && (command(0x24) & 1u) != 0u;
+    const bool recovery = facts.recovery_input_attachment && !facts.hardware_stencil && facts.format == 3u &&
+        !clearing && ge_recovery_depth_independent(commands, facts.valid_depth);
     // Simple unconditional stencil writes can use the COLOR alpha attachment
     // directly. This keeps PSP stencil/alpha together across path transitions.
     // A failed depth test may not require an alpha write, and replacing output
@@ -255,7 +287,7 @@ struct DrawPixelRoute {
         (stencil_pass == 0u || (command(0x21) & 1u) == 0u ||
          (!uses_source_alpha(blend_src) && !uses_source_alpha(blend_dst)));
     if (stencil_enabled) {
-        if (!alpha_stencil && !facts.hardware_stencil)
+        if (!alpha_stencil && !facts.hardware_stencil && !recovery)
             return reject(GeRejectReason::Stencil);
         const std::uint32_t op = command(0xDD);
         if ((op & 7u) > 5u || ((op >> 8u) & 7u) > 5u || ((op >> 16u) & 7u) > 5u)
@@ -296,7 +328,7 @@ struct DrawPixelRoute {
         hw.color_write_mask = static_cast<std::uint8_t>(hw.color_write_mask & ~0x8u);
     hw.src_alpha_factor = 1; // ONE: framebuffer alpha becomes the source alpha
     hw.dst_alpha_factor = 0; // ZERO
-    if (stencil_enabled && !alpha_stencil) {
+    if (stencil_enabled && !alpha_stencil && !recovery) {
         // PSP stencil op order: 0: KEEP, 1: ZERO, 2: REPLACE, 3: INVERT (5), 4: INCR (3), 5: DECR (4)
         static constexpr std::uint8_t kStencilOp[]{0, 1, 2, 5, 3, 4, 0, 0};
         const std::uint32_t test = command(0xDC);
@@ -322,7 +354,7 @@ struct DrawPixelRoute {
         hw.depth_write = command(0xE7) == 0u;
     }
 
-    if (!clearing && (command(0x21) & 1u) != 0u) {
+    if (!clearing && !recovery && (command(0x21) & 1u) != 0u) {
         const std::uint32_t src = command(0xDF) & 0xFu;
         const std::uint32_t dst = (command(0xDF) >> 4) & 0xFu;
         const std::uint32_t equation = (command(0xDF) >> 8) & 7u;
@@ -384,7 +416,7 @@ struct DrawPixelRoute {
     }
 
     const bool cull_primitive = facts.primitive >= 3u;
-    if (!clearing && cull_primitive && (command(0x1D) & 1u) != 0u)
+    if (!clearing && !recovery && cull_primitive && (command(0x1D) & 1u) != 0u)
         hw.cull_mode = (command(0x9B) & 1u) != 0u ? 0x02 : 0x01; // back : front
     const std::uint32_t alpha_func = command(0xDB) & 7u;
     hw.alpha_discard = (!clearing && (command(0x22) & 1u) != 0u && alpha_func != 1u) || color_test;
@@ -392,12 +424,13 @@ struct DrawPixelRoute {
     DrawPixelRoute route;
     route.hardware = true;
     route.framebuffer_alpha_stencil = alpha_stencil;
-    route.exact_pixel = alpha_stencil || color_test || facts.format != 3u || facts.feedback_snapshot || facts.enhanced_filtering ||
+    route.recovery_input_attachment = recovery;
+    route.exact_pixel = recovery || alpha_stencil || color_test || facts.format != 3u || facts.feedback_snapshot || facts.enhanced_filtering ||
                         facts.texture_replacement ||
                         (!clearing && (command(0x1E) & 1u) != 0u && !facts.simple_texture_filter);
     route.state = hw;
-    route.fragment_entry = hw.alpha_discard ? "PSFastAlpha" : "PSFast";
-    route.runs_pixel_update = false;
+    route.fragment_entry = recovery ? "PSRecovery" : hw.alpha_discard ? "PSFastAlpha" : "PSFast";
+    route.runs_pixel_update = recovery;
     route.color_format = CompactColorFormat::Rgba8Unorm;
     route.reject_reason = GeRejectReason::None;
     return route;

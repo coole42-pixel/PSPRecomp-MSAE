@@ -1,6 +1,7 @@
 #include "android_platform.hpp"
 #include "motorstorm_window.hpp"
 #include "motorstorm_audio.hpp"
+#include "motorstorm_audio_ring.hpp"
 #include "motorstorm_controller.hpp"
 #include "motorstorm_pacing.hpp"
 #include "motorstorm_gpu.hpp"
@@ -18,6 +19,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cmath>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <cstring>
@@ -38,6 +40,9 @@ std::uint32_t pressed{};
 std::unordered_map<SDL_JoystickID,SDL_Gamepad *> pads;
 std::unordered_map<SDL_FingerID,SDL_TouchFingerEvent> fingers;
 SDL_AudioStream *audio_stream{};
+// Guest PCM waits here; the SDL callback (audio thread) drains it, declicking
+// underruns and easing consumption when it runs low. See motorstorm_audio_ring.hpp.
+std::unique_ptr<AudioRing> audio_ring;
 AudioReport audio_stats;
 std::atomic<std::uint64_t> blocked_us{};
 AudioPacingReserve reserve;
@@ -479,6 +484,18 @@ void controller_set_rumble(const RumbleOutput &){} // Mobile rumble is pending; 
 void controller_set_focus(bool focused){if(!focused){std::lock_guard lock(input_mutex);live={};pressed=0;}}
 std::string controller_backend(){return "SDL3 Android";}
 bool audio_enabled(){return enabled("PSPRECOMP_MOTORSTORM_AUDIO");}
+// Audio thread: fills what the device asks for from the ring. Never waits for the guest.
+void SDLCALL audio_pull(void *,SDL_AudioStream *stream,int additional,int){
+    AudioRing *ring=audio_ring.get();
+    if(!ring||additional<=0)return;
+    std::int16_t block[1024*2];
+    for(int frames=additional/4;frames>0;){
+        const int count=std::min(frames,1024);
+        ring->pull(block,static_cast<std::size_t>(count));
+        SDL_PutAudioStreamData(stream,block,count*4);
+        frames-=count;
+    }
+}
 // Opens the SDL (AAudio/OpenSL ES) output stream. Some Adreno/AAudio devices
 // refuse the first open at boot, so a failed open is retried from
 // audio_submit at most once a second instead of leaving the game silent.
@@ -492,8 +509,9 @@ void audio_start(std::uint32_t rate){
     if(const char *value=std::getenv("PSPRECOMP_MOTORSTORM_AUDIO_QUEUE");value&&*value)
         queue_frames=static_cast<std::uint32_t>(std::clamp<long long>(std::atoll(value),2048,32768));
     SDL_AudioSpec format{SDL_AUDIO_S16,2,static_cast<int>(sample_rate)};
-    audio_stream=SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,&format,nullptr,nullptr);
-    if(!audio_stream){++audio_stats.errors;log_line("AUDIO",std::string("SDL audio open failed: ")+SDL_GetError()+"; retrying");return;}
+    audio_ring=std::make_unique<AudioRing>(queue_frames,2048,3072);
+    audio_stream=SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,&format,audio_pull,nullptr);
+    if(!audio_stream){audio_ring.reset();++audio_stats.errors;log_line("AUDIO",std::string("SDL audio open failed: ")+SDL_GetError()+"; retrying");return;}
     if(!SDL_ResumeAudioStreamDevice(audio_stream))log_line("AUDIO",std::string("SDL audio resume failed: ")+SDL_GetError());
     audio_stats.opened=true;audio_stats.playing=true;
     if(const char *path=std::getenv("PSPRECOMP_MOTORSTORM_AUDIO_CAPTURE");path&&*path&&!capture){
@@ -517,29 +535,38 @@ void audio_submit(const psprecomp::GuestMemory &memory,std::uint32_t at,std::uin
     const auto start=host_time_us();
     const auto deadline=start+2000000;
     for(;;){
-        std::uint64_t queued=0;
-        {std::lock_guard lock(audio_mutex);if(!audio_stream)return;
-            queued=static_cast<std::uint64_t>(std::max(0,SDL_GetAudioStreamQueued(audio_stream)))/4;}
-        if(queued+frames<=queue_frames||stopped||paused)break;
+        std::uint64_t room=0;
+        {std::lock_guard lock(audio_mutex);if(!audio_stream||!audio_ring)return;room=audio_ring->free_frames();}
+        if(room>=frames||stopped||paused)break;
         const auto now=host_time_us();
         if(now>=deadline){std::lock_guard lock(audio_mutex);audio_stats.dropped_frames+=frames;++audio_stats.errors;return;}
-        const auto excess=queued+frames-queue_frames;
+        const auto excess=frames-room;
         host_sleep_us(std::clamp<std::uint64_t>(excess*1000000ull/sample_rate,500u,5000u));
     }
     if(const auto waited=host_time_us()-start;waited>200)blocked_us.fetch_add(waited);
-    std::lock_guard lock(audio_mutex);if(!audio_stream)return;
-    if(SDL_GetAudioStreamQueued(audio_stream)==0&&audio_stats.queued_buffers>6)++audio_stats.underruns;
+    std::lock_guard lock(audio_mutex);if(!audio_stream||!audio_ring)return;
     for(const auto value:pcm){
         const auto magnitude=static_cast<std::uint32_t>(std::abs(static_cast<int>(value)));
         audio_stats.peak=std::max(audio_stats.peak,magnitude);if(magnitude)++audio_stats.nonzero_samples;
     }
-    if(!SDL_PutAudioStreamData(audio_stream,pcm.data(),static_cast<int>(pcm.size()*2)))++audio_stats.errors;
-    else {++audio_stats.queued_buffers;audio_stats.queued_frames+=frames;}
+    if(const auto pushed=audio_ring->push(pcm.data(),frames);pushed<frames)audio_stats.dropped_frames+=frames-pushed;
+    ++audio_stats.queued_buffers;audio_stats.queued_frames+=frames;
     if(capture&&capture_bytes<0x7FFF0000ull){std::fwrite(pcm.data(),2,pcm.size(),capture);capture_bytes+=pcm.size()*2;}
 }
-AudioReport audio_report(){std::lock_guard lock(audio_mutex);auto out=audio_stats;if(audio_stream)out.buffered_frames=std::max(0,SDL_GetAudioStreamQueued(audio_stream))/4;return out;}
+AudioReport audio_report(){
+    std::lock_guard lock(audio_mutex);auto out=audio_stats;
+    if(audio_stream&&audio_ring){
+        out.buffered_frames=audio_ring->level();
+        const auto ring=audio_ring->stats();
+        out.underruns=ring.underruns;out.silent_frames=ring.silent_frames;
+    }
+    return out;
+}
 void audio_shutdown(){
-    std::lock_guard lock(audio_mutex);if(audio_stream)SDL_DestroyAudioStream(audio_stream);audio_stream=nullptr;audio_stats.playing=false;
+    std::lock_guard lock(audio_mutex);
+    if(audio_ring){const auto ring=audio_ring->stats();audio_stats.underruns=ring.underruns;audio_stats.silent_frames=ring.silent_frames;}
+    // Destroying the stream waits for the callback, so the ring outlives it.
+    if(audio_stream)SDL_DestroyAudioStream(audio_stream);audio_stream=nullptr;audio_ring.reset();audio_stats.playing=false;
     if(capture){capture_header();std::fclose(capture);capture=nullptr;}
     log_line("AUDIO","queued_buffers="+std::to_string(audio_stats.queued_buffers)+" queued_frames="+std::to_string(audio_stats.queued_frames)+
         " nonzero_samples="+std::to_string(audio_stats.nonzero_samples)+" peak="+std::to_string(audio_stats.peak)+

@@ -2196,6 +2196,7 @@ void execute_block_transfer(GuestMemory &memory) {
     }
 }
 
+thread_local bool g_skip_draws = false;
 void execute_list(GuestMemory &memory, std::uint32_t address, std::uint32_t stall, bool rasterize,
                   std::vector<GeInterrupt> &interrupts, std::uint64_t submission,
                   GeListProgress *progress = nullptr) {
@@ -2656,7 +2657,7 @@ void execute_list(GuestMemory &memory, std::uint32_t address, std::uint32_t stal
                 (!inspection.select_draw || draw == inspection.draw) &&
                 (!inspection.capture || (draw >= inspection.first && draw <= inspection.last));
             inspect_draw(inspection, memory, submission, draw, address, cursor - 4u, data);
-            if (!rasterize) {
+            if (!rasterize || g_skip_draws) {
                 const auto &layout = layout_for_type(g_state.vertex_type);
                 const std::uint32_t index_type = (g_state.vertex_type >> 11u) & 3u;
                 if (index_type != 0u)
@@ -2976,6 +2977,8 @@ void begin_list(GuestMemory &memory, bool rasterize) {
     }
 }
 } // namespace
+
+void software_ge_set_skip_draws(bool skip) noexcept { g_skip_draws = skip; }
 
 std::vector<GeInterrupt> software_ge_execute_list(GuestMemory &memory, std::uint32_t address,
                                                   std::uint32_t stall, bool rasterize,

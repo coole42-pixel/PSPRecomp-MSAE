@@ -111,6 +111,10 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
                     invalid("must be off, zero or reallyzero");
                 config.frame_generation = choice;
             }
+            else if (key == "frame_skip") {
+                if (choice != "off" && choice != "auto") invalid("must be off or auto");
+                config.frame_skip = choice;
+            }
             else if (key == "frame_generation_width") {
                 const auto width = number(1280u, 1920u);
                 if (width != 1280u && width != 1600u && width != 1920u) invalid("must be 1280, 1600 or 1920");
@@ -229,7 +233,7 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
             {"runtime", {"max_dispatches"}},
             {"graphics", {"resolution", "renderer", "antialiasing", "fps", "dynamic_fps", "vsync",
                           "texture_filtering", "widescreen", "less_pop_in", "render_distance",
-                          "frame_generation", "frame_generation_width"}},
+                          "frame_generation", "frame_generation_width", "frame_skip"}},
             {"window", {"enabled", "fullscreen", "scale", "fullscreen_mode", "fullscreen_refresh"}},
             {"audio", {"enabled", "api"}},
             {"textures", {"dump", "replace", "dump_dir", "replace_dir", "budget_mb"}},
@@ -323,6 +327,7 @@ void apply_native_config(const NativeConfig &config) {
     set_default("PSPRECOMP_MOTORSTORM_LESS_POP_IN", config.less_pop_in ? "1" : "0");
     set_default("PSPRECOMP_MOTORSTORM_RENDER_DISTANCE", config.render_distance);
     set_default("PSPRECOMP_MOTORSTORM_FRAMEGEN", config.frame_generation);
+    set_default("PSPRECOMP_MOTORSTORM_FRAMESKIP", config.frame_skip);
     set_default("PSPRECOMP_MOTORSTORM_FRAMEGEN_WIDTH", std::to_string(config.frame_generation_width));
     set_default("PSPRECOMP_MOTORSTORM_FULLSCREEN_MODE", config.fullscreen_mode);
     set_default("PSPRECOMP_MOTORSTORM_FULLSCREEN_REFRESH", std::to_string(config.fullscreen_refresh));

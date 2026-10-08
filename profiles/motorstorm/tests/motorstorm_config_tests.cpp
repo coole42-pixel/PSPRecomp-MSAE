@@ -248,6 +248,89 @@ int main() {
             check(!motorstorm::classify_ge_draw(c.data(), facts).hardware,
                   "conditional stencil tests keep the framebuffer-alpha ordered route");
         }
+        {
+            std::array<std::uint32_t, 256> c{};
+            c[0x23] = 1; c[0xE7] = 1;
+            c[0x24] = 1; c[0xDC] = 0xFFFF03; c[0xDD] = 2u << 16;
+            check(!motorstorm::ge_depth_attachment_changes(c.data(), true, false, true),
+                  "recovery stencil replacement with masked depth preserves native depth");
+            check(motorstorm::ge_depth_attachment_changes(c.data(), true, true, false),
+                  "masked HUD tagging still invalidates native depth");
+            check(!motorstorm::ge_depth_attachment_changes(c.data(), true, true, true),
+                  "transformed geometry does not write through-mode HUD tags");
+            c[0xE7] = 0;
+            check(motorstorm::ge_depth_attachment_changes(c.data(), true, false, true),
+                  "unmasked depth-tested geometry invalidates native depth");
+            c[0x23] = 0;
+            check(!motorstorm::ge_depth_attachment_changes(c.data(), true, false, true),
+                  "disabled depth test preserves depth even with unmasked writes");
+            c[0xD3] = 1 | 0x400;
+            check(motorstorm::ge_depth_attachment_changes(c.data(), true, false, false),
+                  "depth clear invalidates native depth");
+            c[0xD3] = 1 | 0x100;
+            check(!motorstorm::ge_depth_attachment_changes(c.data(), true, true, false),
+                  "color-only clear does not tag or write depth");
+            check(!motorstorm::ge_depth_attachment_changes(c.data(), false, true, false),
+                  "absent depth attachment cannot change");
+        }
+        {
+            std::array<std::uint32_t, 256> c{};
+            c[0x24] = 1; c[0xDC] = 0xFF8002; c[0xDD] = 2u << 16;
+            c[0x21] = 1; c[0xDF] = 26; c[0xE0] = 0xFFFFFF; c[0xE7] = 1;
+            check(!motorstorm::ge_ordered_needs_depth(c.data(), true, false, true),
+                  "recovery EQUAL/REPLACE screen blend consumes stencil but no depth");
+            check(motorstorm::ge_recovery_depth_independent(c.data(), true),
+                  "the observed recovery screen pass permits scoped depth reuse");
+            motorstorm::GeDrawFacts facts;
+            check(!motorstorm::classify_ge_draw(c.data(), facts).hardware,
+                  "recovery requires ordered compact attachment reads");
+            facts.recovery_input_attachment = true;
+            const auto recovery = motorstorm::classify_ge_draw(c.data(), facts);
+            check(recovery.hardware && recovery.recovery_input_attachment && recovery.exact_pixel && recovery.runs_pixel_update &&
+                      !recovery.state.blend && !recovery.state.depth_test && !recovery.state.depth_write &&
+                      !recovery.state.stencil_test && std::string(recovery.fragment_entry) == "PSRecovery",
+                  "recovery uses exact shader stencil/blend on RGBA without native depth or stencil writes");
+            for (auto member : {&motorstorm::GeDrawFacts::feedback, &motorstorm::GeDrawFacts::soft_particles,
+                                &motorstorm::GeDrawFacts::hud_tag, &motorstorm::GeDrawFacts::extended_color}) {
+                facts.*member = true;
+                check(!motorstorm::classify_ge_draw(c.data(), facts).hardware,
+                      "recovery cannot bypass feedback, particles, HUD tags or extended color");
+                facts.*member = false;
+            }
+            facts.format = 2;
+            check(!motorstorm::classify_ge_draw(c.data(), facts).hardware, "recovery requires 8888 alpha storage");
+            facts.format = 3;
+            facts.valid_depth = false;
+            check(!motorstorm::classify_ge_draw(c.data(), facts).hardware,
+                  "recovery without an established depth surface retains the original route");
+            facts.valid_depth = true;
+            c[0x1D] = 1; c[0x9B] = 1;
+            check(motorstorm::classify_ge_draw(c.data(), facts).state.cull_mode == 0,
+                  "recovery retains the ordered shader's face rejection and helper invocations");
+            c[0x1D] = 0;
+            c[0x23] = 1;
+            check(!motorstorm::classify_ge_draw(c.data(), facts).hardware,
+                  "depth-tested recovery retains the packed ordered shader");
+            c[0x23] = 0;
+            c[0xDC] = 0xFF8003;
+            check(!motorstorm::classify_ge_draw(c.data(), facts).hardware,
+                  "other conditional stencil draws retain the packed ordered shader");
+            check(!motorstorm::ge_recovery_depth_independent(c.data(), true),
+                  "other stencil effects retain their original depth transitions");
+            c[0xDC] = 0xFF8002;
+            c[0x23] = 1;
+            check(motorstorm::ge_ordered_needs_depth(c.data(), true, false, true),
+                  "later ordered depth-test consumer requires current native depth");
+            c[0x23] = 0;
+            check(motorstorm::ge_ordered_needs_depth(c.data(), true, true, false),
+                  "HUD tag writer requires current ordered depth even when testing disabled");
+            c[0xD3] = 1 | 0x400;
+            check(motorstorm::ge_ordered_needs_depth(c.data(), true, false, true),
+                  "depth clear requires depth authority transition");
+            c[0xD3] = 1 | 0x100;
+            check(!motorstorm::ge_ordered_needs_depth(c.data(), true, true, false),
+                  "color-only clear does not consume stale depth");
+        }
         ScaleSettings dynamic;
         dynamic.mode = ScaleMode::Dynamic;
         dynamic.min_scale = 0.5f;

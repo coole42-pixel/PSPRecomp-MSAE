@@ -30,6 +30,7 @@ final class GameSettings {
             .putBoolean("dynamic_fps",false).putBoolean("enhanced_filtering",false)
             .putString("render_distance","low").putBoolean("less_pop_in",false)
             .putString("frame_generation","off").putString("frame_generation_width","1280")
+            .putBoolean("frame_skip",true)
             .putBoolean("effects",false).putBoolean("sharpening",false)
             .putBoolean("color_correction",false).putBoolean("soft_particles",false)
             .putBoolean("rumble",false).putString(LOGGING_MODE,"standard")
@@ -69,6 +70,7 @@ final class GameSettings {
             (benchmark?"low":choice(c,"render_distance","low",new String[]{"low","normal","high","ultra"}))+
             "\nless_pop_in = "+(!benchmark&&prefs(c).getBoolean("less_pop_in",false))+
             "\nframe_generation = "+(benchmark?"off":choice(c,"frame_generation","off",new String[]{"off","zero","reallyzero"}))+
+            "\nframe_skip = "+(prefs(c).getBoolean("frame_skip",true)?"auto":"off")+
             "\nframe_generation_width = "+choice(c,"frame_generation_width","1280",new String[]{"1280","1600","1920"})+"\n"+
             "[enhancements]\nenabled = "+(!benchmark&&prefs(c).getBoolean("effects",false))+
             "\ncolor_depth = 16\ncolor_correction = "+prefs(c).getBoolean("color_correction",false)+

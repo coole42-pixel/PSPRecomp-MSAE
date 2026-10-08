@@ -28,6 +28,9 @@ struct NativeConfig {
     // Android only: ZeroFG frame generation in races (off, zero or reallyzero)
     // and the width of the picture it works on (1280, 1600 or 1920).
     std::string frame_generation{"off"};
+    // Race frames whose draws are skipped when the guest falls behind real time
+    // (auto) so game logic and audio keep their speed; off draws every frame.
+    std::string frame_skip{"off"};
     std::uint32_t frame_generation_width{1280};
     std::string fullscreen_mode{"borderless"}, audio_api{"wasapi"};
     std::uint32_t fullscreen_refresh{};  // exclusive fullscreen refresh in Hz, 0 = desktop
