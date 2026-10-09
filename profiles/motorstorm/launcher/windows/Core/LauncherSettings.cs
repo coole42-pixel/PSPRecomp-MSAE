@@ -11,6 +11,11 @@ public sealed class LauncherSettings
     public const int DefaultPort = 47900; // same default as the Android launcher
 
     public string GamePath { get; set; } = "";
+    public string IsoPath { get; set; } = "";
+    public string DiscPath { get; set; } = "";
+    public string EbootPath { get; set; } = "";
+    public string TexturePackPath { get; set; } = "";
+    public Dictionary<string, string> RuntimeOptions { get; set; } = new();
     public string Nickname { get; set; } = "";
     public string HostInvite { get; set; } = "";
     public HostReach Reach { get; set; } = HostReach.LocalNetwork;

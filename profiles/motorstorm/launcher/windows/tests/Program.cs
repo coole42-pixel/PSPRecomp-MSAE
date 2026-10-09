@@ -94,5 +94,62 @@ var solo = new LaunchPlan(Role.Solo, Fullscreen: true).Environment();
 Require(!solo.Keys.Any(k => k.StartsWith("PSPRECOMP_MOTORSTORM_NET")) && solo["PSPRECOMP_MOTORSTORM_FULLSCREEN"] == "1", "solo env");
 Require(LauncherSettings.CleanNickname(new string('a', 40)).Length == 24, "nickname length");
 
+// File and graphics overrides apply equally to every role; unrecognized values use the INI.
+var preferences = new LauncherSettings
+{
+    EbootPath = @"C:\My Game\EBOOT.BIN", DiscPath = @"C:\My Game\disc0", TexturePackPath = @"C:\HD Pack",
+    RuntimeOptions = new() { ["SKIP_INTRO"] = "1", ["RENDERER"] = "vulkan", ["RESOLUTION"] = "4", ["AUDIO"] = "0", ["FPS"] = "bad", ["UNSAFE"] = "1" }
+};
+foreach (var role in new[] { Role.Solo, Role.Host, Role.Join })
+{
+    var env = new LaunchPlan(role, inv, Peer: "127.0.0.1:47900", Settings: preferences).Environment();
+    Require(env["PSPRECOMP_MOTORSTORM_SKIP_INTRO"] == "1", "intro skip for " + role);
+    Require(env["PSPRECOMP_MOTORSTORM_EBOOT"] == preferences.EbootPath && env["PSPRECOMP_MOTORSTORM_DISC"] == preferences.DiscPath, "game paths " + role);
+    Require(env["PSPRECOMP_MOTORSTORM_TEXTURE_REPLACE_DIR"] == preferences.TexturePackPath && env["PSPRECOMP_MOTORSTORM_RENDERER"] == "vulkan", "pack and renderer " + role);
+    Require(env["PSPRECOMP_MOTORSTORM_AUDIO"] == "0" && !env.ContainsKey("PSPRECOMP_MOTORSTORM_FPS") && !env.ContainsKey("PSPRECOMP_MOTORSTORM_UNSAFE"), "validated overrides " + role);
+    Require(env["PSPRECOMP_MOTORSTORM_FULLSCREEN"] == "0", "windowed explicitly overrides INI " + role);
+}
+Require(!new LaunchPlan(Role.Solo, Settings: new LauncherSettings()).Environment().ContainsKey("PSPRECOMP_MOTORSTORM_RENDERER"), "defaults defer to INI");
+
+var defaultLabels = GameOptions.DefaultLabels(null);
+Require(defaultLabels["RENDERER"] == "Default (D3D12)" && defaultLabels["SKIP_INTRO"] == "Default (Off)", "default labels show native built-in values");
+string iniFolder = Path.Combine(Path.GetTempPath(), "motorstorm-default-labels-" + Guid.NewGuid());
+Directory.CreateDirectory(iniFolder);
+try
+{
+    File.WriteAllText(Path.Combine(iniFolder, "MotorStormNative.ini"), "[GRAPHICS]\nRenderer = Vulkan ; custom renderer\nresolution=5\nvsync=false\n[audio]\nenabled=yes\n[game]\nskip_intro=on\n");
+    var labels = GameOptions.DefaultLabels(Path.Combine(iniFolder, "MotorStormNative.exe"));
+    Require(labels["RENDERER"] == "Default (Vulkan)" && labels["RESOLUTION"] == "Default (5)", "labels read selected game's INI including custom resolution");
+    Require(labels["VSYNC"] == "Default (Off)" && labels["AUDIO"] == "Default (On)" && labels["SKIP_INTRO"] == "Default (On)", "INI boolean aliases display On and Off");
+    Require(labels["AA"] == "Default (FXAA)", "missing INI keys show built-in defaults");
+}
+finally { Directory.Delete(iniFolder, true); }
+
+// A tiny ISO fixture exercises extraction and rejects traversal and truncated extents.
+string fixture = Path.Combine(Path.GetTempPath(), "motorstorm-test-" + Guid.NewGuid() + ".iso");
+byte[] image = new byte[24 * 2048];
+void U32(int at, uint value) => System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(at, 4), value);
+void Record(int at, uint sector, uint size, byte flags, string name)
+{
+    image[at] = (byte)(33 + name.Length); U32(at + 2, sector); U32(at + 10, size); image[at + 25] = flags;
+    image[at + 32] = (byte)name.Length; System.Text.Encoding.ASCII.GetBytes(name).CopyTo(image, at + 33);
+}
+image[16 * 2048] = 1; System.Text.Encoding.ASCII.GetBytes("CD001").CopyTo(image, 16 * 2048 + 1); image[16 * 2048 + 6] = 1;
+U32(16 * 2048 + 158, 20); U32(16 * 2048 + 166, 2048);
+Record(20 * 2048, 21, 2048, 2, "PSP_GAME"); Record(21 * 2048, 22, 4, 0, "PARAM.SFO;1");
+image[22 * 2048] = 42;
+try
+{
+    File.WriteAllBytes(fixture, image);
+    string imported = IsoImporter.Import(fixture);
+    try { Require(File.ReadAllBytes(Path.Combine(imported, "PSP_GAME", "PARAM.SFO"))[0] == 42, "ISO extracts exact data"); }
+    finally { Directory.Delete(Path.GetDirectoryName(imported)!, true); }
+    Record(21 * 2048, 22, 4, 0, "../escape;1"); File.WriteAllBytes(fixture, image);
+    try { IsoImporter.Import(fixture); Require(false, "ISO traversal rejected"); } catch (IOException) { Require(true, "ISO traversal rejected"); }
+    Record(21 * 2048, 90, 4, 0, "PARAM.SFO;1"); File.WriteAllBytes(fixture, image);
+    try { IsoImporter.Import(fixture); Require(false, "ISO truncated extent rejected"); } catch (IOException) { Require(true, "ISO truncated extent rejected"); }
+}
+finally { File.Delete(fixture); }
+
 Console.WriteLine(failures == 0 ? $"LauncherTests passed ({checks} checks)" : $"LauncherTests: {failures} of {checks} checks failed");
 return failures == 0 ? 0 : 1;

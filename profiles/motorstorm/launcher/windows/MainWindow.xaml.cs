@@ -84,6 +84,7 @@ public partial class MainWindow : Window
         RefreshHostCode();
         RefreshJoinResult();
         bool idle = session is null;
+        SettingsButton.IsEnabled = idle;
         SoloButton.IsEnabled = idle && gamePath is not null;
         HostButton.IsEnabled = idle && gamePath is not null;
         JoinButton.IsEnabled = idle && gamePath is not null && CurrentJoinTarget() is not null;
@@ -227,6 +228,13 @@ public partial class MainWindow : Window
     private void Launch(LaunchPlan plan, string status)
     {
         if (gamePath is null || session is not null) return;
+        if (settings.EbootPath.Length > 0 && !File.Exists(settings.EbootPath))
+        { ShowToast("Selected EBOOT is missing — update Game files & settings"); return; }
+        if (settings.DiscPath.Length > 0 && !File.Exists(Path.Combine(settings.DiscPath, "PSP_GAME", "PARAM.SFO")))
+        { ShowToast("Selected disc data is missing — import the ISO again"); return; }
+        if (settings.TexturePackPath.Length > 0 && !Directory.Exists(settings.TexturePackPath))
+        { ShowToast("Selected texture pack folder is missing — update Settings"); return; }
+        plan = plan with { Settings = settings };
         settings.Nickname = LauncherSettings.CleanNickname(NicknameBox.Text);
         SaveSettings();
         try
@@ -404,6 +412,12 @@ public partial class MainWindow : Window
         RefreshAll();
     }
 
+    private void Settings_Click(object sender, RoutedEventArgs e)
+    {
+        if (new SettingsWindow(settings) { Owner = this }.ShowDialog() == true)
+            ShowToast("Game files and settings saved — applied on the next launch");
+    }
+
     private void Stop_Click(object sender, RoutedEventArgs e) => session?.Kill();
 
     private void LogToggle_Click(object sender, RoutedEventArgs e)
@@ -524,7 +538,7 @@ public partial class MainWindow : Window
     }
 
     /// <summary>--screenshot out.png [join]: renders the window to a PNG and exits (used to check the design).</summary>
-    public void CaptureAndExit(string path, bool join)
+    public void CaptureAndExit(string path, bool join, bool options = false)
     {
         capturing = true;
         if (join)
@@ -533,12 +547,19 @@ public partial class MainWindow : Window
             JoinCodeBox.Text = "Race me!\nJoin code: " + new JoinCode(InviteCode.Generate(), JoinRoute.Direct, "192.168.1.20:47900");
         }
         Snow.Count = 140;
+        Window target = this;
+        if (options)
+        {
+            target = new SettingsWindow(settings) { Owner = this };
+            target.Show();
+        }
         var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1.5) };
         timer.Tick += (_, _) =>
         {
             timer.Stop();
-            var bmp = new RenderTargetBitmap((int)ActualWidth, (int)ActualHeight, 96, 96, PixelFormats.Pbgra32);
-            bmp.Render(Root);
+            var surface = (FrameworkElement)target.Content;
+            var bmp = new RenderTargetBitmap((int)surface.ActualWidth, (int)surface.ActualHeight, 96, 96, PixelFormats.Pbgra32);
+            bmp.Render(surface);
             var png = new PngBitmapEncoder();
             png.Frames.Add(BitmapFrame.Create(bmp));
             using (var fs = File.Create(path)) png.Save(fs);

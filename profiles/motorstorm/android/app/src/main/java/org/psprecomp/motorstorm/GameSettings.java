@@ -11,6 +11,7 @@ final class GameSettings {
     static final String RESOLUTION = "internal_resolution";
     static final String LOGGING_MODE = "logging_mode";
     static final String TOUCH_UI = "touch_ui";
+    static final String SKIP_INTRO = "skip_intro";
     static final String[] LOGGING_MODES = {"standard", "verbose", "off"};
     static final String[] MIN_SCALES = {"0.50", "0.60", "0.70", "0.80", "0.90"};
     static final String[] MAX_SCALES = {"0.50", "0.60", "0.70", "0.80", "0.90", "1.00"};
@@ -62,7 +63,8 @@ final class GameSettings {
         boolean verbose=loggingMode.equals("verbose");
         // Full resolution is chosen natively from the display; the INI keeps a
         // valid fixed value for the shared config parser.
-        String content="[graphics]\nrenderer = vulkan\nresolution = "+(resolution==0?1:resolution)+"\nantialiasing = "+
+        String content="[game]\nskip_intro = "+prefs(c).getBoolean(SKIP_INTRO,false)+"\n"+
+            "[graphics]\nrenderer = vulkan\nresolution = "+(resolution==0?1:resolution)+"\nantialiasing = "+
             (!benchmark&&prefs(c).getBoolean("fxaa",false)?"FXAA":"None")+"\ntexture_filtering = "+
             (!benchmark&&prefs(c).getBoolean("enhanced_filtering",false)?"enhanced":"psp")+"\nfps = "+
             (benchmark?(benchmarkFps==0?"original":Integer.toString(benchmarkFps)):choice(c,"fps","original",new String[]{"original","60"}))+"\n"+

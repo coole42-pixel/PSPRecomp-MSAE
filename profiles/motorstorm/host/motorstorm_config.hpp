@@ -18,6 +18,7 @@ struct NativeConfig {
     std::uint32_t fps{60};  // 0 = the game's original 30 fps pacing
     bool window{true}, fullscreen{}, audio{true};
     bool dynamic_fps{true};  // fall back to 30 fps instead of running in slow motion
+    bool skip_intro{};  // finish Boot.stf and load the frontend's Press Start screen
     bool vsync{true};
     std::string texture_filtering{"psp"};  // psp (exact) or enhanced (anisotropic + mips)
     std::string widescreen{"auto"};  // auto = Hor+ gameplay, psp = original aspect

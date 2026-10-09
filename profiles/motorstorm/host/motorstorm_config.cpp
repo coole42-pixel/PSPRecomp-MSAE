@@ -94,6 +94,7 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
         }
         if (section == "runtime" && key == "max_dispatches")
             config.max_dispatches = number(1u, UINT64_MAX);
+        if (section == "game" && key == "skip_intro") config.skip_intro = boolean();
         if (section == "graphics") {
             if (key == "resolution") {
                 const auto scale = number(1u, 8u);
@@ -236,6 +237,7 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
                           "frame_generation", "frame_generation_width", "frame_skip"}},
             {"window", {"enabled", "fullscreen", "scale", "fullscreen_mode", "fullscreen_refresh"}},
             {"audio", {"enabled", "api"}},
+            {"game", {"skip_intro"}},
             {"textures", {"dump", "replace", "dump_dir", "replace_dir", "budget_mb"}},
             {"enhancements", {"enabled", "color_depth", "color_correction", "exposure", "contrast", "saturation",
                               "temperature", "tint", "sharpening", "sharpening_strength", "hud_ungraded",
@@ -316,6 +318,7 @@ NativeConfig load_native_config(const std::filesystem::path &path) {
 }
 
 void apply_native_config(const NativeConfig &config) {
+    set_default("PSPRECOMP_MOTORSTORM_SKIP_INTRO", config.skip_intro ? "1" : "0");
     set_default("PSPRECOMP_MOTORSTORM_RENDERER", config.renderer);
     set_default("PSPRECOMP_MOTORSTORM_RESOLUTION", std::to_string(config.resolution));
     set_default("PSPRECOMP_MOTORSTORM_AA", config.antialiasing);

@@ -1,5 +1,6 @@
 #include "motorstorm_arena.hpp"
 #include "motorstorm_config.hpp"
+#include "motorstorm_intro.hpp"
 #include "motorstorm_env.hpp"
 #include "motorstorm_draw_distance.hpp"
 #include "motorstorm_frame_rate.hpp"
@@ -23,11 +24,11 @@ void check(bool condition, const char *message) {
     if (!condition) throw std::runtime_error(message);
 }
 struct EnvironmentScope {
-    std::array<const char *, 11> names{"PSPRECOMP_MOTORSTORM_RENDERER", "PSPRECOMP_MOTORSTORM_RESOLUTION",
+    std::array<const char *, 12> names{"PSPRECOMP_MOTORSTORM_RENDERER", "PSPRECOMP_MOTORSTORM_RESOLUTION",
         "PSPRECOMP_MOTORSTORM_AA", "PSPRECOMP_MOTORSTORM_WINDOW", "PSPRECOMP_MOTORSTORM_FULLSCREEN",
         "PSPRECOMP_MOTORSTORM_WINDOW_SCALE", "PSPRECOMP_MOTORSTORM_AUDIO", "PSPRECOMP_MOTORSTORM_SOFTGE",
-        "PSPRECOMP_MOTORSTORM_PROFILE", "PSPRECOMP_MOTORSTORM_FPS", "PSPRECOMP_MOTORSTORM_WIDESCREEN"};
-    std::array<std::string, 11> previous;
+        "PSPRECOMP_MOTORSTORM_PROFILE", "PSPRECOMP_MOTORSTORM_FPS", "PSPRECOMP_MOTORSTORM_WIDESCREEN", "PSPRECOMP_MOTORSTORM_SKIP_INTRO"};
+    std::array<std::string, 12> previous;
     EnvironmentScope() {
         for (std::size_t i = 0; i < names.size(); ++i) {
             if (const char *value = std::getenv(names[i])) previous[i] = value;
@@ -451,6 +452,24 @@ int main() {
         check(steer.axis_x >= 0 && pedal.buttons == 0x0200u, "the nub steers and R accelerates");
 
         const auto shipped = motorstorm::load_native_config(MOTORSTORM_CONFIG_TEMPLATE);
+        check(!shipped.skip_intro, "Intro skip is opt-in");
+        check(motorstorm::intro_initial_state(true, motorstorm::kBootScene, true, 7u) == motorstorm::kBootLoadSettings,
+              "Intro skip preserves startup settings initialization");
+        check(motorstorm::intro_initial_state(false, motorstorm::kBootScene, true, 7u) == 7u &&
+              motorstorm::intro_initial_state(true, 0x08A75FC4u, true, 7u) == 7u &&
+              motorstorm::intro_initial_state(true, motorstorm::kBootScene, false, 7u) == 7u &&
+              motorstorm::intro_initial_state(true, motorstorm::kBootScene, true, 6u) == 6u,
+              "Intro skip never redirects other scenes, objects or leaving the title");
+        check(motorstorm::intro_notice_buttons(true, motorstorm::kBootScene, 4u, 0u) == 0x4000u &&
+              motorstorm::intro_notice_buttons(true, motorstorm::kBootScene, 4u, 100'000u) == 0u &&
+              motorstorm::intro_notice_buttons(false, motorstorm::kBootScene, 4u, 0u) == 0u &&
+              motorstorm::intro_notice_buttons(true, 0x08A75FC4u, 1u, 0u) == 0u &&
+              motorstorm::intro_notice_buttons(true, motorstorm::kBootScene, 1u, 0u) == 0u,
+              "Notice auto-confirm has press/release edges and never presses Start or confirms title");
+        check(motorstorm::intro_hide_frame(true, motorstorm::kBootScene) &&
+              !motorstorm::intro_hide_frame(false, motorstorm::kBootScene) &&
+              !motorstorm::intro_hide_frame(true, 0x08A75FC4u),
+              "Skipped startup screens are hidden but the frontend is presented");
         check(shipped.loaded && shipped.resolution == 4u && shipped.antialiasing == "fxaa" &&
               shipped.renderer == "d3d12" && shipped.window && shipped.audio && shipped.fps == 60u && shipped.widescreen == "auto",
               "Shipped INI must enable native 4x / FXAA / 60 fps with window and audio");
@@ -495,10 +514,11 @@ int main() {
             file << "\xEF\xBB\xBF[graphics]\nresolution=2\nantialiasing=None\nrenderer=auto\nfps=Original\nwidescreen=psp\n"
                     "[window]\nenabled=false\nfullscreen=true\nscale=3\n[audio]\nenabled=false\n"
                     "[logging]\ntrace_imports=true\ntrace_filesystem=true\nverbose=true\n"
-                    "[runtime]\nmax_dispatches=123456\n[debug]\nprofile=true ; example comment\n"
+                    "[game]\nskip_intro=true\n[runtime]\nmax_dispatches=123456\n[debug]\nprofile=true ; example comment\n"
                     "trace_music=false\nframe_dump_count=2\nframe_dump_dir=captures\n";
         }
         const auto custom = motorstorm::load_native_config(path);
+        check(custom.skip_intro && custom.warnings.empty(), "Game intro option parses as a known boolean");
         check(custom.resolution == 2u && custom.antialiasing == "none" && custom.renderer == "auto" &&
               !custom.window && custom.fullscreen && custom.window_scale == 3u && !custom.audio &&
               custom.fps == 0u && custom.widescreen == "psp",
@@ -512,6 +532,10 @@ int main() {
             _putenv_s("PSPRECOMP_MOTORSTORM_RESOLUTION", "1");
             _putenv_s("PSPRECOMP_MOTORSTORM_WINDOW", "0");
             motorstorm::apply_native_config(shipped);
+            check(std::string(std::getenv("PSPRECOMP_MOTORSTORM_SKIP_INTRO")) == "0", "INI disables intro skip by default");
+            _putenv_s("PSPRECOMP_MOTORSTORM_SKIP_INTRO", "1");
+            motorstorm::apply_native_config(shipped);
+            check(std::string(std::getenv("PSPRECOMP_MOTORSTORM_SKIP_INTRO")) == "1", "Launcher intro override beats INI");
             check(std::string(std::getenv("PSPRECOMP_MOTORSTORM_RESOLUTION")) == "1" &&
                   std::string(std::getenv("PSPRECOMP_MOTORSTORM_WINDOW")) == "0", "Explicit environment choices override INI");
             check(std::string(std::getenv("PSPRECOMP_MOTORSTORM_FPS")) == "60", "INI frame rate reaches the runtime");
@@ -528,7 +552,7 @@ int main() {
             _putenv_s("PSPRECOMP_MOTORSTORM_FRAME_DUMP_COUNT", "");
             _putenv_s("PSPRECOMP_MOTORSTORM_FRAME_DUMP_DIR", "");
         }
-        for (const char *invalid : {"[graphics]\nresolution=0\n", "[graphics]\nantialiasing=MSAA\n",
+        for (const char *invalid : {"[game]\nskip_intro=maybe\n", "[graphics]\nresolution=0\n", "[graphics]\nantialiasing=MSAA\n",
                                    "[window]\nfullscreen=perhaps\n", "[window]\nscale=9\n",
                                    "[graphics]\nfps=20\n", "[graphics]\nfps=241\n", "[graphics]\nfps=fast\n",
                                    "[graphics]\nwidescreen=stretch\n", "[graphics]\nresolution=6\n",

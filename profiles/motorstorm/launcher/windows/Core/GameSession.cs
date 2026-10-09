@@ -8,7 +8,8 @@ public enum Role { Solo, Host, Join }
 
 /// <summary>What one game launch needs; turned into the PSPRECOMP_MOTORSTORM_* environment.</summary>
 public sealed record LaunchPlan(Role Role, string? Invite = null, string? Peer = null, string? Server = null,
-                                int HostPort = LauncherSettings.DefaultPort, string Nickname = "", bool Fullscreen = false)
+                                int HostPort = LauncherSettings.DefaultPort, string Nickname = "", bool Fullscreen = false,
+                                LauncherSettings? Settings = null)
 {
     public Dictionary<string, string> Environment()
     {
@@ -18,7 +19,16 @@ public sealed record LaunchPlan(Role Role, string? Invite = null, string? Peer =
             ["PSPRECOMP_MOTORSTORM_SOFTGE"] = "1",
             ["PSPRECOMP_MOTORSTORM_WINDOW"] = "1",
         };
-        if (Fullscreen) env["PSPRECOMP_MOTORSTORM_FULLSCREEN"] = "1";
+        env["PSPRECOMP_MOTORSTORM_FULLSCREEN"] = Fullscreen ? "1" : "0";
+        if (Settings is { } settings)
+        {
+            if (settings.EbootPath.Length > 0) env["PSPRECOMP_MOTORSTORM_EBOOT"] = settings.EbootPath;
+            if (settings.DiscPath.Length > 0) env["PSPRECOMP_MOTORSTORM_DISC"] = settings.DiscPath;
+            if (settings.TexturePackPath.Length > 0) env["PSPRECOMP_MOTORSTORM_TEXTURE_REPLACE_DIR"] = settings.TexturePackPath;
+            foreach (var option in GameOptions.All)
+                if (settings.RuntimeOptions.TryGetValue(option.Key, out var value) && option.Values.Contains(value))
+                    env["PSPRECOMP_MOTORSTORM_" + option.Key] = value;
+        }
         if (Role == Role.Solo) return env;
         env["PSPRECOMP_MOTORSTORM_NET"] = Role == Role.Host ? "host" : "join";
         env["PSPRECOMP_MOTORSTORM_NET_INVITE"] = Invite ?? throw new InvalidOperationException("invite missing");
@@ -86,6 +96,11 @@ public sealed class GameSession
             CreateNoWindow = true, // the game opens its own window; its console output also goes to the log file
             WorkingDirectory = WorkingDirectory(exePath),
         };
+        // Explicit launcher preferences or the game's INI own these settings, not a stale parent shell.
+        foreach (string key in GameOptions.All.Select(o => "PSPRECOMP_MOTORSTORM_" + o.Key)
+                     .Concat(new[] { "PSPRECOMP_MOTORSTORM_EBOOT", "PSPRECOMP_MOTORSTORM_DISC", "PSPRECOMP_MOTORSTORM_TEXTURE_REPLACE_DIR" })
+                     .Concat(info.Environment.Keys.Where(k => k.StartsWith("PSPRECOMP_MOTORSTORM_NET", StringComparison.OrdinalIgnoreCase))).ToList())
+            info.Environment.Remove(key);
         foreach (var (key, value) in plan.Environment()) info.Environment[key] = value;
         // Pin the log (normally [logging] log_file in the INI) so the launcher knows which file to follow.
         string logPath = Path.ChangeExtension(exePath, ".log");

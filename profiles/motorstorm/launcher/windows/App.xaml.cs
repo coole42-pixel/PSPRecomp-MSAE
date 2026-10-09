@@ -11,6 +11,7 @@ public partial class App : Application
         window.Show();
         // --screenshot <file.png> [join]: render the window once and exit (design checks).
         if (e.Args.Length >= 2 && e.Args[0] == "--screenshot")
-            window.CaptureAndExit(e.Args[1], e.Args.Length >= 3 && e.Args[2] == "join");
+            window.CaptureAndExit(e.Args[1], e.Args.Length >= 3 && e.Args[2] == "join",
+                e.Args.Length >= 3 && e.Args[2] == "settings");
     }
 }

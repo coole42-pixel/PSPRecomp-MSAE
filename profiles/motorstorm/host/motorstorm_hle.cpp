@@ -12,6 +12,7 @@
 #include "motorstorm_controller.hpp"
 #include "motorstorm_rumble.hpp"
 #include "motorstorm_media.hpp"
+#include "motorstorm_intro.hpp"
 #include "motorstorm_atrac.hpp"
 #include "motorstorm_frame_rate.hpp"
 #include "motorstorm_pacing.hpp"
@@ -68,6 +69,7 @@ constexpr std::uint32_t kModuleThreadStackSize = 0x10000u;
 
 HleOptions g_options;
 bool g_installed = false;
+bool g_skip_intro = false;
 
 // ---------------------------------------------------------------------------
 // Diagnostics helpers
@@ -1783,6 +1785,24 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
     gpu_set_publish_guard(wait_for_ge_thread);
     g_options = options;
     g_installed = true;
+    // This guest helper only stores the pending menu index and resets the current
+    // one. Preserve that behavior, entering Boot's settings/localization load
+    // directly. After its fonts initialize, normal scene exit loads Press Start.
+    const char *skip_intro_option = std::getenv("PSPRECOMP_MOTORSTORM_SKIP_INTRO");
+    g_skip_intro = skip_intro_option != nullptr && std::string_view(skip_intro_option) == "1";
+    if (g_skip_intro) {
+        runtime.register_function(0x08893684u, [](Runtime &rt, AllegrexContext &ctx) {
+            auto &memory = rt.memory();
+            const auto object = ctx.gpr[4];
+            const auto scene = memory.load32(0x08A76FDCu);
+            const bool boot_object = object != 0u && object == memory.load32(0x08A9E48Cu);
+            const auto requested = intro_initial_state(true, scene, boot_object, ctx.gpr[5]);
+            if (requested != ctx.gpr[5]) log_line("BOOT", "skip_intro: loading startup settings");
+            memory.store32(object + 60u, requested);
+            memory.store32(object + 56u, 0xFFFFFFFFu);
+            ctx.pc = ctx.gpr[31];
+        }, "motorstorm_skip_intro_initial_state");
+    }
     g_arena.next = (user_arena_start + 0xFFu) & ~0xFFu;
     g_stack_next_top = kUserRamTop - kModuleThreadStackSize;
     psprecomp::reset_sas_hle_state();
@@ -3866,6 +3886,17 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
             }
             trace_game_state(rt);
             update_racing_scene(rt);
+            if (g_skip_intro && rt.memory().load32(0x08A76FDCu) == kBootScene) {
+                const auto object = rt.memory().load32(0x08A9E48Cu);
+                if (object != 0u && rt.memory().contains(object, 88u) &&
+                    rt.memory().load32(object + 56u) == kBootInitializeFonts) {
+                    // The state enter callback has now loaded the localized FE
+                    // fonts. Exit normally before starting either intro movie.
+                    rt.memory().store32(object + 60u, kBootFinished);
+                    rt.memory().store8(object + 86u, 0u);
+                    rt.memory().store8(object + 87u, 0u);
+                }
+            }
             if (MOTORSTORM_ENV_FLAG("PSPRECOMP_MOTORSTORM_TRACE_DISPLAY")) {
                 if (g_display.set_frame_buf_count <= 4u || g_display.set_frame_buf_count % 60u == 0u) {
                     std::ostringstream out;
@@ -4267,7 +4298,7 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
             decide_frame_skip();
             pace_frame(rt.memory());
             // Publish the frame the guest just displayed to the native window.
-            if (!frame_was_skipped)
+            if (!frame_was_skipped && !intro_hide_frame(g_skip_intro, rt.memory().load32(0x08A76FDCu)))
                 window_present(rt.memory(), g_display.frame_buf,
                                g_display.stride != 0u ? g_display.stride : 512u, g_display.format,
                                g_display.width != 0u ? g_display.width : 480u,
@@ -4438,13 +4469,20 @@ void install_hle(Runtime &runtime, std::uint32_t user_arena_start, const HleOpti
                 }
             }
             const std::uint32_t live_pad = input.buttons;
+            std::uint32_t intro_pad = 0u;
+            if (g_skip_intro && rt.memory().load32(0x08A76FDCu) == kBootScene) {
+                const auto object = rt.memory().load32(0x08A9E48Cu);
+                if (object != 0u && rt.memory().contains(object, 88u))
+                    intro_pad = intro_notice_buttons(true, kBootScene,
+                        rt.memory().load32(object + 56u), g_virtual_time_us);
+            }
             g_last_pad_buttons = live_pad | (static_cast<std::uint32_t>(input.x) << 16u) | (static_cast<std::uint32_t>(input.y) << 24u);
             const auto analog_x = g_ctrl_requested_mode == 1u ? input.x : std::uint8_t{128u};
             const auto analog_y = g_ctrl_requested_mode == 1u ? input.y : std::uint8_t{128u};
             if (address != 0u && count > 0 && rt.memory().contains(address, 16u)) {
                 rt.memory().zero(address, 16u);
                 rt.memory().store32(address, static_cast<std::uint32_t>(g_virtual_time_us));
-                rt.memory().store32(address + 4u, forced_pad | live_pad);
+                rt.memory().store32(address + 4u, forced_pad | live_pad | intro_pad);
                 rt.memory().store8(address + 8u, analog_x);
                 rt.memory().store8(address + 9u, analog_y);
             }

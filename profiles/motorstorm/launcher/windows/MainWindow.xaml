@@ -142,6 +142,8 @@
                     </StackPanel>
 
                     <StackPanel DockPanel.Dock="Bottom">
+                        <Button x:Name="SettingsButton" Style="{StaticResource LinkButton}" Content="Game ISO · EBOOT · Texture pack · Settings…"
+                                Click="Settings_Click" HorizontalAlignment="Left" Margin="0,0,0,12"/>
                         <!-- Game location -->
                         <Border Style="{StaticResource GlassCard}" CornerRadius="14" Padding="16,12" Margin="0,0,0,14">
                             <DockPanel>

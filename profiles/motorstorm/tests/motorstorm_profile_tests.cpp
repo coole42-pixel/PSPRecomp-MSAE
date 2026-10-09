@@ -143,7 +143,9 @@ int main(int argc,char **argv) {
                     metadata.find("\"vertex_address\":145756172") != std::string::npos &&
                     metadata.find("\"raw_commands\":[") != std::string::npos,
                 "GE inspection captures pre-draw address and full command state");
-        require(std::filesystem::exists(ppm) && std::filesystem::file_size(ppm) == 480u * 272u * 3u + 15u,
+        // Diagnostic capture includes the entire 512-pixel render target stride,
+        // whereas the game's displayed viewport is 480 pixels wide.
+        require(std::filesystem::exists(ppm) && std::filesystem::file_size(ppm) == 512u * 272u * 3u + 15u,
                 "GE draw capture writes a complete render target");
         require(!std::filesystem::exists(directory / "submission_7_draw_1.json") &&
                     !std::filesystem::exists(directory / "submission_7_draw_3.ppm"),

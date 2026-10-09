@@ -197,6 +197,7 @@ public final class LauncherActivity extends Activity {
         ScrollView scroll=new ScrollView(this);scroll.addView(options);
         TextView info=new TextView(this);
         info.setText("Default: 2x resolution, original 30 fps, low draw distance, optional effects off. Changes apply next launch. Menus and races always fill the screen.");options.addView(info);
+        CheckBox skipIntro=settingToggle(options,"Skip intro (start at Press Start)",GameSettings.SKIP_INTRO,false);
         Spinner resolution=settingChoice(options,"Internal resolution",new String[]{"Full (matches display)","1x (480 x 272)","2x (960 x 544, default)","3x","4x","5x (2400 x 1360)"},GameSettings.resolution(this));
         String[] fpsValues={"original","60"};
         Spinner fps=settingChoice(options,"Frame rate",new String[]{"Original (30 fps, default)","60 fps"},settingIndex("fps","original",fpsValues));
@@ -237,6 +238,7 @@ public final class LauncherActivity extends Activity {
                     Toast.makeText(this,"Dynamic minimum must not exceed maximum",Toast.LENGTH_SHORT).show();return;
                 }
                 GameSettings.prefs(this).edit().putInt(GameSettings.RESOLUTION,resolution.getSelectedItemPosition())
+                    .putBoolean(GameSettings.SKIP_INTRO,skipIntro.isChecked())
                     .putString("fps",fpsValues[fps.getSelectedItemPosition()]).putBoolean("dynamic_fps",dynamicFps.isChecked())
                     .putBoolean("fxaa",fxaa.isChecked()).putBoolean("enhanced_filtering",filtering.isChecked())
                     .putString("render_distance",distanceValues[distance.getSelectedItemPosition()]).putBoolean("less_pop_in",popIn.isChecked())

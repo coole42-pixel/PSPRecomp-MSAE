@@ -20,6 +20,12 @@ Settings apply next launch. Reset defaults restores the graphics preset while
 preserving game files, imported drivers and audio preference. Version 2 of the
 graphics preference migration applies this preset once to existing installs.
 
+**Skip intro (start at Press Start)** bypasses startup warnings, logos and intro
+movies while preserving settings, localization and font initialization. The
+game loads the normal title screen and waits for your input. This preference is
+off by default, persists across launches and graphics resets, and is written as
+`[game] skip_intro = true/false` in each session INI.
+
 ### Frame generation (ZeroFG)
 
 *Settings > Frame generation in races (ZeroFG)* shows a generated frame between
